@@ -1,0 +1,23 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 本机运行态文件：绝不入库
+#   usage-ledger.jsonl  用量账本（含本机全部会话的用量历史）
+#   balance-prefs.json  余额查询开关
+#   dsh-web.log         本机启动日志
+usage-ledger.jsonl
+balance-prefs.json
+dsh-web.log
+*.log
+
+# 打包/校验过程的临时产物
+*.tgz
+*.tmp
+packages/plugin/lib/client.js.invalid
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

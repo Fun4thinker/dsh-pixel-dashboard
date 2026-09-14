@@ -1,0 +1,20 @@
+# 统一换行符为 LF，且**检出时也保持 LF**。
+#
+# 两个理由：
+#   1) tools/build.mjs 的实现版本号是 src/ 源码内容的 SHA-256。若同一份源码在一台
+#      机器上是 LF、另一台检出成 CRLF，重新构建会算出不同的版本号——同一个提交在
+#      不同机器上「指纹」不一致，排查版本问题时会造成误导。
+#   2) packages/plugin/lib/ 是入库的构建产物，内容应当与构建机逐字节一致。
+#
+# 没有这份文件时，全局 core.autocrlf=true 会把工作区改成 CRLF（git 会刷一屏警告）。
+* text=auto eol=lf
+
+# 二进制文件不参与换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary

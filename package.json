@@ -1,0 +1,21 @@
+{
+  "name": "dsh-pixel-dashboard-repo",
+  "version": "2.0.0",
+  "private": true,
+  "description": "DSH 插件开发仓库：像素风皮肤与用量看板。对外发布的是 packages/ 下的两个包。",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "verify": "node tools/verify.mjs",
+    "test": "node tools/test.mjs && node tools/test-patch-layer.mjs",
+    "preflight": "node tools/preflight.mjs",
+    "render-check": "node tools/render-check.mjs",
+    "install:official": "node tools/install-official.mjs",
+    "doctor": "node tools/doctor.mjs",
+    "pack:plugin": "npm pack ./packages/plugin",
+    "pack:bundle": "npm pack ./packages/bundle"
+  }
+}
