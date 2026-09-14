@@ -14,7 +14,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 /** 校验构建产物：源码树里的版本号还是占位符，只有产物才代表真正部署的东西。 */
-const built = join(root, 'packages', 'plugin', 'lib', 'host.js')
+const built = join(root, 'lib', 'host.js')
 if (!existsSync(built)) {
   console.error(`找不到构建产物 ${built}；先运行 node tools/build-deploy.mjs`)
   process.exit(1)
@@ -194,7 +194,7 @@ const samplePersistence = {
   },
 }
 
-const { UsageCatalog } = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'host.js')).href)
+const { UsageCatalog } = await import(pathToFileURL(join(root, 'lib', 'host.js')).href)
 const sampleCatalog = new UsageCatalog({
   persistence: () => samplePersistence,
   sessions: () => undefined,
@@ -245,7 +245,7 @@ process.env.DEEPSEEK_API_KEY = SECRET_PROBE
 /** 记录假 fetch 收到的请求，用于断言端点与 Authorization 头。 */
 const calls = []
 // 单独造一个实例并注入假 fetch：预检不该真的打网络。
-const { BalanceService } = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'balance.js')).href)
+const { BalanceService } = await import(pathToFileURL(join(root, 'lib', 'balance.js')).href)
 const probeService = new BalanceService({
   credentials: () => undefined,
   settings: () => undefined,
@@ -306,7 +306,7 @@ const bogus = new BalanceService({
 assert.equal((await bogus.read()).balances[0].total, undefined, '读不懂的金额应是 undefined，而不是 0')
 // null / 空串绝不能变成 0：JSON 里字段缺失可能是 null，而界面上 0 就是「余额空了」。
 // Number(null) 与 Number('') 都等于 0，所以这两条必须显式挡掉。
-const { parseAmount } = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'balance.js')).href)
+const { parseAmount } = await import(pathToFileURL(join(root, 'lib', 'balance.js')).href)
 assert.equal(parseAmount(null), undefined, 'null 金额必须是 undefined，不能变成 0')
 assert.equal(parseAmount(''), undefined, '空串金额必须是 undefined，不能变成 0')
 assert.equal(parseAmount('   '), undefined, '空白金额必须是 undefined，不能变成 0')
@@ -470,7 +470,7 @@ for (const banned of ['Bearer ', 'sk-', 'eyJ']) {
 }
 
 // 解析器：用假响应验窗口归类与「缺失不显示成 0」
-const plansModule = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'plans.js')).href)
+const plansModule = await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)
 const {
   parseZhipuQuota, parseCommandCodeCredits, maskSecret, readCommandCodeKey,
   deriveKeyRef, COMMAND_CODE_KEY_ENVS,
@@ -564,7 +564,7 @@ assert.equal(readCommandCodeKey(fakeAuth), undefined, '坏文件应安静降级�
 rmSync(fakeAuth, { force: true })
 
 // ── 多厂商价目：智谱 GLM 与「估算价」的诚实标注 ──────────────────
-const pricingModule = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'pricing.js')).href)
+const pricingModule = await import(pathToFileURL(join(root, 'lib', 'pricing.js')).href)
 const { pricingOf, normalizeModel, MODEL_RATES } = pricingModule
 
 // deepseek-v4.1-flash 是 DSH 实际在用的模型名（本机账本里有近 2000 条）。

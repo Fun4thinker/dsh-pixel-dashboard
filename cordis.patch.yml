@@ -1,0 +1,19 @@
+# dsh-pixel-dashboard 的组合包 patch（仓库根**就是**发布包本身）。
+#
+# 这一个包同时是「组合包」与「插件本体」：本文件把插件作为一行配置插进 profile
+# 的条目树，行名用**包名**而不是路径，因此由 profile 的 node_modules 解析——
+# 换机、升级、pnpm 重新布局都不影响。
+#
+# 这也是社区/官方推荐的单包形态（见 DSH docs/user/develop/basic/publish.md 与
+# dshmarket 等社区插件）：仓库根就是一个声明了 `dsh.bundle` 的包，于是
+#   dsh plugin --profile web add github:<user>/<repo>
+# 这一条命令就能装、并且会被自动加进 `dsh.profile.bundles`。
+# 拆成「插件包 + 组合包」两个包时做不到这一点：dsh plugin 只接收命令行上那一个
+# 规格，而组合包依赖的插件包若不在 npm 上，pnpm 会卡在解析它。
+#
+# 卸载：dsh plugin --profile web remove dsh-pixel-dashboard
+# 临时停用：给下面这行加 disabled: true
+
+- insert:
+    - id: pixel-dashboard
+      name: 'dsh-pixel-dashboard'

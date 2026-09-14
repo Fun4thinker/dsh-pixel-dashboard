@@ -11,6 +11,7 @@
  *   lib/ledger.js    本机用量账本
  *   lib/client.js    浏览器半边产物（window.__ModuleLoader__ 容器格式）
  *
+ * 仓库根就是发布包本身（单包形态），因此产物直接落在根的 lib/。
  * 客户端源码也一并放进 lib/client/，方便线上排查时对照。
  *
  * 用法: node tools/build.mjs
@@ -24,7 +25,9 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
 const srcDir = join(root, 'src')
-const outDir = join(root, 'packages', 'plugin', 'lib')
+// 仓库根**就是**发布包（单包形态，见根 cordis.patch.yml 的说明），
+// 因此产物直接落在根的 lib/ 下。
+const outDir = join(root, 'lib')
 
 /** 宿主侧的模块：改动这些会影响实现版本号。 */
 const HOST_SOURCES = ['host.js', 'pricing.js', 'ledger.js', 'balance.js', 'plans.js', 'prefs.js']
@@ -46,14 +49,9 @@ mkdirSync(outDir, { recursive: true })
 for (const file of HOST_SOURCES) cpSync(join(srcDir, file), join(outDir, file))
 cpSync(join(srcDir, 'client'), join(outDir, 'client'), { recursive: true })
 
-// 1b) 把仓库根的 LICENSE 拷进两个包：package.json 的 files 里都声明了它，
-//     少了这份文件 npm 会静默跳过（不报错），发布出去就没有许可证信息。
-//     只维护仓库根这一份，避免两处内容漂移。
-for (const pkg of ['plugin', 'bundle']) {
-  const target = join(root, 'packages', pkg, 'LICENSE')
-  if (!existsSync(join(root, 'LICENSE'))) throw new Error('仓库根缺少 LICENSE，无法随包发布')
-  cpSync(join(root, 'LICENSE'), target)
-}
+// 1b) LICENSE 只维护仓库根这一份，而它是发布包的一部分（package.json 的 files
+//     里声明了它）。少了它 npm 只是静默跳过、不报错，发布出去就没有许可证信息。
+if (!existsSync(join(root, 'LICENSE'))) throw new Error('仓库根缺少 LICENSE，无法随包发布')
 
 // 2) 生成装载入口
 const version = sourceHash()
@@ -93,22 +91,37 @@ for (const file of readdirSync(join(outDir, 'client'))) {
 }
 injectVersion(join(outDir, 'client.js'), true)
 
-// 5) 校验包根清单：
-//    包根是 packages/plugin/，产物只是它的 lib/。在 lib/ 里再放一份 package.json
-//    会形成嵌套包根，让发布内容与解析路径都变得含糊；这里只做一致性检查。
-const manifestPath = join(root, 'packages', 'plugin', 'package.json')
+// 5) 校验包根清单：仓库根就是发布包，产物只是它的 lib/。在 lib/ 里再放一份
+//    package.json 会形成嵌套包根，让发布内容与解析路径都变得含糊；
+//    这里只做一致性检查。
+//
+//    这几条不是形式主义：`github:` 直装与 npm 直装都直接加载 lib/，任何一条对不上
+//    都会让插件在浏览器里静默不注册。尤其 dsh.bundle 缺了的话，`dsh plugin add`
+//    只会把它当普通库装进 profile，**不进 dsh.profile.bundles，插件永不激活**。
+const manifestPath = join(root, 'package.json')
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
 if (manifest.main !== './lib/index.js') {
-  throw new Error(`packages/plugin/package.json 的 main 应为 ./lib/index.js，实际 ${manifest.main}`)
+  throw new Error(`package.json 的 main 应为 ./lib/index.js，实际 ${manifest.main}`)
 }
 if (manifest.exports?.['./client'] !== './lib/client.js') {
-  throw new Error(`packages/plugin/package.json 的 exports["./client"] 应指向 ./lib/client.js`)
+  throw new Error(`package.json 的 exports["./client"] 应指向 ./lib/client.js`)
 }
 if (manifest.dsh?.client?.platform !== 'web') {
-  throw new Error('packages/plugin/package.json 必须声明 dsh.client.platform = "web"，否则浏览器半边不会被加载')
+  throw new Error('package.json 必须声明 dsh.client.platform = "web"，否则浏览器半边不会被加载')
+}
+if (manifest.dsh?.bundle?.patch === undefined) {
+  throw new Error('package.json 必须声明 dsh.bundle.patch——否则 dsh plugin add 不会把本包装进 dsh.profile.bundles，插件永不激活')
 }
 if (!Array.isArray(manifest.files) || !manifest.files.includes('lib')) {
-  throw new Error('packages/plugin/package.json 的 files 必须包含 lib，否则发布时产物会被漏掉')
+  throw new Error('package.json 的 files 必须包含 lib，否则发布时产物会被漏掉')
+}
+if (!existsSync(join(root, 'cordis.patch.yml'))) {
+  throw new Error('仓库根缺少 cordis.patch.yml（dsh.bundle.patch 指向它）')
+}
+// patch 的行名必须是**包名**，否则 profile 的 node_modules 解析不到
+const patch = readFileSync(join(root, 'cordis.patch.yml'), 'utf8')
+if (!patch.includes(`'${manifest.name}'`)) {
+  throw new Error(`cordis.patch.yml 里没有以包名 '${manifest.name}' 引用的行，profile 会解析失败`)
 }
 
-console.log(`\n已生成 packages/plugin/lib/（实现版本 ${version}）`)
+console.log(`\n已生成 lib/（包 ${manifest.name}@${manifest.version}，实现版本 ${version}）`)

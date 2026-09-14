@@ -67,8 +67,8 @@ function must(condition, message) {
 }
 
 // ── 第 1 关：浏览器产物能加载并正确注册 ──────────────────────────
-/** 校验哪个构建产物：默认 packages/plugin/lib，可用 `node tools/render-check.mjs <目录>` 覆盖。 */
-const deployRoot = process.argv[2] ?? 'packages/plugin/lib'
+/** 校验哪个构建产物：默认根 lib，可用 `node tools/render-check.mjs <目录>` 覆盖。 */
+const deployRoot = process.argv[2] ?? 'lib'
 const bundle = readFileSync(join(root, deployRoot, 'client.js'), 'utf8')
 let factory
 const mountedStyles = []
@@ -217,7 +217,7 @@ must(dockHtml.includes('本次会话'), '费用条应说明这是本次会话')
 must(dockHtml.includes('2,000') || dockHtml.includes('2000'), '费用条应显示 token 数')
 
 // 纯展示层：直接喂金额，断言格式与分档说明（金额来自网络，静态渲染里拿不到）
-const viewModule = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'client', 'SessionCost.js')).href)
+const viewModule = await import(pathToFileURL(join(root, 'lib', 'client', 'SessionCost.js')).href)
 const { SessionCostView } = viewModule
 must(typeof SessionCostView === 'function', 'SessionCost.js 应导出 SessionCostView')
 
@@ -262,7 +262,7 @@ must(!partial.includes('undefined'), `费用条不应渲染出 undefined：${par
 
 // ── 账户余额：费用条旁那一枚 + 看板卡片 ──────────────────────────
 // SessionCostView 已在上面的费用条一节里取过，这里只补拿余额相关的模块。
-const { balanceStatus, formatMoney, balanceSummary } = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'client', 'balance.js')).href)
+const { balanceStatus, formatMoney, balanceSummary } = await import(pathToFileURL(join(root, 'lib', 'client', 'balance.js')).href)
 
 // 币种与符号：官方两种币都认识，未知币种显示代码而不是瞎猜符号
 must(formatMoney(12.34, 'CNY') === '¥12.34', `CNY 应显示 ¥，实际 ${formatMoney(12.34, 'CNY')}`)
@@ -323,7 +323,7 @@ const iconHtml = renderToStaticMarkup(React.createElement(entryRegistration.comp
 must(iconHtml.includes('<svg'), '侧栏图标没有渲染出 svg')
 
 // ── 字体回归闸门：绝不能再引入点阵/像素字体或全局强制换字体 ────────
-const { STYLES } = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'client', 'theme.js')).href)
+const { STYLES } = await import(pathToFileURL(join(root, 'lib', 'client', 'theme.js')).href)
 const css = STYLES.map(([, text]) => text).join('\n')
 for (const banned of ['Fusion Pixel', 'Zpix', 'pixel-font']) {
   must(!css.includes(banned), `样式里出现了点阵字体「${banned}」，读起来累，必须用正常字体`)
@@ -384,7 +384,7 @@ for (const dead of ['.px-clock-value', '.px-offpeak']) {
 }
 
 // ── 第 2 关：用真实形状数据把整页渲染出来 ────────────────────────
-const { View } = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'client', 'dashboard.js')).href)
+const { View } = await import(pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
 must(typeof View === 'function', 'dashboard.js 没有导出 View')
 
 const payload = buildPayload()
@@ -406,7 +406,7 @@ must(glmHtml.includes('估算价'), '价目表里没有的模型必须标成估�
 // ── 订阅套餐额度：纯逻辑 + 看板卡片 + 费用条那一枚 ───────────────
 const {
   formatQuota, windowProgress, quotaTone, formatReset, providerStatus, hasAnyQuota, tightestWindow,
-} = await import(pathToFileURL(join(root, 'packages', 'plugin', 'lib', 'client', 'plans.js')).href)
+} = await import(pathToFileURL(join(root, 'lib', 'client', 'plans.js')).href)
 
 // 单位：智谱是积分、Command Code 是美元信用额，数值必须带单位前缀
 must(formatQuota(12000, '') === '12000', `整数应原样显示，实际 ${formatQuota(12000, '')}`)

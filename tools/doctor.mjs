@@ -37,12 +37,12 @@ const flags = []
 const note = (level, message, detail) => flags.push({ level, message, detail })
 
 // ── 1. 构建产物 ────────────────────────────────────────────────
-const builtEntry = join(root, 'packages', 'plugin', 'lib', 'index.js')
+const builtEntry = join(root, 'lib', 'index.js')
 let builtVersion
 if (!existsSync(builtEntry)) {
   note('error', '仓库里还没有构建产物', '先运行：node tools/build.mjs')
 } else {
-  builtVersion = /IMPL_VERSION = '([^']+)'/.exec(readFileSync(join(root, 'packages', 'plugin', 'lib', 'host.js'), 'utf8'))?.[1]
+  builtVersion = /IMPL_VERSION = '([^']+)'/.exec(readFileSync(join(root, 'lib', 'host.js'), 'utf8'))?.[1]
   note('ok', `构建产物就绪（实现版本 ${builtVersion ?? '未知'}）`, root)
 }
 

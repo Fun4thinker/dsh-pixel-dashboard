@@ -22,9 +22,9 @@ import {
   pricingOf,
   ratesOf,
   zonedParts,
-} from '../packages/plugin/lib/pricing.js'
-import { UsageCatalog } from '../packages/plugin/lib/host.js'
-import { UsageLedger, mergeRecords, parseLedger, recordOf, usageOfRecord } from '../packages/plugin/lib/ledger.js'
+} from '../lib/pricing.js'
+import { UsageCatalog } from '../lib/host.js'
+import { UsageLedger, mergeRecords, parseLedger, recordOf, usageOfRecord } from '../lib/ledger.js'
 
 let passed = 0
 /**

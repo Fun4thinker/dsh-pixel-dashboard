@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '..')
 const srcDir = join(root, 'src', 'client')
-const outDir = join(root, 'packages', 'plugin', 'lib')
+const outDir = join(root, 'lib')
 const outFile = join(outDir, 'client.js')
 
 /**
@@ -152,11 +152,10 @@ const registry = modules.map((module) => {
     + `\t\t\t${module.code.trim()}\n${exportLines}},`
 }).join('\n')
 
-// 注册 id 必须是插件包名：DSH 网关按 profile 配置行里的包名（组合包 patch 的
-// name: 'dsh-pixel-dashboard'）校验 bundle 是否注册了同名模块。仓库根 package.json
-// 的 name 是开发仓库自己的（…-repo），从这里取 id 会让加载器报
-// "loaded without registering"，因此这里读 packages/plugin/package.json。
-const packageId = JSON.parse(readFileSync(join(root, 'packages', 'plugin', 'package.json'), 'utf8')).name
+// 注册 id 必须是插件包名：DSH 网关按 profile 配置行里的包名（cordis.patch.yml 的
+// name: 'dsh-pixel-dashboard'）校验 bundle 是否注册了同名模块。仓库根就是发布包，
+// 因此这里直接读根的 package.json。
+const packageId = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).name
 const bundle = `window.__ModuleLoader__.load({
 	id: ${JSON.stringify(packageId)},
 	factory: (platformRequire) => {
