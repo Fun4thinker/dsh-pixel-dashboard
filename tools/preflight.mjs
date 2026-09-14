@@ -449,10 +449,10 @@ assert.equal(plansPayload.enabled, true, '默认应启用套餐监控')
 assert.ok(Array.isArray(plansPayload.providers), 'providers 应是数组')
 assert.deepEqual(
   plansPayload.providers.map((provider) => provider.id).sort(),
-  ['commandcode', 'zhipu'],
-  '应包含智谱与 Command Code 两家',
+  ['commandcode', 'volcengine', 'zhipu'],
+  '应包含智谱、Command Code 与火山方舟三家',
 )
-// 预检环境既没有凭据服务也没有环境变量、更没有 CLI 凭据文件：两家都应明说没配 Key
+// 预检环境既没有凭据服务也没有环境变量、更没有 CLI 凭据文件：三家都应明说没配 Key
 for (const provider of plansPayload.providers) {
   assert.equal(provider.ok, false, `${provider.id} 未配 Key 时不应报成功`)
   assert.equal(provider.reason, 'no-key', `${provider.id} 应回报 no-key`)
@@ -552,6 +552,237 @@ assert.equal(bareMonth.total, undefined, '没有总额时 total 应是 undefined
 assert.equal(maskSecret('sk-abcdefghijklmnop'), '…mnop', '长密钥只露尾 4 位')
 assert.equal(maskSecret('short'), '(已打码)', '过短的密钥整体打码')
 assert.ok(!maskSecret('sk-abcdefghijklmnop').includes('abcdefgh'), '打码结果不得含密钥主体')
+
+// ── 火山方舟：签名 V4 + 两种 plan 的解析 ────────────────────────
+// 火山用量接口在**控制面** OpenAPI 上，要 AK/SK 签名；推理用的 ark- Key 会被网关
+// 在格式层拒掉（实测 400 InvalidAuthorization）。这里把签名的结构与不变量钉住。
+const {
+  parseVolcAgentPlan, parseVolcCodingPlan, volcWindowName, VOLC_AK_ENVS, VOLC_SK_ENVS,
+} = plansModule
+
+// 凭据候选**不得**混入 provider 派生的推理 Key：那把在这里必然失败，纳进来只会误导
+assert.ok(!VOLC_AK_ENVS.some((name) => name === 'FANGZHOU_API_KEY'),
+  '火山 AK 候选不得包含 FANGZHOU_API_KEY（那是推理 Key，签不了名）')
+assert.ok(!VOLC_AK_ENVS.includes('COMMAND_CODE_API_KEY'), '火山 AK 候选不得混入别家引用名')
+assert.ok(VOLC_AK_ENVS.includes('VOLC_ACCESS_KEY_ID'), '火山 AK 候选应含约定名')
+assert.ok(VOLC_SK_ENVS.includes('VOLC_SECRET_ACCESS_KEY'), '火山 SK 候选应含约定名')
+// AK 与 SK 是两把不同的引用名，不能是同一个
+assert.notDeepEqual(VOLC_AK_ENVS, VOLC_SK_ENVS, 'AK 与 SK 的候选名必须不同')
+
+// 窗口名归一：线上 Level=session 就是控制台的「5 小时」，照抄字面会显示成陌生的「会话」
+assert.equal(volcWindowName('session'), 'fiveHour', 'session 必须映射成 5 小时窗口')
+assert.equal(volcWindowName('SESSION'), 'fiveHour', '大小写不敏感')
+assert.equal(volcWindowName('weekly'), 'weekly')
+assert.equal(volcWindowName('monthly'), 'monthly')
+assert.equal(volcWindowName('daily'), undefined, 'daily 不是我们要显示的窗口，应被跳过')
+assert.equal(volcWindowName(''), undefined)
+assert.equal(volcWindowName(undefined), undefined)
+
+// Agent Plan：绝对值 Quota/Used，百分比自己算；AFPDaily 刻意不取
+const afp = parseVolcAgentPlan({
+  AFPFiveHour: { Quota: 1000, Used: 250, ResetTime: 1_789_000_000_000 },
+  AFPWeekly: { Quota: 50000, Used: 12500, ResetTime: 1_789_500_000_000 },
+  AFPMonthly: { Quota: 200000, Used: 50000, ResetTime: 1_790_000_000_000 },
+  AFPDaily: { Quota: 999999, Used: 1, ResetTime: 1_789_000_000_000 },
+  PlanType: 'medium',
+})
+assert.equal(afp.windows.length, 3, 'AFPDaily 应被跳过，只留三个窗口')
+assert.equal(afp.planType, 'medium')
+const afpFive = afp.windows.find((win) => win.window === 'fiveHour')
+assert.equal(afpFive.used, 250)
+assert.equal(afpFive.total, 1000)
+assert.equal(afpFive.usedPercent, 25, '已用百分比应由 Used/Quota 算出')
+assert.equal(afpFive.remaining, 750, '剩余应由总额 - 已用算出')
+// ResetTime 是**毫秒**：不得被当成秒再乘 1000
+assert.equal(afpFive.resetAt, 1_789_000_000_000, 'Agent Plan 的 ResetTime 是毫秒，不应再换算')
+// Quota<=0 = 该窗口未订阅 → 跳过，而不是显示成 0 额度
+const afpUnsub = parseVolcAgentPlan({
+  AFPFiveHour: { Quota: 0, Used: 0, ResetTime: 1 },
+  AFPWeekly: { Quota: 50000, Used: 1, ResetTime: 1_789_500_000_000 },
+})
+assert.equal(afpUnsub.windows.length, 1, 'Quota<=0 的窗口应视为未订阅并跳过')
+assert.equal(afpUnsub.windows[0].window, 'weekly')
+// 完全没订 Agent Plan → 空结果（上层据此回落到 Coding Plan 探测）
+assert.equal(parseVolcAgentPlan({}).windows.length, 0, '无字段应返回空而不是编造窗口')
+
+// Coding Plan：**只给百分比**，没有 used/total；ResetTimestamp 是**秒**
+const coding = parseVolcCodingPlan({
+  QuotaUsage: [
+    { Level: 'session', Percent: 0, ResetTimestamp: 1_782_057_600 },
+    { Level: 'weekly', Percent: 1.672568, ResetTimestamp: 1_782_057_600 },
+    { Level: 'monthly', Percent: 0.836284, ResetTimestamp: 1_784_303_999 },
+  ],
+})
+assert.equal(coding.windows.length, 3)
+const codingWeek = coding.windows.find((win) => win.window === 'weekly')
+assert.equal(codingWeek.usedPercent, 1.67, '百分比应保留两位小数')
+assert.equal(codingWeek.used, undefined, '只给百分比时 used 必须是 undefined 而不是 0')
+assert.equal(codingWeek.total, undefined, '只给百分比时 total 必须是 undefined 而不是 0')
+assert.equal(codingWeek.percentOnly, true, '只有百分比时应标记 percentOnly')
+// 秒 → 毫秒：1_782_057_600 应变成 1_782_057_600_000
+assert.equal(codingWeek.resetAt, 1_782_057_600_000, 'ResetTimestamp 是秒，应换算成毫秒')
+// 认不出的窗口跳过，且计入 unparsed
+const codingPartial = parseVolcCodingPlan({
+  QuotaUsage: [{ Level: 'daily', Percent: 5 }, { Level: 'weekly', Percent: 12 }, null],
+})
+assert.equal(codingPartial.windows.length, 1, 'daily 与坏记录应被跳过')
+assert.equal(codingPartial.unparsed, 2, '跳过的记录应计入 unparsed')
+// 未订阅、字段改名等情况下返回空而不是抛错
+assert.equal(parseVolcCodingPlan({}).windows.length, 0)
+assert.equal(parseVolcCodingPlan({ QuotaUsage: 'nope' }).windows.length, 0)
+
+// 签名 V4：结构与不变量（无服务端金标准向量，因此锁定结构性契约）
+const volcModule = await import(pathToFileURL(join(root, 'lib', 'volc-sign.js')).href)
+const { signVolcRequest, canonicalQuery, volcDates, uriEncode, isVolcAuthErrorCode, volcResponseError } = volcModule
+
+// canonical query 按 key 字母序；`-` 属 unreserved 不编码
+assert.equal(canonicalQuery('GetAFPUsage', 'cn-beijing'),
+  'Action=GetAFPUsage&Region=cn-beijing&Version=2024-01-01', 'canonical query 应排序且不编码 -')
+// 编码必须按 RFC3986：encodeURIComponent 漏掉 !'()* ，照抄会签名不匹配
+assert.equal(uriEncode('a b'), 'a%20b', '空格应编码成 %20')
+assert.equal(uriEncode("!'()*"), '%21%27%28%29%2A', "!'()* 必须编码（encodeURIComponent 不会）")
+assert.equal(uriEncode('-_.~'), '-_.~', 'unreserved 四个符号不编码')
+
+const fixedNow = Date.parse('2024-06-21T00:00:00Z')
+assert.deepEqual(volcDates(fixedNow), { xDate: '20240621T000000Z', shortDate: '20240621' },
+  'X-Date 必须是 UTC 的 yyyyMMddTHHmmssZ')
+
+const signed = signVolcRequest({
+  accessKeyId: 'AKLTtest', secretAccessKey: 'secretkey', action: 'GetAFPUsage', now: fixedNow,
+})
+// 空 body 的 SHA-256 是固定值，证明走的是空 body
+assert.equal(signed.xContentSha256, 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+  '空 body 的 SHA-256 应为固定值')
+assert.equal(signed.xDate, '20240621T000000Z')
+// 算法串**没有** AWS4 前缀、scope 以 request 结尾（照搬标准 SigV4 会失败）
+assert.ok(signed.authorization.startsWith('HMAC-SHA256 Credential=AKLTtest/20240621/cn-beijing/ark/request,'),
+  `scope 或算法串不对：${signed.authorization}`)
+assert.ok(signed.authorization.includes('SignedHeaders='), 'Authorization 必须声明 SignedHeaders')
+const sigPart = /Signature=([0-9a-f]+)$/.exec(signed.authorization)
+assert.ok(sigPart !== null, 'Authorization 末尾应是十六进制签名')
+assert.equal(sigPart[1].length, 64, 'HMAC-SHA256 签名应是 64 位十六进制')
+// 端点固定：签名用的 URL 必须是官方网关，且 query 与签名用的一致
+assert.equal(signed.url, `https://open.volcengineapi.com/?${signed.query}`,
+  'URL 必须由签名的同一份 canonical query 拼出，否则签名不匹配')
+assert.ok(signed.url.startsWith('https://open.volcengineapi.com/'), '端点固定为官方控制面网关')
+// 确定性：同样的输入必须给出同样的签名
+const signedAgain = signVolcRequest({
+  accessKeyId: 'AKLTtest', secretAccessKey: 'secretkey', action: 'GetAFPUsage', now: fixedNow,
+})
+assert.equal(signed.authorization, signedAgain.authorization, '签名必须确定')
+// **SignedHeaders 与 canonical headers 必须同源**：这正是社区里争议「要不要排序」的那个
+// 失败模式——只要两处由同一数组生成就不可能不一致。这里断言它们集合一致。
+const declared = /SignedHeaders=([^,]+),/.exec(signed.authorization)[1].split(';')
+for (const name of ['content-type', 'host', 'x-content-sha256', 'x-date']) {
+  assert.ok(declared.includes(name), `SignedHeaders 应包含 ${name}`)
+}
+assert.equal(declared.length, 4, 'SignedHeaders 只应有这四个头')
+// 换一把 SK 必须换出不同签名（否则等于没签）
+const otherKey = signVolcRequest({
+  accessKeyId: 'AKLTtest', secretAccessKey: 'other', action: 'GetAFPUsage', now: fixedNow,
+})
+assert.notEqual(otherKey.authorization, signed.authorization, '不同 SK 必须得到不同签名')
+
+// 错误信封：火山业务错误常**以 200 携带信封**返回，只看状态码会把失败当成功
+const envelope = volcResponseError({
+  ResponseMetadata: { Error: { Code: 'InvalidAccessKey', Message: 'invalid' } },
+})
+assert.deepEqual(envelope, { code: 'InvalidAccessKey', message: 'invalid' })
+assert.equal(volcResponseError({ ResponseMetadata: { RequestId: 'x' }, Result: {} }), undefined,
+  '没有 Error 时应返回 undefined')
+assert.equal(volcResponseError({ Error: { Code: 'X' } }).code, 'X', '顶层 Error 也要认')
+// 鉴权类判定：决定是否附上「这里要 AK/SK」那条提示
+assert.ok(isVolcAuthErrorCode('InvalidAccessKey'), 'InvalidAccessKey 属鉴权类')
+assert.ok(isVolcAuthErrorCode('InvalidAuthorization'), 'InvalidAuthorization 属鉴权类')
+assert.ok(isVolcAuthErrorCode('SignatureDoesNotMatch'), '签名不匹配属鉴权类')
+assert.ok(isVolcAuthErrorCode('AccessDenied'), 'AccessDenied 属鉴权类')
+assert.ok(!isVolcAuthErrorCode('InvalidActionOrVersion'), 'Action 名写错不是鉴权问题')
+assert.ok(!isVolcAuthErrorCode('InternalError'), '服务端错误不是鉴权问题')
+
+// 端到端（注入 fetch）：签名头必须真的带上，且不能把 AK/SK 写进响应
+const volcSeen = {}
+const volcService = new (await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)).PlansService({
+  credentials: () => ({
+    resolve: async (ref) => {
+      if (ref === 'VOLC_ACCESS_KEY_ID') return { value: 'AKLTpreflight0123456789', source: 'file' }
+      if (ref === 'VOLC_SECRET_ACCESS_KEY') return { value: 'c2VjcmV0LXByZWZsaWdodC0wMDAwMDAwMA', source: 'file' }
+      return undefined
+    },
+  }),
+  prefs: async () => ({ plansEnabled: true }),
+  env: {},
+  fetchImpl: async (url, init) => {
+    volcSeen.url = url
+    volcSeen.headers = init?.headers ?? {}
+    // 只有第一个 Action 返回数据；第二个不该被调用
+    if (url.includes('GetAFPUsage')) {
+      return new Response(JSON.stringify({
+        ResponseMetadata: { RequestId: 'x' },
+        Result: { AFPFiveHour: { Quota: 100, Used: 40, ResetTime: 1_789_000_000_000 }, PlanType: 'small' },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    volcSeen.secondCalled = true
+    return new Response('{}', { status: 200 })
+  },
+})
+const volcPayload = await volcService.read({ refresh: true })
+const volcProvider = volcPayload.providers.find((item) => item.id === 'volcengine')
+assert.ok(volcProvider !== undefined, '响应里应有火山那一家')
+assert.equal(volcProvider.ok, true, `火山应取数成功：${JSON.stringify(volcProvider)}`)
+assert.equal(volcProvider.windows.length, 1)
+assert.equal(volcProvider.windows[0].usedPercent, 40, '40/100 应算出 40%')
+// 请求必须真的发出签名头，且端点是控制面网关
+assert.ok(volcSeen.url.startsWith('https://open.volcengineapi.com/?'), '应请求控制面网关')
+assert.ok(/authorization/i.test(Object.keys(volcSeen.headers).join(' ')) || volcSeen.headers.authorization !== undefined,
+  '必须带 Authorization 头')
+assert.ok(String(volcSeen.headers.authorization ?? '').startsWith('HMAC-SHA256 Credential='),
+  'Authorization 必须是火山 HMAC-SHA256 形式')
+assert.equal(volcSeen.headers['x-content-sha256'],
+  'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', '空 body 的 sha256 头')
+assert.ok(volcSeen.secondCalled !== true, '第一个 Action 成功就不该再试第二个')
+// 隐私：AK/SK 的值绝不能出现在响应里（这条路径直达浏览器）
+const volcBody = JSON.stringify(volcProvider)
+for (const secret of ['AKLTpreflight0123456789', 'c2VjcmV0LXByZWZsaWdodC0wMDAwMDAwMA']) {
+  assert.ok(!volcBody.includes(secret), `火山响应里泄露了凭据值：${secret}`)
+}
+assert.ok(!volcBody.includes('c2VjcmV0'), '响应不得含 SK 任何片段')
+// 打码后只留尾 4 位，可用于确认「用的是哪一把」
+assert.ok(volcProvider.keyHint.includes('6789'), '应回报打码后的 AK 尾段')
+
+// 只配了 AK 没配 SK：必须指出缺的是哪一个
+const halfService = new (await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)).PlansService({
+  credentials: () => ({
+    resolve: async (ref) => (ref === 'VOLC_ACCESS_KEY_ID'
+      ? { value: 'AKLTonlyak0123456789', source: 'file' }
+      : undefined),
+  }),
+  prefs: async () => ({ plansEnabled: true }),
+  env: {},
+  fetchImpl: async () => { throw new Error('不该发请求：凭据不齐') },
+})
+const halfProvider = (await halfService.read({ refresh: true })).providers.find((item) => item.id === 'volcengine')
+assert.equal(halfProvider.ok, false)
+assert.equal(halfProvider.reason, 'no-key')
+assert.equal(halfProvider.keyRef, 'VOLC_SECRET_ACCESS_KEY', '应指出缺的是 SK')
+assert.ok(halfProvider.hint.includes('AccessKey'), '应说明这里要的是 AccessKey')
+
+// 鉴权被拒：必须给出「这里要 AK/SK 而不是推理 Key」这条唯一有用的提示
+const rejectedService = new (await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)).PlansService({
+  credentials: () => ({
+    resolve: async (ref) => (ref === 'VOLC_ACCESS_KEY_ID'
+      ? { value: 'AKLTbad0123456789abc', source: 'file' }
+      : ref === 'VOLC_SECRET_ACCESS_KEY' ? { value: 'bad-secret-value-here', source: 'file' } : undefined),
+  }),
+  prefs: async () => ({ plansEnabled: true }),
+  env: {},
+  fetchImpl: async () => new Response(JSON.stringify({
+    ResponseMetadata: { Error: { Code: 'InvalidAccessKey', Message: 'bad key' } },
+  }), { status: 401, headers: { 'content-type': 'application/json' } }),
+})
+const rejectedProvider = (await rejectedService.read({ refresh: true })).providers.find((item) => item.id === 'volcengine')
+assert.equal(rejectedProvider.ok, false)
+assert.equal(rejectedProvider.reason, 'rejected', '信封里的鉴权错误应归为 rejected（即使 HTTP 是 401）')
+assert.ok(rejectedProvider.hint.includes('AccessKey'), '必须提示要的是 AccessKey 而不是推理 Key')
 
 // 自动发现：读不到文件时必须安静地返回 undefined，而不是抛错
 assert.equal(readCommandCodeKey(join(tmpdir(), `dsh-pixel-nonexistent-${process.pid}.json`)), undefined, '文件不存在时应返回 undefined')

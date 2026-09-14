@@ -473,6 +473,11 @@ const planPayload = {
       { window: 'fiveHour', label: '5 小时', used: 0.24, total: 3, usedPercent: 8, remaining: 2.76 },
       { window: 'monthly', label: '每月', used: 23, total: 100, usedPercent: 23, remaining: 77 },
     ] },
+    // 火山方舟：绝对值窗口（Agent Plan），且 note 里要说清要的是 AK/SK
+    { id: 'volcengine', name: '火山方舟 Coding Plan', ok: true, plan: 'Agent Plan small', note: '用量接口在控制面，需火山账号的 AccessKey ID / Secret（与推理用的 ark- Key 是两套凭据）。', windows: [
+      { window: 'fiveHour', label: '5 小时', used: 250, total: 1000, usedPercent: 25, remaining: 750 },
+      { window: 'weekly', label: '每周', used: 12500, total: 50000, usedPercent: 25, remaining: 37500 },
+    ] },
   ],
 }
 must(hasAnyQuota(planPayload) === true, '有额度时应为真')
@@ -493,15 +498,19 @@ const plansHtml = renderToStaticMarkup(React.createElement(View, {
   plansBusy: false,
   onTogglePlans: () => {},
 }))
-for (const token of ['账户与套餐', '智谱', 'Command Code', '5 小时', '每周', '每月', 'px-quota-fill', 'px-plan-name']) {
+for (const token of ['账户与套餐', '智谱', 'Command Code', '火山方舟', '5 小时', '每周', '每月', 'px-quota-fill', 'px-plan-name']) {
   must(plansHtml.includes(token), `套餐面板缺少「${token}」`)
 }
 must(plansHtml.includes('61.8%'), '套餐面板应显示已用百分比')
 must(plansHtml.includes('没有公开文档化的额度接口'), '套餐面板必须写明接口是未文档化的（诚实披露）')
 must(plansHtml.includes('不会离开本机'), '套餐面板必须写明凭据不出本机')
 must(plansHtml.includes('编程套餐专属'), '套餐面板应提示智谱需要套餐专属 Key')
+// 火山的凭据是**另一套**（控制面 AK/SK，不是推理 Key）。界面必须说清楚，
+// 否则用户会把自己唯一的 ark- Key 填进去、然后一直失败。
+must(plansHtml.includes('AccessKey'), '套餐面板应说明火山要的是 AccessKey（不是推理 Key）')
 // 充值 / 管理入口：用户看到额度不够时的下一步动作
 must(plansHtml.includes('commandcode.ai/studio'), '套餐面板应给出 Command Code 管理入口')
+must(plansHtml.includes('console.volcengine.com'), '套餐面板应给出火山控制台入口')
 must(plansHtml.includes('platform.deepseek.com/usage'), '余额面板应给出 DeepSeek 官方用量/充值入口')
 
 // 没配 Key 的两家：必须给出可读原因，且看板其余部分照常
@@ -515,12 +524,16 @@ const plansEmptyHtml = renderToStaticMarkup(React.createElement(View, {
     providers: [
       { id: 'zhipu', name: '智谱 GLM Coding Plan', ok: false, reason: 'no-key', keyRef: 'ZHIPU_CODING_API_KEY', windows: [], supportedWindows: ['fiveHour', 'weekly'] },
       { id: 'commandcode', name: 'Command Code', ok: false, reason: 'no-key', keyRef: 'COMMAND_CODE_API_KEY', windows: [], supportedWindows: ['fiveHour', 'weekly', 'monthly'] },
+      // 火山只配了 AK 没配 SK：必须指出缺的是哪一个，而不是笼统说「没配 Key」
+      { id: 'volcengine', name: '火山方舟 Coding Plan', ok: false, reason: 'no-key', keyRef: 'VOLC_SECRET_ACCESS_KEY', keyRefs: ['VOLC_SECRET_ACCESS_KEY', 'VOLCENGINE_SECRET_ACCESS_KEY'], hint: '需要在火山引擎控制台创建 AccessKey（不是方舟的推理 API Key），两者都要配齐。', windows: [], supportedWindows: ['fiveHour', 'weekly', 'monthly'] },
     ],
   },
   onTogglePlans: () => {},
 }))
 must(plansEmptyHtml.includes('ZHIPU_CODING_API_KEY'), '未配智谱 Key 时应指明凭据名')
 must(plansEmptyHtml.includes('COMMAND_CODE_API_KEY'), '未配 Command Code Key 时应指明凭据名')
+must(plansEmptyHtml.includes('VOLC_SECRET_ACCESS_KEY'), '火山缺 SK 时应指明缺的是哪一个')
+must(plansEmptyHtml.includes('AccessKey'), '火山未配时应说明要的是 AccessKey')
 must(plansEmptyHtml.includes('费用明细'), '套餐不可用时看板其余部分仍应渲染')
 
 // 套餐关闭态：必须说明已关闭

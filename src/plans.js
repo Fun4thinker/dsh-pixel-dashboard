@@ -44,6 +44,15 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import {
+  VOLC_API_VERSION,
+  VOLC_CONTENT_TYPE,
+  VOLC_DEFAULT_REGION,
+  VOLC_OPENAPI_HOST,
+  isVolcAuthErrorCode,
+  signVolcRequest,
+  volcResponseError,
+} from './volc-sign.js'
 
 /** 智谱 quota 接口：固定官方域名。 */
 export const ZHIPU_QUOTA_URL = 'https://open.bigmodel.cn/api/monitor/usage/quota/limit'
@@ -59,6 +68,32 @@ export const COMMAND_CODE_CREDITS_PATH = '/alpha/billing/credits'
 
 /** Command Code 订阅周期接口，用于补出月度刷新时间。 */
 export const COMMAND_CODE_SUBSCRIPTION_URL = 'https://api.commandcode.ai/alpha/billing/subscriptions'
+
+/**
+ * 火山方舟（Volcengine Ark）用量接口路径，供界面上标出来源。
+ *
+ * 形如 `/?Action=...&Region=...&Version=...`；Action 有两个候选，见
+ * {@link VOLC_ACTIONS}。
+ */
+export const VOLC_QUOTA_PATH = `/?Action=<Action>&Version=${VOLC_API_VERSION}`
+
+/** 火山控制面 OpenAPI 网关（与数据面推理域名 ark.cn-beijing.volces.com 不同）。 */
+export const VOLC_QUOTA_HOST = VOLC_OPENAPI_HOST
+
+/**
+ * 火山方舟的两个用量 Action，按探测顺序排列。
+ *
+ * 同一账号可能订的是 Agent Plan（回**绝对值** Quota/Used）或 Coding Plan
+ * （只回**百分比** Percent），官方没有「一次问清」的接口，所以按顺序试：
+ *   1. `GetAFPUsage` — Agent Plan，绝对值；
+ *   2. `GetCodingPlanUsage` — Coding Plan，百分比。
+ *
+ * 两家共用同一份 AK/SK，因此**鉴权失败直接停**、不再试下一个。
+ */
+export const VOLC_ACTIONS = [
+  { action: 'GetAFPUsage', plan: 'Agent Plan' },
+  { action: 'GetCodingPlanUsage', plan: 'Coding Plan' },
+]
 
 /**
  * 复刻 DSH 从 provider 路由名派生凭据引用的规则。
@@ -106,6 +141,9 @@ export const COMMAND_CODE_ROUTES = ['command-code', 'commandcode', 'command_code
 /** 智谱常见的自定义 provider 路由名。 */
 export const ZHIPU_ROUTES = ['zhipu-coding', 'zai-coding-cn', 'zhipu', 'bigmodel', 'glm']
 
+/** 火山方舟常见的自定义 provider 路由名。 */
+export const VOLC_ROUTES = ['fangzhou', 'volcengine', 'ark', 'volces', 'doubao']
+
 /** 智谱 Coding Plan 的候选凭据引用名（按优先级）。 */
 export const ZHIPU_KEY_ENVS = candidateRefs(
   ['ZHIPU_CODING_API_KEY', 'ZHIPU_API_KEY', 'BIGMODEL_API_KEY'],
@@ -118,11 +156,30 @@ export const COMMAND_CODE_KEY_ENVS = candidateRefs(
   COMMAND_CODE_ROUTES,
 )
 
+/**
+ * 火山方舟的候选凭据引用名（AccessKey ID）。
+ *
+ * **注意与另外两家的根本区别**：火山的用量接口要的是**账号级 AK/SK 签名**，
+ * 不是推理用的 `ark-` Bearer Key（后者在网关格式层就被拒，见 lib/volc-sign.js）。
+ * 因此这里刻意**不派生** `FANGZHOU_API_KEY` 那类 provider 引用名——那把是推理 Key，
+ * 拿它去签名只会得到 401/400，反而误导。只认名字里明确写着 AK 的两项。
+ */
+export const VOLC_AK_ENVS = ['VOLC_ACCESS_KEY_ID', 'VOLCENGINE_ACCESS_KEY_ID']
+
+/** 火山方舟的候选凭据引用名（Secret Access Key），与 AK 一一对应。 */
+export const VOLC_SK_ENVS = ['VOLC_SECRET_ACCESS_KEY', 'VOLCENGINE_SECRET_ACCESS_KEY']
+
 /** 兼容旧名：第一候选。 */
 export const ZHIPU_KEY_ENV = ZHIPU_KEY_ENVS[0]
 
 /** 兼容旧名：第一候选。 */
 export const COMMAND_CODE_KEY_ENV = COMMAND_CODE_KEY_ENVS[0]
+
+/** 火山 AK 的第一候选。 */
+export const VOLC_AK_ENV = VOLC_AK_ENVS[0]
+
+/** 火山 SK 的第一候选。 */
+export const VOLC_SK_ENV = VOLC_SK_ENVS[0]
 
 /** 单次上游请求超时。 */
 export const REQUEST_TIMEOUT_MS = 12_000
@@ -310,6 +367,108 @@ export function parseCommandCodeCredits(payload, subscription) {
     ? data.plan
     : typeof data.subscription?.plan === 'string' ? data.subscription.plan : ''
   return { plan, windows, unparsed }
+}
+
+/**
+ * 火山方舟 Coding Plan 的窗口名归一。
+ *
+ * 线上字段是 `Level`，实测取值 `session` / `weekly` / `monthly`（另有 `daily`）。
+ * **`session` 就是控制台上的「5 小时」**——照抄字面会显示成一个陌生的「会话」，
+ * 所以这里显式映射，并保留若干同义写法做防御。
+ * @param {string} label - 原始窗口名。
+ * @returns {'fiveHour'|'weekly'|'monthly'|undefined} 归一窗口名。
+ */
+export function volcWindowName(label) {
+  const text = String(label ?? '').toLowerCase().trim()
+  if (['session', '5h', 'fivehour', 'five_hour', 'five-hour', 'rolling_5h', 'rolling'].includes(text)) {
+    return 'fiveHour'
+  }
+  if (['weekly', 'week', '7d'].includes(text)) return 'weekly'
+  if (['monthly', 'month'].includes(text)) return 'monthly'
+  return undefined
+}
+
+/**
+ * 解析火山方舟 `GetAFPUsage`（Agent Plan）的 `Result`。
+ *
+ * 三个窗口 `AFPFiveHour` / `AFPWeekly` / `AFPMonthly` 各给**绝对值**
+ * `Quota` / `Used`，因此百分比自己算（比接口口径可控）。`ResetTime` 是**毫秒**。
+ *
+ * 两条照做不误的规则：
+ *   1. `Quota <= 0` 视为该窗口未订阅/未启用，**跳过**——这也是把「已鉴权但没订
+ *      Agent Plan」识别成空结果、从而回落到 Coding Plan 探测的依据。
+ *   2. `AFPDaily` **刻意不取**：官方控制台自己把它隐藏了（其 Quota 常高于周上限，
+ *      是历史默认值而不是强制限额），照实显示会误导。
+ * @param {object} result - 响应里的 `Result`。
+ * @returns {{windows:object[],unparsed:number,planType:string}} 归一结果。
+ */
+export function parseVolcAgentPlan(result) {
+  const windows = []
+  let unparsed = 0
+  for (const [key, window] of [
+    ['AFPFiveHour', 'fiveHour'],
+    ['AFPWeekly', 'weekly'],
+    ['AFPMonthly', 'monthly'],
+  ]) {
+    const raw = result?.[key]
+    if (raw === null || raw === undefined) continue
+    if (typeof raw !== 'object') {
+      unparsed += 1
+      continue
+    }
+    const total = numberOrUndefined(raw.Quota)
+    // 未订阅/未启用的窗口：不算「坏数据」，静默跳过
+    if (total === undefined || total <= 0) continue
+    windows.push(buildWindow({
+      window,
+      used: numberOrUndefined(raw.Used),
+      total,
+      resetAt: normalizeEpoch(raw.ResetTime),
+      source: 'volcengine',
+    }))
+  }
+  const planType = typeof result?.PlanType === 'string' ? result.PlanType.trim() : ''
+  return { windows, unparsed, planType }
+}
+
+/**
+ * 解析火山方舟 `GetCodingPlanUsage`（Coding Plan）的 `Result`。
+ *
+ * 这个接口**只给百分比**，没有 used/total（官方口径如此），所以窗口会带
+ * `percentOnly` 标记，界面上说明「官方只给了百分比」——不假装精确。
+ * `ResetTimestamp` 是**秒**（与 Agent Plan 的毫秒不同，`normalizeEpoch` 会分辨）。
+ *
+ * 数组字段名按 `QuotaUsage` 取，另留两个同义名做防御（该接口无逐字段官方文档）。
+ * @param {object} result - 响应里的 `Result`。
+ * @returns {{windows:object[],unparsed:number}} 归一结果。
+ */
+export function parseVolcCodingPlan(result) {
+  const windows = []
+  let unparsed = 0
+  const list = result?.QuotaUsage ?? result?.Usages ?? result?.Details
+  if (!Array.isArray(list)) return { windows, unparsed }
+
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') {
+      unparsed += 1
+      continue
+    }
+    const window = volcWindowName(item.Level ?? item.Type ?? item.Period ?? item.Window ?? item.Label)
+    // 认不出的窗口（如 daily）跳过：宁可少显示一个，也不把它挂到别的窗口上
+    if (window === undefined) {
+      unparsed += 1
+      continue
+    }
+    windows.push(buildWindow({
+      window,
+      usedPercent: numberOrUndefined(
+        item.Percent ?? item.UsedPercent ?? item.UsagePercent,
+      ),
+      resetAt: normalizeEpoch(item.ResetTimestamp ?? item.ResetTime),
+      source: 'volcengine',
+    }))
+  }
+  return { windows, unparsed }
 }
 
 /** 是否有可用的有限数字。 */
@@ -502,6 +661,7 @@ export class PlansService {
     this.inflight = Promise.all([
       this.#readZhipu(),
       this.#readCommandCode(),
+      this.#readVolcengine(),
     ])
       .then((providers) => {
         const payload = { enabled: true, fetchedAt: Date.now(), providers }
@@ -640,6 +800,178 @@ export class PlansService {
       authFile,
       windows: parsed.windows,
       ...(parsed.unparsed > 0 ? { warning: `有 ${parsed.unparsed} 条额度记录无法识别（接口可能已变更）` } : {}),
+    }
+  }
+
+  /**
+   * 火山方舟（Agent Plan / Coding Plan）额度。
+   *
+   * 与另外两家的**根本区别**：这不是数据面的 Bearer 接口，而是控制面 OpenAPI，
+   * 要求 AK/SK 签名（见 lib/volc-sign.js）。推理用的 `ark-` Key 塞进 Authorization
+   * 会在网关**格式层**被拒（400 / InvalidAuthorization），所以：
+   *
+   *   - 凭据只认 `VOLC_ACCESS_KEY_ID` / `VOLC_SECRET_ACCESS_KEY` 这类明确写着 AK 的
+   *     引用名，**刻意不纳入 provider 派生的推理 Key**——那把在这里必然失败，
+   *     纳进来只会把用户引到错误的排查方向。
+   *   - 鉴权类错误**立刻停**：两个 Action 共用同一份 AK/SK，换一个试没有意义。
+   *   - 其它错误继续试下一个 Action（Agent Plan ↔ Coding Plan 是两种订阅）。
+   *
+   * @returns {Promise<object>} 该家的结果。
+   */
+  async #readVolcengine() {
+    const base = {
+      id: 'volcengine',
+      name: '火山方舟 Coding Plan',
+      docURL: 'https://console.volcengine.com/ark',
+      endpoint: VOLC_QUOTA_PATH,
+      supportedWindows: ['fiveHour', 'weekly', 'monthly'],
+      // 界面上必须说清楚这里要的是 AK/SK 而不是推理 Key——这是唯一容易配错的地方
+      note: '用量接口在控制面，需火山账号的 AccessKey ID / Secret（与推理用的 ark- Key 是两套凭据）。',
+    }
+    const accessKeyId = await this.resolveKey(VOLC_AK_ENVS)
+    const secretAccessKey = await this.resolveKey(VOLC_SK_ENVS)
+    if (accessKeyId === undefined || secretAccessKey === undefined) {
+      // 只配了一半时要说清缺哪一个，否则用户不知道该补什么
+      const missing = accessKeyId === undefined ? VOLC_AK_ENV : VOLC_SK_ENV
+      return {
+        ...base,
+        ok: false,
+        reason: 'no-key',
+        keyRef: missing,
+        keyRefs: accessKeyId === undefined ? VOLC_AK_ENVS : VOLC_SK_ENVS,
+        hint: '需要在火山引擎控制台创建 AccessKey（不是方舟的推理 API Key），两者都要配齐。',
+        windows: [],
+      }
+    }
+
+    const errors = []
+    for (const { action, plan } of VOLC_ACTIONS) {
+      const call = await this.#volcCall(action, accessKeyId.value, secretAccessKey.value, base)
+      if (call.error !== undefined) {
+        // 鉴权类：两个 Action 共用凭据，换一个也是同样结果，直接停
+        if (call.auth === true) {
+          return {
+            ...base,
+            ok: false,
+            reason: 'rejected',
+            error: call.error,
+            hint: '这里要的是火山账号的 AccessKey ID / Secret Access Key，而不是方舟推理用的 ark- 开头的 Key；'
+              + '请到火山引擎控制台「访问控制 → 访问密钥」创建。',
+            keyRef: accessKeyId.ref,
+            keySource: accessKeyId.source,
+            keyHint: `AK ${maskSecret(accessKeyId.value)}`,
+            windows: [],
+          }
+        }
+        errors.push(`${action}: ${call.error}`)
+        continue
+      }
+      const result = call.body?.Result ?? call.body ?? {}
+      const parsed = action === 'GetAFPUsage'
+        ? parseVolcAgentPlan(result)
+        : parseVolcCodingPlan(result)
+      if (parsed.windows.length === 0) {
+        // 已鉴权但该 plan 没数据：多半是没订这一种，继续试下一个
+        errors.push(`${action}: 未返回额度窗口`)
+        continue
+      }
+      const planType = parsed.planType === undefined || parsed.planType === ''
+        ? plan
+        : `${plan} ${parsed.planType}`
+      return {
+        ...base,
+        ok: true,
+        plan: planType,
+        keyRef: accessKeyId.ref,
+        keySource: accessKeyId.source,
+        keyHint: `AK ${maskSecret(accessKeyId.value)}`,
+        windows: parsed.windows,
+        ...(parsed.unparsed > 0 ? { warning: `有 ${parsed.unparsed} 条额度记录无法识别（接口可能已变更）` } : {}),
+      }
+    }
+    // 两个 Action 都没数据：不谎报成功，把每家的话带出来
+    return {
+      ...base,
+      ok: false,
+      reason: 'request-failed',
+      error: errors.join('；') || '未返回额度窗口',
+      hint: '已通过鉴权但没查到套餐额度：确认账号确实订了 Agent Plan 或 Coding Plan。',
+      keyRef: accessKeyId.ref,
+      keySource: accessKeyId.source,
+      keyHint: `AK ${maskSecret(accessKeyId.value)}`,
+      windows: [],
+    }
+  }
+
+  /**
+   * 发一次火山控制面 OpenAPI 调用（签名 POST）。
+   *
+   * 与 {@link PlansService} 的 `#requestJson` 分开，因为火山这边有三点不同：
+   *   1. 要 POST + 签名头，不是裸 GET；
+   *   2. **失败也带 JSON 信封**——网关对签名/凭据错误常返 400/401 且 body 是
+   *      `ResponseMetadata.Error`，只看状态码无法区分「凭据不对」与「接口坏了」；
+   *   3. 需要把鉴权类错误单独标出来（`auth: true`），调用方据此决定要不要继续试。
+   *
+   * 隐私：只回报错误码与消息这两个安全字段，**不回传响应体**。
+   * @param {string} action - OpenAPI Action。
+   * @param {string} accessKeyId - AK。
+   * @param {string} secretAccessKey - SK。
+   * @param {object} base - 该家的基础字段（含 docURL 等，这里只用来取 region）。
+   * @returns {Promise<{body?:object,error?:string,auth?:boolean}>} 结果。
+   */
+  async #volcCall(action, accessKeyId, secretAccessKey, base) {
+    if (typeof this.fetchImpl !== 'function') return { error: '当前运行环境没有可用的 fetch' }
+    let signed
+    try {
+      signed = signVolcRequest({
+        accessKeyId,
+        secretAccessKey,
+        action,
+        region: this.volcRegion ?? VOLC_DEFAULT_REGION,
+      })
+    } catch (error) {
+      return { error: `签名失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => { controller.abort() }, this.timeoutMs)
+    try {
+      const response = await this.fetchImpl(signed.url, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'content-type': VOLC_CONTENT_TYPE,
+          'x-date': signed.xDate,
+          'x-content-sha256': signed.xContentSha256,
+          authorization: signed.authorization,
+        },
+        body: '',
+      })
+      const text = await response.text()
+      if (text.length > MAX_RESPONSE_BYTES) return { error: '响应过大' }
+      let body
+      try {
+        body = JSON.parse(text)
+      } catch {
+        return { error: response.ok ? '响应不是合法 JSON' : `HTTP ${response.status}` }
+      }
+      // 火山业务错误常以 200 携带信封返回，所以**先看信封、再看状态码**
+      const envelope = volcResponseError(body)
+      if (envelope !== undefined) {
+        return {
+          error: `${envelope.code || `HTTP ${response.status}`}${envelope.message === '' ? '' : `：${envelope.message}`}`,
+          auth: isVolcAuthErrorCode(envelope.code),
+        }
+      }
+      if (!response.ok) {
+        return { error: `HTTP ${response.status}`, auth: response.status === 401 || response.status === 403 }
+      }
+      return { body }
+    } catch (error) {
+      const aborted = error instanceof Error && error.name === 'AbortError'
+      return { error: aborted ? '请求超时' : '网络请求失败' }
+    } finally {
+      clearTimeout(timer)
     }
   }
 

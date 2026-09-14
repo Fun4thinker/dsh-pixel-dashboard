@@ -158,7 +158,8 @@ src/                    源码（改这里）
   pricing.js            时段判定、价目表、费用折算（纯函数）
   ledger.js             本机用量账本
   balance.js            官方账户余额查询（宿主侧；Key 只在这里出现）
-  plans.js              第三方套餐额度（宿主侧；智谱 / Command Code）
+  plans.js              第三方套餐额度（宿主侧；智谱 / Command Code / 火山方舟）
+  volc-sign.js          火山引擎签名 V4（纯函数；AK/SK 那套，见下）
   prefs.js              本机开关存储（余额与套餐共用，避免互相覆盖）
   client/               浏览器半边源码
     balance.js          余额取数与格式化（浏览器侧；永远看不到 Key）
@@ -202,25 +203,30 @@ tools/                  构建、校验、安装、体检脚本
 |---|---|---|
 | 智谱 GLM Coding Plan | 5 小时、每周 | 官方**没有**月度额度（文档只定义这两个窗口），卡片里会写明 |
 | Command Code | 5 小时、每周、每月 | 月度额度是美元信用额（如 `$70`） |
+| 火山方舟 Agent / Coding Plan | 5 小时、每周、每月 | 自动探测两种订阅：Agent Plan 给**绝对值**，Coding Plan **只给百分比** |
 
 ### 请先读这一段：这些接口是未文档化的
 
-**两家都没有公开文档化的额度 API。** 本插件用的是它们**前端自己在用**的内部接口：
+**三家都没有公开文档化的额度 API。** 本插件用的是它们**前端/CLI 自己在用**的内部接口：
 
 | 厂商 | 接口 | 鉴权 |
 |---|---|---|
 | 智谱 | `GET open.bigmodel.cn/api/monitor/usage/quota/limit` | **裸 Key，不加 `Bearer `** |
 | Command Code | `GET api.commandcode.ai/alpha/billing/credits` | `Authorization: Bearer <key>` |
+| 火山方舟 | `POST open.volcengineapi.com/?Action=…&Version=2024-01-01` | **AK/SK 签名 V4**（见下） |
 
-由此带来三条**必须知情**的后果：
+由此带来四条**必须知情**的后果：
 
 1. **可能随时失效。** 官方一改前端，这里就会取不到。因此全程 fail-soft：一家失败只标
-   那一家，另一家与看板其余部分照常工作，界面上明确写「未文档化的内部接口」。
+   那一家，其余各家与看板其余部分照常工作，界面上明确写「未文档化的内部接口」。
 2. **智谱的失败不走 HTTP 状态码。** 它鉴权失败时 HTTP **仍是 200**，得看响应体里的
    `success` 字段——只看状态码会把失败当成成功。
 3. **智谱的窗口分类看 `unit` 字段，不能按重置时间猜。** 周期末尾「每周」会比「5 小时」
    更早重置，按时间排序必然把两个窗口标反（这是社区踩过的坑，代码里已按 `unit`
    区分并写了注释）。
+4. **火山的端点不在推理域名上。** 用量接口是**控制面 OpenAPI**（`open.volcengineapi.com`），
+   与模型调用的 `ark.cn-beijing.volces.com` 是两套东西；它的失败也**常以 200 携带错误信封**
+   （`ResponseMetadata.Error`）返回，所以只看状态码同样会把失败当成功。
 
 ### 凭据怎么配
 
@@ -228,6 +234,7 @@ tools/                  构建、校验、安装、体检脚本
 |---|---|---|
 | 智谱 | 凭据引用 `ZHIPU_CODING_API_KEY` | —（智谱没有官方 CLI 凭据文件） |
 | Command Code | 凭据引用 `COMMAND_CODE_API_KEY` | `~/.commandcode/auth.json` 的 `apiKey` |
+| 火山方舟 | 凭据引用 `VOLC_ACCESS_KEY_ID` + `VOLC_SECRET_ACCESS_KEY` | —（**两把都要配**） |
 
 写进 DSH 凭据库即可（环境变量同名亦可）。Command Code 若已装 CLI 并登录过，插件会
 自动读该文件，**无需**额外配置；`COMMANDCODE_HOME` 可覆盖它的目录。
@@ -236,6 +243,15 @@ tools/                  构建、校验、安装、体检脚本
 > 与平台普通 API Key **不通用**。用错的表现是：标准模型调用能过，但额度查询报
 > `Authentication Failed`。界面上会显示凭据尾 4 位（如 `…a1b2`），便于你确认读到的
 > 是哪一把。
+
+> **火山方舟要的是另一套凭据：AccessKey ID / Secret Access Key，不是推理用的 `ark-` Key。**
+> 这一点最容易配错，所以插件**刻意不从 provider 路由名派生**火山的凭据名——按
+> 「方舟」那个 provider 存的 `ark-` Key 拿去做签名必然失败，纳进候选只会把你引到
+> 错误的排查方向。请到火山引擎控制台「访问控制 → 访问密钥」创建，然后配成
+> `VOLC_ACCESS_KEY_ID` 与 `VOLC_SECRET_ACCESS_KEY`（两把缺一不可，界面会指出缺的是哪个）。
+>
+> 用推理 Key 去查的表现是可验证的：网关在**格式层**就拒（HTTP 400 /
+> `InvalidAuthorization` 100024），不是权限问题。
 
 ### 隐私
 
@@ -369,9 +385,21 @@ npm publish               # 包名 dsh-pixel-dashboard
   `Number(null)` 与 `Number('')` 都等于 `0`，接口字段缺失时会踩这个坑，必须显式挡掉
   （预检闸门里有对应断言）。
 - **第三方额度接口是未文档化的，必须按「随时会坏」来写。** 一律 fail-soft：一家失败只标
-  那一家；界面上明说数据源是内部接口。两个具体坑：智谱鉴权失败时 **HTTP 仍是 200**，只看
+  那一家；界面上明说数据源是内部接口。三个具体坑：智谱鉴权失败时 **HTTP 仍是 200**，只看
   状态码会把失败当成功；窗口分类必须看它给的 `unit` 字段，按重置时间排序会把「每周」与
-  「5 小时」标反。
+  「5 小时」标反；火山网关的失败也**常以 200 携带 `ResponseMetadata.Error` 信封**返回，
+  所以那边同样是「先看信封、再看状态码」。
+- **火山的额度接口要 AK/SK 签名，不要把它和推理 Key 混为一谈。** 用量在**控制面 OpenAPI**
+  （`open.volcengineapi.com`），不是数据面推理域名；推理用的 `ark-` Key 会被网关在**格式层**
+  拒掉（HTTP 400 / `InvalidAuthorization`）。因此：凭据候选里**刻意不纳入** provider 派生的
+  `FANGZHOU_API_KEY` 一类名字（纳进来只会把用户引向错误的排查方向）；两个 Action 共用同一份
+  AK/SK，所以**鉴权类错误立刻停、不再试下一个**，只有「已鉴权但没数据」才继续试。
+  签名是 AWS SigV4 的火山变体，三处差异照搬标准 SigV4 就会失败：algorithm 串无 `AWS4` 前缀、
+  scope 以 `request` 结尾、派生密钥的 SK 不加 `AWS4` 前缀。另外
+  **`SignedHeaders` 与 canonical headers 必须由同一份排序数组生成**——社区里「要不要排序」
+  的争议本质是两者不一致，同源生成就把这个失败模式从构造上消掉了。
+  预检闸门锁的是签名的**结构性契约**（空 body 摘要、scope、64 位十六进制签名、端点固定、
+  确定性、换 SK 必换签名），因为拿不到服务端金标准向量。
 - **额度百分比可以超过 100，不要夹到 100。** 套餐额度用超时官方会给出 >100 的百分比，
   而「超了多少」正是最该让用户看见的信息。宿主保留真值，只在**进度条宽度**上夹取
   （`barPercent`），并单独标出「已超限」。夹数字会把「已严重超限」伪装成「刚好用满」。

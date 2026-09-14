@@ -30,7 +30,7 @@ const srcDir = join(root, 'src')
 const outDir = join(root, 'lib')
 
 /** 宿主侧的模块：改动这些会影响实现版本号。 */
-const HOST_SOURCES = ['host.js', 'pricing.js', 'ledger.js', 'balance.js', 'plans.js', 'prefs.js']
+const HOST_SOURCES = ['host.js', 'pricing.js', 'ledger.js', 'balance.js', 'plans.js', 'volc-sign.js', 'prefs.js']
 
 /**
  * 由宿主源码内容算出的短哈希，用作实现版本号。
