@@ -7,12 +7,17 @@
 不残留手写配置行：
 
 ```bash
-# 安装
+# 安装（两个包都发布到 npm 之后可用）
 dsh plugin --profile web add dsh-pixel-dashboard-bundle
 
 # 卸载
 dsh plugin --profile web remove dsh-pixel-dashboard-bundle
 ```
+
+> **当前（尚未发布到 npm）请改用源码安装**：先把仓库 clone 下来，再在仓库里运行
+> `node tools/install-official.mjs --profile web`。本包在 `dependencies` 里声明的
+> `dsh-pixel-dashboard` 还不在 npm 上，pnpm 会一直卡在解析它；直接
+> `dsh plugin add github:...#path:packages/bundle` 同样会卡住。
 
 安装后**重启一次 `dsh`**（宿主侧代码只在启动时加载），再刷新浏览器页面。
 

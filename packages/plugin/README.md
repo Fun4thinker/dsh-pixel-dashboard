@@ -9,11 +9,16 @@
 [`dsh-pixel-dashboard-bundle`](https://www.npmjs.com/package/dsh-pixel-dashboard-bundle)：
 
 ```bash
+# 两个包都发布到 npm 之后可用
 dsh plugin --profile web add dsh-pixel-dashboard-bundle
 ```
 
+> **当前（尚未发布到 npm）请改用源码安装**：先把仓库 clone 下来，再在仓库里运行
+> `node tools/install-official.mjs --profile web`。原因见仓库 README 的「安装」一节——
+> 组合包在 `dependencies` 里声明了本包，而本包不在 npm 上时，pnpm 会一直卡在解析它。
+
 完整说明、口径与设计约束见
-[仓库 README](https://github.com/deepseek-ai/dsh-pixel-dashboard#readme)。
+[仓库 README](https://github.com/Fun-thinker/dsh-pixel-dashboard#readme)。
 
 ## 隐私
 

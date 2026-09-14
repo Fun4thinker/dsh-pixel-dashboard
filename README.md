@@ -16,13 +16,9 @@
 | `dsh-pixel-dashboard-bundle` | profile 组合包：声明 `dsh.bundle.patch`，由 dsh 自动加入 `dsh.profile.bundles` |
 
 ```bash
-# 从 npm 安装（已发布时）
-dsh plugin --profile web add dsh-pixel-dashboard-bundle
-
-# 或直接从 GitHub 安装（仓库根就是组合包所在的仓库，见下方说明）
-dsh plugin --profile web add github:<user>/dsh-pixel-dashboard
-
-# 从本地源码安装（开发/验证用）
+# 推荐：克隆仓库后从本地源码安装（**当前唯一开箱可用的方式**）
+git clone https://github.com/Fun-thinker/dsh-pixel-dashboard.git
+cd dsh-pixel-dashboard
 node tools/install-official.mjs --profile web
 
 # 卸载
@@ -34,9 +30,30 @@ dsh plugin --profile web remove dsh-pixel-dashboard-bundle
 
 要求：Node ≥ 18（用到全局 `fetch`；DSH 本身的要求更高）。插件**没有任何第三方依赖**。
 
+> **为什么必须先 clone，而不能直接 `dsh plugin add github:...`。**
+> 本仓库是「一个仓库装两个包」的结构，而 `dsh plugin` 只把命令行上那一个规格交给 pnpm：
+>
+> - 指向**仓库根**（`github:Fun-thinker/dsh-pixel-dashboard`）：根包名是
+>   `dsh-pixel-dashboard-repo`，它**没有** `dsh.bundle` 声明（它只是开发仓库的清单）。
+>   按 DSH 的 `reconcilePlugins()` 逻辑（`apps/cli/src/plugin.ts`），没有该声明的依赖
+>   只会被当作普通库装进 profile，**不会进入 `dsh.profile.bundles`，插件永不激活**。
+>   实测：`pnpm` 报 `+ dsh-pixel-dashboard-repo 2.0.0`，而 `dsh` 里毫无变化。
+> - 指向**子目录**（`github:user/repo#path:packages/bundle`）：语法本身 pnpm 支持，
+>   但组合包在 `dependencies` 里声明了 `dsh-pixel-dashboard`，而该包**尚未发布到 npm**。
+>   实测 pnpm 会一直卡在解析这个依赖上（90 秒以上无输出），装不下来。
+> - 让组合包改从 git 子目录取插件包（`file:packages/plugin` 或 git 规格）也不行：
+>   前者在 git 依赖打包时按**安装方**的相对路径解析，报
+>   `ERR_PNPM_LINKED_PKG_DIR_NOT_FOUND`；后者被 pnpm 以
+>   `ERR_PNPM_EXOTIC_SUBDEP`（`blockExoticSubdeps`）直接拒绝。
+>
+> 因此：**要么 clone 后本地安装（上面这条，已验证可用），要么把两个包发布到 npm 后
+> 再用 `dsh plugin add dsh-pixel-dashboard-bundle`。** 后者是给最终用户的形态；
+> 当前两个包在 npm 上都不存在（`registry.npmjs.org` 返回 404）。
+
 > **本地路径安装的注意点**：pnpm 对本地目录用 `link:` 规格，而 **`link:` 不解析目标包的
 > `dependencies`**，因此组合包声明的插件包不会被装上，patch 里的行会解析失败。
-> `tools/install-official.mjs` 会自动把插件包也装一次。从 npm / GitHub 安装则没有这个问题。
+> `tools/install-official.mjs` 会自动把插件包也装一次（它把两个目录都传给 `dsh plugin`），
+> 所以上面这条推荐路径没有这个问题。
 
 安装后**重启一次 `dsh`**（宿主侧代码只在启动时加载），再刷新浏览器页面。
 
@@ -44,9 +61,11 @@ dsh plugin --profile web remove dsh-pixel-dashboard-bundle
 
 不需要拷贝 `~/.dsh` 下的任何东西——那是机器本地目录。只需两件事：
 
-1. 把这个仓库拷过去（或 `git clone`）；
-2. 在新机器上运行 `node tools/install-official.mjs --profile web`，
-   或者已发布后用 `dsh plugin --profile web add dsh-pixel-dashboard-bundle`。
+1. `git clone` 这个仓库（公开仓库，不需要任何凭据）；
+2. 在仓库里运行 `node tools/install-official.mjs --profile web`。
+
+`packages/plugin/lib/` 是**入库的构建产物**，clone 下来就是可直接加载的版本，
+新机器上不需要跑构建、也不需要装任何依赖。装完重启 `dsh`、刷新页面即可。
 
 想连用量历史一起带走，额外复制 `usage-ledger.jsonl`（见下）。
 
@@ -279,14 +298,13 @@ npm publish ./packages/bundle      # dsh-pixel-dashboard-bundle
 组合包里的 `dependencies: { "dsh-pixel-dashboard": "^2.0.0" }` 必须与插件包实际发布的版本
 匹配，否则安装时拉不到。升级时两边版本一起改。
 
-GitHub 直装不需要发布：`dsh plugin --profile web add github:<user>/dsh-pixel-dashboard`，
-但需要 pnpm 允许该仓库的构建脚本（组合包不需要构建，插件包的 `lib/` 已随仓库提交）。
+**发布顺序不能反**：先发插件包，再发组合包。上面「安装」一节记录了一个实测结论——
+在插件包尚未上 npm 之前，任何指向组合包的安装（含 `github:...#path:packages/bundle`）
+都会卡在解析这个未发布的依赖上。所以**发布 npm 是让 `dsh plugin add` 这类一行命令
+可用的前提**，不是可选项。
 
-> 仓库里的 `packages/plugin/lib/` 是**构建产物但必须入库**：GitHub 直装不会跑构建，
+> 仓库里的 `packages/plugin/lib/` 是**构建产物但必须入库**：clone 下来就要能直接加载，
 > 而 DSH 加载的正是 `lib/client.js`。发布前确认它是最新的（`node tools/build.mjs`）。
-
-> 发布前确认 `packages/plugin/lib/` 是最新的（`node tools/build.mjs`），
-> 它是构建产物，但必须随包一起发布——DSH 加载的是 `lib/client.js`，不是源码。
 
 ## 必须守住的设计约束
 
@@ -313,6 +331,15 @@ GitHub 直装不需要发布：`dsh plugin --profile web add github:<user>/dsh-p
   同理，没有内容时要 `return null` 而不是渲染空 `div`，否则会污染产品的 4px 间距节奏。
 - **图表不要用 `preserveAspectRatio="none"`**，热力图格子必须是正方形：配固定像素高度会把
   几何非等比拉伸；把 24 小时塞进同一格只会画出条形。渲染闸门会直接量 SVG 矩形的宽高差。
+- **看板是「内容定宽」的：信息量少的卡片不该独占整行。** 「时段与计费」只有倒计时加三行
+  键值对，独占整行会显得空荡；它与「活跃日历」并排（`.px-pair`）后两块都更合适。两条约束：
+  日历格子边长**随那栏宽度线性变化**（53 列），所以比例不能随便给——左栏只留够放
+  「周一至周五 09:00–12:00、14:00–18:00」这一行的最小宽度，其余让给日历；
+  并排时左栏内的 `.px-period` 要改回竖排，否则键值对会在窄栏里反复折行；
+  窄屏（≤960px）必须塌回单列，否则日历被压成一条。渲染闸门用**标签配对扫描**断言两张
+  面板确实同处一个容器、顺序为「计费在左、日历在右」、容器内恰好两张面板——
+  不能图省事把「容器起点到字符串结尾」当作区间，那会让「日历被移到容器外」这种回归
+  悄悄通过。
 - **不要把「兼容性」做成取数的前置闸门。** 版本哈希或能力名对不上并不等于数据不可用，
   拦在取数层会让整块界面失去数据，症状是「一直加载中」这种最难查的形态。
   让数据先到手，各界面按字段有无自行降级，并且降级必须可见。
