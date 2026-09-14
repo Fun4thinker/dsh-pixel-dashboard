@@ -4,68 +4,76 @@
 马卡龙配色主题、Token 趋势、模型分布、全年活跃日历、**费用估算**、**时段倒计时**、
 **官方账户余额**、**第三方订阅套餐额度**，以及输入框正下方的**本次会话费用条**。
 
-按 DSH 官方的插件分发方式做成 **profile 组合包**：安装、卸载、以及随 DSH 升级都走官方机制。
+按 DSH 官方的插件分发方式做成**单包组合（bundle）**：仓库根就是一个声明了
+`dsh.bundle.patch` 的包，安装、卸载、以及随 DSH 升级都走官方机制。
 
 ## 安装
 
-插件分两个包，`dsh` 通过组合包把它作为一层配置挂进 profile：
-
-| 包 | 作用 |
-|---|---|
-| `dsh-pixel-dashboard` | 插件本体：宿主半边 + 浏览器半边 |
-| `dsh-pixel-dashboard-bundle` | profile 组合包：声明 `dsh.bundle.patch`，由 dsh 自动加入 `dsh.profile.bundles` |
+用官方的 `dsh plugin add`，指向本仓库即可。**这是社区与官方文档推荐的标准方式**
+（见 DSH `docs/user/develop/basic/publish.md`）：
 
 ```bash
-# 推荐：克隆仓库后从本地源码安装（**当前唯一开箱可用的方式**）
-git clone https://github.com/Fun-thinker/dsh-pixel-dashboard.git
-cd dsh-pixel-dashboard
-node tools/install-official.mjs --profile web
+# 标准安装：仓库根就是组合包，一条命令搞定
+dsh plugin --profile web add github:Fun4thinker/dsh-pixel-dashboard
 
-# 卸载
-dsh plugin --profile web remove dsh-pixel-dashboard-bundle
+# 卸载（自动移出 dsh.profile.bundles，不残留配置行）
+dsh plugin --profile web remove dsh-pixel-dashboard
+
+# 已发布到 npm 之后，也可以直接用包名
+dsh plugin --profile web add dsh-pixel-dashboard
 ```
 
-`dsh plugin` 会把包交给 pnpm 装到 profile 目录，并把声明了 `dsh.bundle` 的依赖自动加进
-`dsh.profile.bundles`；卸载时自动移出，不会残留配置行。
+`dsh plugin` 会把包交给 pnpm 装到 profile 目录，并把声明了 `dsh.bundle` 的依赖**自动**
+加进 `dsh.profile.bundles`；卸载时自动移出。
 
-要求：Node ≥ 18（用到全局 `fetch`；DSH 本身的要求更高）。插件**没有任何第三方依赖**。
-
-> **为什么必须先 clone，而不能直接 `dsh plugin add github:...`。**
-> 本仓库是「一个仓库装两个包」的结构，而 `dsh plugin` 只把命令行上那一个规格交给 pnpm：
->
-> - 指向**仓库根**（`github:Fun-thinker/dsh-pixel-dashboard`）：根包名是
->   `dsh-pixel-dashboard-repo`，它**没有** `dsh.bundle` 声明（它只是开发仓库的清单）。
->   按 DSH 的 `reconcilePlugins()` 逻辑（`apps/cli/src/plugin.ts`），没有该声明的依赖
->   只会被当作普通库装进 profile，**不会进入 `dsh.profile.bundles`，插件永不激活**。
->   实测：`pnpm` 报 `+ dsh-pixel-dashboard-repo 2.0.0`，而 `dsh` 里毫无变化。
-> - 指向**子目录**（`github:user/repo#path:packages/bundle`）：语法本身 pnpm 支持，
->   但组合包在 `dependencies` 里声明了 `dsh-pixel-dashboard`，而该包**尚未发布到 npm**。
->   实测 pnpm 会一直卡在解析这个依赖上（90 秒以上无输出），装不下来。
-> - 让组合包改从 git 子目录取插件包（`file:packages/plugin` 或 git 规格）也不行：
->   前者在 git 依赖打包时按**安装方**的相对路径解析，报
->   `ERR_PNPM_LINKED_PKG_DIR_NOT_FOUND`；后者被 pnpm 以
->   `ERR_PNPM_EXOTIC_SUBDEP`（`blockExoticSubdeps`）直接拒绝。
->
-> 因此：**要么 clone 后本地安装（上面这条，已验证可用），要么把两个包发布到 npm 后
-> 再用 `dsh plugin add dsh-pixel-dashboard-bundle`。** 后者是给最终用户的形态；
-> 当前两个包在 npm 上都不存在（`registry.npmjs.org` 返回 404）。
-
-> **本地路径安装的注意点**：pnpm 对本地目录用 `link:` 规格，而 **`link:` 不解析目标包的
-> `dependencies`**，因此组合包声明的插件包不会被装上，patch 里的行会解析失败。
-> `tools/install-official.mjs` 会自动把插件包也装一次（它把两个目录都传给 `dsh plugin`），
-> 所以上面这条推荐路径没有这个问题。
+要求：Node ≥ 18（用到全局 `fetch`；DSH 本身的要求更高）。插件**没有任何第三方依赖**，
+也**不需要 `prepare`/构建脚本**——`lib/` 是随仓库提交的构建产物，装完即可加载。
 
 安装后**重启一次 `dsh`**（宿主侧代码只在启动时加载），再刷新浏览器页面。
 
+<details>
+<summary>从本地源码安装（开发/改代码时用）</summary>
+
+改 `src/` 后要重新构建并让 profile 指向本地目录：
+
+```bash
+git clone https://github.com/Fun4thinker/dsh-pixel-dashboard.git
+cd dsh-pixel-dashboard
+node tools/build.mjs                 # 产物写进根 lib/
+node tools/install-official.mjs --profile web
+```
+
+`install-official.mjs` 只是把 `dsh plugin --profile web add <本仓库根目录>` 包了一层；
+pnpm 会建 `link:` 软链，因此之后每次 `node tools/build.mjs` 都即时生效（实现版本哈希会变，
+宿主持热更新）。
+
+> **为什么单包形态很关键。** 本仓库早先拆成「插件包 + 组合包」两个包（`packages/plugin`
+> 与 `packages/bundle`），结果 `dsh plugin add github:...` **两种写法都用不了**：
+>
+> - 指向**仓库根**：根包名是 `dsh-pixel-dashboard-repo`，没有 `dsh.bundle` 声明。
+>   按 DSH 的 `reconcilePlugins()`（`apps/cli/src/plugin.ts`），它只会被当作普通库装进
+>   profile，**不进 `dsh.profile.bundles`，插件永不激活**——而且只打印一句 warning。
+> - 指向**子目录**（`#path:packages/bundle`）：语法 pnpm 支持，但组合包 `dependencies`
+>   里声明的插件包不在 npm 上，pnpm 会**一直卡在解析它**（实测 90 秒以上无输出）。
+> - 让组合包改从 git 子目录取插件包也不行：`file:packages/plugin` 在 git 依赖打包时按
+>   **安装方**的相对路径解析，报 `ERR_PNPM_LINKED_PKG_DIR_NOT_FOUND`；换 git 规格被 pnpm
+>   以 `ERR_PNPM_EXOTIC_SUBDEP`（`blockExoticSubdeps`）拒绝。
+>
+> 单包形态让这些问题一起消失：仓库根自己声明 `dsh.bundle`，`lib/` 已入库因此不需要
+> 构建脚本，一条 `add github:...` 即可。`tools/build.mjs` 里有对应的清单闸门，
+> 缺 `dsh.bundle` / `main` / `exports["./client"]` 等任一项都会在构建时直接报错。
+</details>
+
 ### 换电脑
 
-不需要拷贝 `~/.dsh` 下的任何东西——那是机器本地目录。只需两件事：
+不需要拷贝 `~/.dsh` 下的任何东西——那是机器本地目录。只需一条命令：
 
-1. `git clone` 这个仓库（公开仓库，不需要任何凭据）；
-2. 在仓库里运行 `node tools/install-official.mjs --profile web`。
+```bash
+dsh plugin --profile web add github:Fun4thinker/dsh-pixel-dashboard
+```
 
-`packages/plugin/lib/` 是**入库的构建产物**，clone 下来就是可直接加载的版本，
-新机器上不需要跑构建、也不需要装任何依赖。装完重启 `dsh`、刷新页面即可。
+公开仓库，不需要任何凭据；`lib/` 随仓库带上，**不需要构建、不需要装依赖**。
+装完重启 `dsh`、刷新页面即可。
 
 想连用量历史一起带走，额外复制 `usage-ledger.jsonl`（见下）。
 
@@ -157,10 +165,18 @@ src/                    源码（改这里）
     plans.js            套餐额度取数、进度与格式化（浏览器侧）
     SessionCost.js      输入框正下方的费用条 + 余额 + 套餐额度
     dashboard.js        看板整页
-packages/plugin/        发布的插件包（lib/ 是构建产物）
-packages/bundle/        发布的 profile 组合包（cordis.patch.yml）
+lib/                    构建产物（**入库**，DSH 直接加载这里）
+  index.js              装载入口（带实现版本哈希）
+  host.js 等            宿主半边产物
+  client.js             浏览器半边产物（window.__ModuleLoader__ 容器）
+  client/               浏览器半边产物源码副本（便于线上排查对照）
+cordis.patch.yml        本包作为 profile 层插入的那一行（dsh.bundle.patch 指向它）
 tools/                  构建、校验、安装、体检脚本
 ```
+
+> 仓库根**就是发布包**（单包形态）：`package.json` 同时是 npm 清单与 `dsh.bundle`
+> 声明，`lib/` 与 `cordis.patch.yml` 都在根。这正是官方与社区插件的标准形态
+> （对照 `dshmarket` 等），也是 `dsh plugin add github:...` 能用一条命令装上的前提。
 
 ## 账户余额
 
@@ -282,35 +298,36 @@ node tools/uninstall.mjs           # 清理早期「整机部署」方式的残�
 - **费用条排版闸门**（`tools/render-check.mjs`）断言注册到 `conversation.composer.dock`
   的 `order` 是负数，并断言拿不到余额/额度时不渲染空的那些枚。
 
-## 发布到 npm / GitHub
+## 发布到 npm
 
-两个包分别发布，**先发插件包，再发组合包**（组合包依赖插件包的版本号）：
+单包形态，只有一条发布命令：
 
 ```bash
-node tools/build.mjs
-npm publish ./packages/plugin      # dsh-pixel-dashboard
-npm publish ./packages/bundle      # dsh-pixel-dashboard-bundle
+node tools/build.mjs      # 产物写进根 lib/（必须先跑，lib/ 是发布内容的一部分）
+npm publish               # 包名 dsh-pixel-dashboard
 ```
 
-`tools/build.mjs` 会把仓库根的 `LICENSE` 拷进两个包（`package.json` 的 `files` 里都声明了它，
-少了这份文件 npm 只是静默跳过，不会报错）。
+发布后用户可以直接 `dsh plugin --profile web add dsh-pixel-dashboard`。
+不过**发布 npm 只是可选的分发加速**——`github:` 直装本来就可用，两者都不需要
+`prepare` 脚本，因为 `lib/` 是随仓库提交的构建产物。
 
-组合包里的 `dependencies: { "dsh-pixel-dashboard": "^2.0.0" }` 必须与插件包实际发布的版本
-匹配，否则安装时拉不到。升级时两边版本一起改。
+> `lib/` 是**构建产物但必须入库**：DSH 加载的正是 `lib/client.js` 与 `lib/index.js`，
+> 而 git 直装不会跑任何构建。发布或推送前确认它是最新的（`node tools/build.mjs`），
+> 并已 `git add`（`lib/` 不在 `.gitignore` 里，但改完容易忘了提交）。
 
-**发布顺序不能反**：先发插件包，再发组合包。上面「安装」一节记录了一个实测结论——
-在插件包尚未上 npm 之前，任何指向组合包的安装（含 `github:...#path:packages/bundle`）
-都会卡在解析这个未发布的依赖上。所以**发布 npm 是让 `dsh plugin add` 这类一行命令
-可用的前提**，不是可选项。
-
-> 仓库里的 `packages/plugin/lib/` 是**构建产物但必须入库**：clone 下来就要能直接加载，
-> 而 DSH 加载的正是 `lib/client.js`。发布前确认它是最新的（`node tools/build.mjs`）。
+> 版本号两边要一起改：`package.json` 的 `version` 与 README 里出现的版本描述。
+> 实现版本（源码哈希）是自动派生的，不用手改。
 
 ## 必须守住的设计约束
 
 都是踩过坑换来的，改动前请先读完：
 
-- **组合包的 patch 用包名，不用路径。** `name: 'dsh-pixel-dashboard'` 由 profile 的
+- **仓库根必须保持「单包」形态：一个 `package.json` 同时声明 npm 清单与 `dsh.bundle`。**
+  这是 `dsh plugin add github:<user>/<repo>` 能用一条命令装上的前提。早先拆成
+  「插件包 + 组合包」两个包时，指向根的写法会装到一个没有 `dsh.bundle` 的开发清单
+  （`dsh` 只警告一句、不进 `dsh.profile.bundles`，**插件永不激活**），指向子目录的写法
+  又会卡在解析未发布依赖上。`tools/build.mjs` 里有闸门把这几项钉住。
+- **patch 的行用包名，不用路径。** `name: 'dsh-pixel-dashboard'` 由 profile 的
   `node_modules` 解析，因此换机、升级、pnpm 重新布局都不影响；写死路径会在别的机器上失效。
 - **一条插件行只能有一个来源。** 组合包和手写 loader 行同时存在会重复注册
   `/dsh-pixel/data`，路由冲突 → Loader 整体回滚 → 旧代码继续应答，而且**没有任何报错**。
@@ -402,6 +419,6 @@ npm publish ./packages/bundle      # dsh-pixel-dashboard-bundle
 ## 回滚
 
 ```bash
-dsh plugin --profile web remove dsh-pixel-dashboard-bundle
+dsh plugin --profile web remove dsh-pixel-dashboard
 # 然后重启 dsh、刷新页面
 ```

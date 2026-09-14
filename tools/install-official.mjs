@@ -13,12 +13,12 @@
  * 两条安装路径：
  *   1) **本仓库源码**（默认）：直接 add 仓库根目录，pnpm 建 `link:` 软链。
  *      改完 `src/` 重新构建即生效（实现版本哈希会变，宿主热更新）。
- *   2) **已发布 / GitHub**：`--spec github:Fun-thinker/dsh-pixel-dashboard`
+ *   2) **已发布 / GitHub**：`--spec github:Fun4thinker/dsh-pixel-dashboard`
  *      或 `--npm dsh-pixel-dashboard`。
  *
  * 用法:
  *   node tools/install-official.mjs --profile web
- *   node tools/install-official.mjs --profile web --spec github:Fun-thinker/dsh-pixel-dashboard
+ *   node tools/install-official.mjs --profile web --spec github:Fun4thinker/dsh-pixel-dashboard
  *   node tools/install-official.mjs --profile web --npm
  *   node tools/install-official.mjs --profile web --dry-run
  */
