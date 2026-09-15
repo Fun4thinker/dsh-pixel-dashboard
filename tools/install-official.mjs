@@ -12,7 +12,10 @@
  *
  * 两条安装路径：
  *   1) **本仓库源码**（默认）：直接 add 仓库根目录，pnpm 建 `link:` 软链。
- *      改完 `src/` 重新构建即生效（实现版本哈希会变，宿主热更新）。
+ *      改完 `src/` 重新构建后，**客户端半边刷新页面即可**（浏览器产物被按需重读），
+ *      而**宿主半边必须重启 dsh**——宿主模块只在启动时加载，且 dsh-base 默认
+ *      关掉了 HMR 的模块重载（`hmr` 行 `disabled: true`），`patchReload: live`
+ *      只重挂配置层、不会重新 import 宿主实现。
  *   2) **已发布 / GitHub**：`--spec github:Fun4thinker/dsh-pixel-dashboard`
  *      或 `--npm dsh-pixel-dashboard`。
  *

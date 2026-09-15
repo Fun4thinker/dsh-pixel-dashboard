@@ -7,7 +7,7 @@
  * 用法: node tools/preflight.mjs
  */
 import { strict as assert } from 'node:assert'
-import { existsSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -50,12 +50,18 @@ assert.deepEqual(
 
 /** 记录注册结果的最小 webServer 替身。 */
 const routes = []
+/** 记录 ctx.on 注册的监听器，供下面驱动 `session/event` 用。 */
+const hostListeners = new Map()
 const ctx = {
   get(name) {
     if (name === 'webServer') return { register: (route) => { routes.push(route); return () => {} } }
     return undefined
   },
-  on() {},
+  on(event, handler) {
+    const list = hostListeners.get(event) ?? []
+    list.push(handler)
+    hostListeners.set(event, list)
+  },
 }
 // apply 通过 ctx.webServer 访问已声明注入的服务；替身提供同名属性。
 ctx.webServer = ctx.get('webServer')
@@ -72,10 +78,12 @@ const routeOf = (path) => {
 
 const dataRoute = routeOf('/dsh-pixel/data')
 const versionRoute = routeOf('/dsh-pixel/version')
+const periodRoute = routeOf('/dsh-pixel/period')
 const balanceRoute = routeOf('/dsh-pixel/balance')
 const plansRoute = routeOf('/dsh-pixel/plans')
 const toggleRoute = routeOf('/dsh-pixel/toggle')
-assert.equal(routes.length, 5, `应注册恰好五条路由，实际 ${routes.length}`)
+const notifyRoute = routeOf('/dsh-pixel/notify')
+assert.equal(routes.length, 7, `应注册恰好七条路由，实际 ${routes.length}`)
 
 /**
  * 最小 req/res 替身。
@@ -137,12 +145,13 @@ const ok = await call(dataRoute)
 assert.equal(ok.statusCode, 200, `GET 应返回 200，实际 ${ok.statusCode}`)
 const payload = JSON.parse(ok.body)
 assert.equal(typeof payload.generatedAt, 'number', '响应应含 generatedAt')
-assert.equal(payload.version, info.version, '数据响应里的版本应与版本路由一致')
-// 能力声明是客户端判断兼容性的唯一依据，必须齐全——缺项会让对应界面降级。
-// 注意「齐全」是指**声明**要完整，而不是要求客户端按它拦截取数（见 README 的设计约束）。
+assert.equal(payload.version, info.version, '数据响应里的版本应与版本路由一致')// 能力声明是客户端判断兼容性的唯一依据，必须齐全——缺项会让对应界面降级。
+// 注意「齐全」是指**声明**要完整，而不是要求客户端按它拦截取数（设计约束见 AGENT.md）。
 const REQUIRED_CAPABILITIES = [
-  'period', 'peakRule', 'sessionCost', 'calendarByDay', 'tieredRates', 'crossDeviceLedger',
-  'balance', 'balanceToggle', 'thirdPartyPlans',
+  'period', 'periodClock', 'peakRule', 'sessionCost', 'calendarByDay', 'tieredRates', 'crossDeviceLedger',
+  'balance', 'balanceToggle', 'thirdPartyPlans', 'notifyJournal', 'notifyThresholds',
+  // 会话清单里的预览标题（与 DSH 侧栏同源）。旧的 id 片段用户对不上侧栏任何一个会话。
+  'sessionTitle',
 ]
 assert.ok(Array.isArray(payload.capabilities), '响应应含 capabilities 数组')
 for (const name of REQUIRED_CAPABILITIES) {
@@ -158,6 +167,51 @@ assert.deepEqual(payload.peakRule.weekdays, [1, 2, 3, 4, 5], '高峰只落在工
 assert.ok(payload.period !== undefined, '响应应含当前时段状态')
 assert.equal(payload.offPeak, undefined, '旧的 offPeak 字段不应再出现')
 assert.equal(typeof payload.ledger?.path, 'string', '响应应回报账本路径，便于确认跨设备同步是否生效')
+
+// ── 时段路由：侧栏指示灯的取数口 ────────────────────────────────
+// 侧栏那枚点靠它画环形进度，因此这里锁住三件事：**纯时钟**（不依赖账本/会话，
+// 因此永远可用）、本段长度可算（`prevChangeMs + nextChangeMs`，没有它就画不出比例）、
+// 以及只读方法之外一律 405。
+{
+  const periodRes = await call(periodRoute)
+  assert.equal(periodRes.statusCode, 200, `GET /period 应返回 200，实际 ${periodRes.statusCode}`)
+  const clock = JSON.parse(periodRes.body)
+  assert.equal(typeof clock.generatedAt, 'number', '/period 应含 generatedAt')
+  assert.equal(clock.timezone, 'Asia/Shanghai', '/period 应带上站点时区')
+  assert.equal(Object.hasOwn(clock, 'ledger'), false, '/period 不得带上账本信息（它是纯时钟，不读账本）')
+  const phase = clock.period
+  assert.equal(typeof phase.peak, 'boolean', '/period 应给出当前是否高峰')
+  assert.equal(typeof phase.nextChangeMs, 'number', '/period 应给出距下次切换的毫秒数')
+  assert.equal(typeof phase.prevChangeMs, 'number', '/period 应给出本段已走的毫秒数')
+  assert.equal(typeof phase.periodMs, 'number', '/period 应给出本段总长（环形进度靠它）')
+  // 本段总长必须恰好是「已走 + 还剩」：这是界面画比例的**唯一**依据，
+  // 算错会让环长与倒计时对不上（弧走满了倒计时却还有一大截）。
+  assert.equal(
+    phase.periodMs,
+    phase.prevChangeMs + phase.nextChangeMs,
+    'periodMs 必须等于 prevChangeMs + nextChangeMs',
+  )
+  assert.ok(phase.prevChangeMs >= 0 && phase.nextChangeMs >= 0, '两个方向的时间差都不应为负')
+  // 本段总长必须落在真实窗口里：最短的段是午休（2 小时），最长的是周末（63 小时）。
+  assert.ok(
+    phase.periodMs >= 120 * 60_000 - 1000 && phase.periodMs <= 63 * 3600_000 + 1000,
+    `periodMs 应落在 2 小时 ~ 63 小时之间，实际 ${phase.periodMs / 60_000} 分钟`,
+  )
+  // 非只读方法一律拒绝（与余额 / 套餐 / 通知同一口径）
+  const periodPost = await call(periodRoute, 'POST', '/dsh-pixel/period')
+  assert.equal(periodPost.statusCode, 405, 'POST /period 应返回 405')
+}
+
+// ── 客户端 URL 与宿主路由必须对得上 ─────────────────────────────
+// 这两边是**两个文件里的两个字符串**，写岔了不会有任何报错：宿主照常注册、
+// 客户端照常请求，只是请求打到 404 上，指示灯安静地永远不出现。因此直接查源码。
+{
+  const periodClient = readFileSync(join(root, 'lib', 'client', 'period.js'), 'utf8')
+  assert.ok(
+    periodClient.includes("'/dsh-pixel/period'"),
+    '客户端 period.js 必须请求 /dsh-pixel/period——与宿主注册路径写岔了指示灯会静默不出现',
+  )
+}
 
 // ── 非空数据闸门 ───────────────────────────────────────────────
 // 上面全用空数据源，只能证明「不报错」，证明不了「算得对」。
@@ -213,13 +267,104 @@ assert.ok(sample.overview.totals.local > 0, '有数据时聚合结果不得为 0
 // 10:00 北京属高峰，应全部落在高峰档
 assert.equal(sample.overview.totals.peak.cacheHit, 600, '高峰档应记录该请求')
 assert.equal(sample.overview.totals.idle.cacheHit, 0, '高峰时段不应计入空闲档')
-// 旧模型名应被折叠到现行模型
-assert.deepEqual(sample.models.map((row) => row.model), ['deepseek-flash'], '旧模型名应折叠为 deepseek-flash')
+// 旧模型名应被折叠到现行模型，且条目身份带上提供商。
+// `sampleCatalog` 没有注入 LLM 目录，因此这里钉的正是「读不到目录也要照常工作」：
+// 提供商取自事件里的 provider（而不是猜），外显名退回价目表。
+assert.deepEqual(sample.models.map((row) => row.key), ['deepseek-flash@deepseek-official'], '旧模型名应折叠为 deepseek-flash 并带上提供商')
+assert.deepEqual(sample.models.map((row) => row.rollup), ['deepseek-flash'])
+assert.equal(sample.models[0].provider, 'deepseek-official')
+assert.ok(sample.models[0].rates !== undefined, '每个条目必须带上自己那一份单价')
+assert.equal(sample.pricing.models['deepseek-flash'], sample.models[0].rates, '逐模型单价表按归一键索引')
 assert.ok(sample.sessions[0].cost.standard > 0, '会话应带非零费用摘要')
 assert.equal(sample.ledger.total, 1, '账本应记录一条')
 
 const rejected = await call(dataRoute, 'POST')
 assert.equal(rejected.statusCode, 405, 'POST 应返回 405')
+
+// ── 会话预览标题：必须与 DSH 侧栏的 displayTitleOf 同一条回落链 ──────
+// 这一列曾经显示 `id.slice(8, 16)`，用户拿一串十六进制对不上侧栏任何一行。
+// 三条回落各自都要能命中，而且**顺序不能反**（有标题时用标题，没标题才退目录名）；
+// 另外标题事件是 last-wins 的，用户改名后必须立刻反映出来。
+{
+  const titleTime = SAMPLE_TIME
+  /** 造一个带标题事件的会话快照。 */
+  const sessionWith = (id, cwd, events) => ({
+    async list() {
+      return [{ header: { id, createdAt: titleTime, cwd }, revision: 'r1', eventCount: events.length }]
+    },
+    async open() {
+      return {
+        async read(offset = 0, limit = 500) { return { events: events.slice(offset, offset + limit) } },
+        async close() {},
+      }
+    },
+  })
+  const usageEvent = {
+    type: 'assistant/message',
+    seq: 1,
+    time: titleTime,
+    data: {
+      message: { role: 'assistant', content: [], source: { kind: 'model', provider: 'deepseek-official', model: 'deepseek-flash' } },
+      usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    },
+  }
+  /** 取某个会话的预览标题。 */
+  const titleOf = async (id, cwd, events) => {
+    const catalog = new UsageCatalog({
+      persistence: () => sessionWith(id, cwd, events),
+      sessions: () => undefined,
+      timezone: () => 'Asia/Shanghai',
+      ledgerPath: join(tmpdir(), `dsh-pixel-title-${process.pid}-${id}.jsonl`),
+    })
+    const result = await catalog.read()
+    return result.sessions.find((row) => row.id === id)?.title
+  }
+
+  // 1) 有 session/title → 用它（且 last-wins）
+  const titled = await titleOf('session-titled', 'D:\\blog', [
+    { type: 'session/title', seq: 0, time: titleTime, data: { title: '旧标题', messageSeqs: [], source: { kind: 'fallback' } } },
+    usageEvent,
+    { type: 'session/title', seq: 2, time: titleTime, data: { title: '重构会话清单', messageSeqs: [0], source: { kind: 'user' } } },
+  ])
+  assert.equal(titled, '重构会话清单', `应取最新的 session/title，实际「${titled}」`)
+
+  // 2) 没有标题 → 工作目录末段（两种分隔符都要能取出来）
+  assert.equal(
+    await titleOf('session-notitle', 'D:\\my_project\\blog', [usageEvent]),
+    'blog',
+    '没有标题时应回落到工作目录末段（与侧栏同源）',
+  )
+  assert.equal(
+    await titleOf('session-posix', '/home/u/proj-a/', [usageEvent]),
+    'proj-a',
+    'POSIX 路径（含末尾分隔符）也应取到末段',
+  )
+
+  // 3) 既没有标题也没有工作目录 → 会话 id（而不是空白）
+  assert.equal(
+    await titleOf('session-noinfo', '', [usageEvent]),
+    'session-noinfo',
+    '标题与目录都拿不到时应回落到会话 id，绝不能是空串',
+  )
+
+  // 4) 畸形标题事件不得把已有标题擦成空：读不懂就保留上一个已知标题
+  const partial = await titleOf('session-partial', 'D:\\blog', [
+    { type: 'session/title', seq: 0, time: titleTime, data: { title: '有效标题', messageSeqs: [], source: { kind: 'user' } } },
+    { type: 'session/title', seq: 1, time: titleTime, data: { title: '' } },
+    { type: 'session/title', seq: 2, time: titleTime, data: {} },
+    { type: 'session/title', seq: 3, time: titleTime },
+    usageEvent,
+  ])
+  assert.equal(partial, '有效标题', '读不懂的 session/title 不得把已有标题擦掉')
+
+  // 5) 每个会话都必须带一个非空 title，否则界面会渲染成空白行
+  for (const session of sample.sessions) {
+    assert.equal(typeof session.title, 'string', `${session.id} 缺少 title`)
+    assert.ok(session.title.length > 0, `${session.id} 的 title 不能是空串`)
+  }
+  // 上面那份假会话有工作目录、没有标题事件 → 应是目录末段
+  assert.equal(sample.sessions[0].title, 'blog', `预览标题应是工作目录末段，实际「${sample.sessions[0].title}」`)
+}
 
 // ── 账户余额：隐私与开关 ────────────────────────────────────────
 // 这一层的断言重点是「不发不该发的请求」与「不泄露 Key」，而不是余额数字本身
@@ -825,7 +970,164 @@ assert.equal(unknownPricing.rates, MODEL_RATES['deepseek-flash'], '未知模型�
 // 分档标注：GLM-4.6V 官方按输入长度分档，这里只取最低档并标出来
 assert.equal(pricingOf('glm-4.6v').tiered, true, 'GLM-4.6V 应标记为分档定价（这里只按最低档）')
 
-console.log(`预检通过：插件形状、5 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
-  + 'POST 拒绝、余额隐私与开关、套餐解析与凭据打码、多厂商价目')
+// ── 通知与预警：宿主侧的结束事实 + 阈值配置读写 ──────────────────
+const notifyModule = await import(pathToFileURL(join(root, 'lib', 'notify.js')).href)
+const {
+  NOTIFY_DEFAULTS, NotifyJournal, normalizeNotify, noticeOf, truncate,
+} = notifyModule
+
+// 1) `turn/end` 的五种原因各自归类；**认不出的必须落到 error 一侧**，
+//    把一次失败说成「已完成」是这里最不能犯的错（TurnEndReasonMap 可扩展）。
+const outcomes = [
+  ['completed', 'done'], ['error', 'error'], ['aborted', 'error'],
+  ['blocked', 'error'], ['max-tokens', 'error'], ['interrupted', 'error'],
+  ['some-future-reason', 'error'],
+]
+for (const [kind, category] of outcomes) {
+  const notice = noticeOf(
+    { id: 'session-1', header: { cwd: 'D:\\blog' } },
+    { type: 'turn/end', time: 1, data: { turn: 3, reason: { kind } } },
+    'blog',
+  )
+  assert.equal(notice.category, category, `reason.kind=${kind} 应归入 ${category}`)
+  assert.equal(notice.turn, 3, '应带上轮次')
+  assert.equal(notice.workspace, 'blog', '应带上工作目录名')
+}
+// 非 turn/end 事件不产生通知
+assert.equal(
+  noticeOf({ id: 's' }, { type: 'turn/start', time: 1, data: {} }, 'w'),
+  undefined,
+  '非 turn/end 事件不应产生通知',
+)
+// 失败要带原因；且必须截断（错误信息可能很长，而它要进系统通知）
+const failedNotice = noticeOf(
+  { id: 's' },
+  { type: 'turn/end', time: 1, data: { turn: 1, reason: { kind: 'error', error: { message: 'x'.repeat(500), code: 'RATE_LIMIT' } } } },
+  'w',
+)
+assert.ok(failedNotice.detail.length <= 240, `失败原因应被截断，实际 ${failedNotice.detail.length}`)
+assert.equal(failedNotice.code, 'RATE_LIMIT', '失败应带上错误码')
+assert.equal(truncate('  '), undefined, '空白文本应归一成 undefined')
+
+// 2) 环形日志：容量上限 + 单调游标 + 「开始订阅」不重播历史
+const journal = new NotifyJournal({ limit: 3 })
+for (let i = 1; i <= 5; i += 1) journal.record({ at: i, sessionId: `s${i}`, category: 'done' })
+assert.equal(journal.read({ since: 0 }).events.length, 3, '超出容量后应只保留最近 3 条')
+const first = journal.read({})
+assert.equal(first.events.length, 0, '不给 since 时应只回报当前游标，不重播历史')
+assert.equal(first.cursor, 5, '游标应为最新一条的 id')
+// 被裁掉之后要能明确说「中间丢了」，而不是安静地少提醒几条
+const stale = journal.read({ since: 1 })
+assert.equal(stale.dropped, true, 'since 早于最旧记录时应标出 dropped')
+assert.equal(journal.read({ since: 4 }).dropped, false, '没丢记录时不应误报 dropped')
+
+// 3) 配置归一：脏输入不能污染配置，也不能把「未设置」变成 0
+const clean = normalizeNotify({
+  notifyDone: 'yes',
+  warnBalance: { cny: 10, USD: '5', __proto__: 999, BAD: -1, EMPTY: '', NULL: null },
+  warnQuotaPercent: 250,
+})
+assert.equal(clean.notifyDone, NOTIFY_DEFAULTS.notifyDone, '非布尔值应退回默认值')
+assert.equal(clean.warnBalance.CNY, 10, '币种键应归一成大写')
+assert.equal(clean.warnBalance.USD, 5, '数字字符串应被接受')
+assert.equal(clean.warnBalance.BAD, undefined, '负阈值应被丢弃')
+assert.equal(clean.warnBalance.EMPTY, undefined, '空串不能被当成 0')
+assert.equal(clean.warnBalance.NULL, undefined, 'null 不能被当成 0')
+assert.ok(!Object.hasOwn(clean.warnBalance, '__proto__'), '原型键必须被正则挡掉')
+assert.equal(clean.warnQuotaPercent, 250, '超过 100 的阈值是合法用法（只提醒超限）')
+assert.equal(normalizeNotify({ warnQuotaPercent: 'abc' }).warnQuotaPercent, NOTIFY_DEFAULTS.warnQuotaPercent, '读不懂的百分比应退回默认')
+assert.deepEqual(Object.keys(clean).sort(), Object.keys(NOTIFY_DEFAULTS).sort(), '归一结果只能含已知键')
+
+// 4) 路由行为：GET 带 since 读增量；POST 写配置；跨站被拒
+const notifyRead = await call(notifyRoute, 'GET', '/dsh-pixel/notify')
+assert.equal(notifyRead.statusCode, 200)
+const notifyPayload = JSON.parse(notifyRead.body)
+assert.ok(notifyPayload.config !== undefined, 'GET 应带上配置')
+assert.equal(notifyPayload.cursor, 0, '尚无会话事件时游标应为 0')
+assert.equal(notifyPayload.events.length, 0)
+
+// 驱动一次 session/event，确认宿主 listener 真的把事实记进了日志。
+// 这条断言是「后台会话也能提醒」的核心：浏览器看不到这些事件，只有宿主能。
+const sessionEventHandlers = hostListeners.get('session/event') ?? []
+assert.equal(sessionEventHandlers.length, 1, '应恰好注册一个 session/event 监听器')
+sessionEventHandlers[0](
+  { id: 'session-abc', header: { cwd: 'D:\\my_project\\blog' } },
+  { type: 'turn/end', time: Date.now(), data: { turn: 2, reason: { kind: 'completed' } } },
+)
+const afterEvent = JSON.parse((await call(notifyRoute, 'GET', '/dsh-pixel/notify?since=0')).body)
+assert.equal(afterEvent.events.length, 1, '宿主应把 turn/end 记进通知日志')
+assert.equal(afterEvent.events[0].category, 'done')
+assert.equal(afterEvent.events[0].workspace, 'blog', '工作区名应由宿主算好')
+
+// 5) 热路径安全：`session/event` 上还挂着持久化、投影与遥测，监听器抛错会中断
+//    同一次 emit 的后续订阅者（最坏是会话日志没落盘）。因此无论喂进什么畸形
+//    事件，这个监听器都必须安静返回，绝不向调用方抛错。
+//
+//    分两类断言，因为它们的正确行为不同：
+//      - 结构上不是「某会话结束」的（非 turn/end、或会话 id 读不出来）→ 不记；
+//      - 确实是 turn/end 但 reason 畸形 → **仍然要记**，只是归到「原因未知」。
+//        一次真实结束不该因为字段坏掉就凭空消失；而且它必须落到 error 一侧，
+//        绝不能因为读不懂就当成「已完成」。
+const noRecordEvents = [
+  { type: 'user/message', time: 1, data: {} },
+  { type: 'turn/start', time: 1, data: { turn: 1 } },
+]
+const noSubjectValues = [{}, null, undefined, { header: {} }, { id: '', header: { cwd: null } }]
+for (const weird of noRecordEvents) {
+  for (const subject of [{ id: 'x', header: {} }, ...noSubjectValues]) {
+    sessionEventHandlers[0](subject, weird)
+  }
+}
+for (const subject of noSubjectValues) {
+  sessionEventHandlers[0](subject, { type: 'turn/end', time: 1, data: { turn: 1, reason: { kind: 'completed' } } })
+}
+// 读全量要用 since=0：不带 since 的 GET 是「从现在开始订阅」，按设计返回空列表。
+const afterNoRecord = JSON.parse((await call(notifyRoute, 'GET', '/dsh-pixel/notify?since=0')).body)
+assert.equal(afterNoRecord.events.length, 1, '非 turn/end 或读不出会话 id 时不得写入通知日志')
+
+// 畸形 reason：结构可读、字段坏掉。仍须记一条，且必须归到 error 一侧。
+const malformedReasonEvents = [
+  { type: 'turn/end', time: 1, data: null },
+  { type: 'turn/end', time: 1, data: { turn: 1, reason: null } },
+  { type: 'turn/end', time: 1, data: { turn: 1, reason: { kind: 'error', error: null } } },
+  { type: 'turn/end', time: 1, data: { turn: 1, reason: { kind: 'aborted', reason: null } } },
+  { type: 'turn/end', time: 1 },
+]
+for (const weird of malformedReasonEvents) {
+  sessionEventHandlers[0]({ id: 'session-bad', header: { cwd: 'D:\\x' } }, weird)
+}
+const afterBad = JSON.parse((await call(notifyRoute, 'GET', '/dsh-pixel/notify?since=0')).body)
+assert.equal(
+  afterBad.events.length,
+  1 + malformedReasonEvents.length,
+  '畸形 reason 的 turn/end 仍应记录（一次真实结束不该凭空消失）',
+)
+for (const entry of afterBad.events.slice(1)) {
+  assert.equal(entry.category, 'error', `读不懂的 reason 必须归到 error 一侧，而不是假装完成：${JSON.stringify(entry)}`)
+}
+
+const notifyWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', { warnBalance: { CNY: 20 } })
+assert.equal(notifyWrite.statusCode, 200, `POST 应返回 200，实际 ${notifyWrite.statusCode}`)
+const written = JSON.parse(notifyWrite.body)
+assert.equal(written.config.warnBalance.CNY, 20, '阈值应被写入')
+assert.equal(written.config.notifyDone, true, '未提交的项应保持原值（合并语义）')
+// 写回后读一次，确认真的持久化到隔离的 prefs 文件里
+const reread = JSON.parse((await call(notifyRoute, 'GET')).body)
+assert.equal(reread.config.warnBalance.CNY, 20, '重新读取应看到刚写入的阈值')
+// 跨站被拒：写路由不接受跨站表单触发
+const crossSiteWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', { warnQuotaPercent: 1 }, { 'sec-fetch-site': 'cross-site' })
+assert.equal(crossSiteWrite.statusCode, 403, '跨站写请求应被拒绝')
+// 非法体被拒（数组不是对象）
+const badWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', [1, 2, 3])
+assert.equal(badWrite.statusCode, 400, '数组体应被拒绝')
+// 只读方法之外一律 405
+const putRoute = await call(notifyRoute, 'PUT', '/dsh-pixel/notify')
+assert.equal(putRoute.statusCode, 405, 'PUT 应返回 405')
+
+// 恢复：把开关文件清干净，避免影响后续断言
+rmSync(sandboxPrefs, { force: true })
+
+console.log(`预检通过：插件形状、7 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
+  + 'POST 拒绝、时段时钟、余额隐私与开关、套餐解析与凭据打码、多厂商价目、通知日志与预警阈值')
 
 rmSync(sandboxPrefs, { force: true })

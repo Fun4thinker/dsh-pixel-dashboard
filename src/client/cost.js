@@ -16,14 +16,40 @@ const FALLBACK_RATES = {
 
 /**
  * 取某个模型的价目条目。
+ *
+ * 两个来源，按**可信度**排序：
+ *   1) 宿主逐模型交下来的 `pricing.models`（键是归一后的模型名）。条目身份
+ *      `deepseek-flash@commandcode` 与它只差一个 `@提供商` 后缀，因此先剥离再查；
+ *   2) 宿主整张价目表 `pricing.rates`——**旧宿主**没有 `models` 时走这条。
+ *
+ * 为什么不能只靠 `pricing.rates` 按模型路由 id 查：表里只有归一后的模型名
+ * （`deepseek-flash`），而路由 id 是 `deepseek/deepseek-v4.1-flash`。查不到就会
+ * 静默回落到 Flash 价——**GLM 那一行因此被当成「分时定价」，多画了一列 token、
+ * 少画了一个金额表头，整张表从那一行起列就错位了。**
  * @param {object} pricing - 宿主的 pricing 段。
- * @param {string} model - 模型名（应为归一后的键）。
+ * @param {string} model - 条目身份（`模型@提供商`）或模型名。
  * @returns {object} 价目条目。
  */
 export function ratesFor(pricing, model) {
-  return pricing?.rates?.[model]
+  return ratesKeyOf(pricing, model)
     ?? pricing?.rates?.['deepseek-flash']
     ?? FALLBACK_RATES
+}
+
+/**
+ * 按条目身份查价目，查不到返回 undefined（**不回落**）。
+ * @param {object} pricing - 宿主的 pricing 段。
+ * @param {string} model - 条目身份或模型名。
+ * @returns {object|undefined} 价目条目。
+ */
+function ratesKeyOf(pricing, model) {
+  const key = String(model ?? '')
+  const at = key.indexOf('@')
+  const rollup = at <= 0 ? key : key.slice(0, at)
+  return pricing?.models?.[rollup]
+    ?? pricing?.models?.[key]
+    ?? pricing?.rates?.[rollup]
+    ?? pricing?.rates?.[key]
 }
 
 /**

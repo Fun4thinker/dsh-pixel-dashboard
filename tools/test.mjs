@@ -24,7 +24,16 @@ import {
   zonedParts,
 } from '../lib/pricing.js'
 import { UsageCatalog } from '../lib/host.js'
-import { UsageLedger, mergeRecords, parseLedger, recordOf, usageOfRecord } from '../lib/ledger.js'
+import {
+  UsageLedger,
+  mergeRecords,
+  modelKeyOf,
+  needsRouteEnrichment,
+  parseLedger,
+  recordOf,
+  upgradeRecord,
+  usageOfRecord,
+} from '../lib/ledger.js'
 
 let passed = 0
 /**
@@ -109,6 +118,55 @@ await check('周五下班后一直空闲到周一 9:00', () => {
   const parts = zonedParts(T('2026-09-11T10:30:00Z') + state.nextChangeMs, DEFAULT_TIMEZONE)
   assert.equal(parts.weekday, 1, '应落在周一')
   assert.equal(parts.hour, 9, '应在 9 点')
+})
+
+console.log('pricing：本段已走 / 总长（侧栏指示灯的环形进度）')
+
+// 这一组断言锁的是**比例的分母**。侧栏那枚点用「已走 ÷ 总长」画弧，
+// 分母算错就会弧走满了而倒计时还剩一大截（或反过来），而那看起来只是「动画有点怪」，
+// 不会有任何报错——所以必须在这里钉住。
+
+await check('本段总长 = 已走 + 还剩（高峰 180 分、午休 120 分）', () => {
+  const peak = periodState(T('2026-09-10T03:00:30Z'), DEFAULT_TIMEZONE) // 北京 11:00:30
+  assert.equal(peak.peak, true)
+  assert.equal(peak.periodMs, 180 * 60_000, '上午高峰 9:00–12:00 应是 180 分钟')
+  assert.equal(peak.nextChangeMs, 59.5 * 60_000, '距 12:00 应是 59.5 分钟')
+  assert.equal(peak.prevChangeMs, 120.5 * 60_000, '距 9:00 应是 120.5 分钟')
+
+  const lunch = periodState(T('2026-09-10T04:30:00Z'), DEFAULT_TIMEZONE) // 北京 12:30
+  assert.equal(lunch.peak, false)
+  assert.equal(lunch.periodMs, 120 * 60_000, '午休 12:00–14:00 应是 120 分钟')
+  assert.equal(lunch.prevChangeMs, 30 * 60_000, '距 12:00 应是 30 分钟')
+
+  const weekend = periodState(T('2026-09-12T02:00:00Z'), DEFAULT_TIMEZONE) // 周六 10:00
+  assert.equal(weekend.peak, false)
+  assert.equal(weekend.periodMs, 63 * 3600_000, '周五 18:00 → 周一 9:00 应是 63 小时')
+})
+
+await check('已走上界贴合：正好站在边界上时 prev = 0，且 periodMs 仍等于 next', () => {
+  // 北京 9:00:00 整——刚进高峰，0 秒已走
+  const at = periodState(T('2026-09-10T01:00:00Z'), DEFAULT_TIMEZONE)
+  assert.equal(at.peak, true)
+  assert.equal(at.prevChangeMs, 0, '刚进这一段的瞬间不应算成已走一段')
+  assert.equal(at.nextChangeMs, 180 * 60_000)
+  assert.equal(at.periodMs, at.nextChangeMs, 'prev 为 0 时总长必须仍等于 next，不能算成 0')
+})
+
+await check('比例恒在 0..1 之间，且倒计时归零意味着已走满', () => {
+  // 逐分钟扫一遍整个周末 + 若干工作日，比例必须单调、有界
+  let checked = 0
+  for (let offset = 0; offset < 8 * 24 * 60; offset += 7) {
+    const state = periodState(T('2026-09-11T00:00:00Z') + offset * 60_000, DEFAULT_TIMEZONE)
+    assert.ok(state.periodMs > 0, `总长必须为正，实际 ${state.periodMs}（offset ${offset}）`)
+    const fraction = state.prevChangeMs / state.periodMs
+    assert.ok(fraction >= 0 && fraction <= 1, `比例应在 0..1，实际 ${fraction}`)
+    assert.ok(
+      state.prevChangeMs < state.periodMs,
+      '已走必须严格小于总长——等于总长就意味着这一刻已经该翻转了',
+    )
+    checked += 1
+  }
+  assert.ok(checked > 1000, `应扫过足够多的时刻，实际 ${checked}`)
 })
 
 console.log('pricing：价目与折算')
@@ -305,12 +363,26 @@ await check('每条请求按发生时刻分入高峰 / 空闲档', () => {
 })
 
 await check('旧模型名被折叠到现行模型（deepseek-chat → flash）', () => {
-  assert.deepEqual([...new Set(data.models.map((row) => row.model))].sort(), ['deepseek-flash'])
+  // 条目身份是「归一模型 + 提供商」：三条旧名都折到同一个模型，
+  // 且都来自同一家（deepseek-official），因此只剩一条。
+  assert.deepEqual(
+    [...new Set(data.models.map((row) => row.key))].sort(),
+    ['deepseek-flash@deepseek-official'],
+  )
+  assert.deepEqual([...new Set(data.models.map((row) => row.rollup))], ['deepseek-flash'])
+})
+
+await check('每个条目都带上自己那一份单价，客户端不必再按路由 id 查一次', () => {
+  for (const model of data.models) {
+    assert.ok(model.rates !== undefined, `${model.key} 缺少 rates`)
+    // 逐模型表按**归一键**索引：客户端拿到的是宿主已经查好的那一份
+    assert.equal(data.pricing.models[model.rollup], model.rates)
+  }
 })
 
 await check('费用按分档单价折算，不是整段套一个折扣', () => {
   const model = data.models[0]
-  const rates = ratesOf(model.model)
+  const rates = ratesOf(model.rollup)
   const expected = costOf(model.totals.peak, rates, 'peak') + costOf(model.totals.idle, rates, 'idle')
   assert.equal(Number(model.cost.standard.toFixed(6)), Number(expected.toFixed(6)))
   assert.ok(model.cost.standard > 0)
@@ -323,7 +395,18 @@ await check('汇总给出标准价与「全走空闲」对比', () => {
 })
 
 await check('时段状态随站点时区返回，并带上官方口径说明', () => {
-  assert.equal(data.period.peak, false, '周四 12:00 北京应为空闲')
+  // 断言**不**写死 true/false：`UsageCatalog` 用的是真实当前时刻，写死会让这条
+  // 用例只在一天中的某些时段通过（实测：北京时间周二 10:59 跑必失败）。
+  // 这里改成两条都与墙钟无关的检查：
+  //   1) 时段状态必须与数据自己的生成时刻一致（这才是「按发生时刻判定」的契约）；
+  //   2) 固定时刻的口径本身仍被钉死（周四 12:00 北京 = 空闲）。
+  assert.equal(
+    data.period.peak,
+    isPeak(data.generatedAt, DEFAULT_TIMEZONE),
+    '时段状态应与数据生成时刻一致',
+  )
+  assert.equal(periodState(T('2026-09-10T04:00:00Z'), DEFAULT_TIMEZONE).peak, false, '周四 12:00 北京应为空闲')
+  assert.equal(periodState(T('2026-09-10T02:00:00Z'), DEFAULT_TIMEZONE).peak, true, '周四 10:00 北京应为高峰')
   assert.equal(data.peakRule.windows.length, 2)
   assert.ok(data.peakRule.note.includes('周一至周五'))
   assert.ok(data.pricing.source.includes('api-docs.deepseek.com'))
@@ -379,6 +462,66 @@ await check('落在高峰时段的会话只累计高峰金额', () => {
   assert.ok(sessionB.cost.peak > 0)
 })
 
+await check('同一模型经不同提供商调用时分成两个条目，并各自带上提供商', async () => {
+  // 这正是用户报的问题：三条路由都提供 DeepSeek Flash，旧版会显示成好几行
+  // 「DeepSeek Flash + 一个路由名」。现在身份是「模型 × 提供商」，
+  // 同一个模型在同一家下合并，跨家才分行。
+  const multi = new UsageCatalog({
+    persistence: () => fakePersistence({
+      w: [
+        message(1, T('2026-09-10T02:00:00Z'), 'deepseek-flash', { input: 100, output: 10 }),
+      ],
+      c: [
+        {
+          type: 'assistant/message',
+          seq: 1,
+          time: T('2026-09-10T02:10:00Z'),
+          data: {
+            usage: { inputTokens: 200, outputTokens: 20 },
+            message: {
+              role: 'assistant',
+              content: [],
+              source: { kind: 'model', provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' },
+            },
+          },
+        },
+      ],
+    }),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('by-provider'),
+    // 假模型目录：Command Code 那条路由在设置里的外显名
+    llm: () => ({
+      listProviders: () => [
+        { id: 'deepseek-official', name: 'DeepSeek 官方' },
+        { id: 'commandcode', name: 'Command Code' },
+      ],
+      listModels: async (id) => (id === 'commandcode'
+        ? [{ id: 'deepseek/deepseek-v4.1-flash', name: 'COD-DeepSeek V4.1 Flash' }]
+        : [{ id: 'deepseek-flash', name: 'DeepSeek Flash' }]),
+    }),
+  })
+  const result = await multi.read()
+  assert.deepEqual(
+    result.models.map((row) => row.key).sort(),
+    ['deepseek-flash@commandcode', 'deepseek-flash@deepseek-official'],
+    '同一个模型经两家调用必须是两个条目',
+  )
+  assert.deepEqual(
+    result.models.map((row) => row.providerLabel).sort(),
+    ['Command Code', 'DeepSeek 官方'],
+    '提供商要显示成设置里的名字，而不是路由名',
+  )
+  const official = result.models.find((row) => row.provider === 'deepseek-official')
+  const command = result.models.find((row) => row.provider === 'commandcode')
+  // 路由 id 里的 `deepseek/` 前缀不参与归一：它必须落到 flash 的价目上而不是「估算价」
+  assert.equal(command.rollup, 'deepseek-flash')
+  assert.equal(command.priced, true, '斜杠形态的路由 id 也要认得出价目')
+  assert.equal(command.label, 'COD-DeepSeek V4.1 Flash', '外显名跟随 DSH 设置')
+  assert.equal(official.totals.local, 110, '两条记录不能互相串味')
+  assert.equal(command.totals.local, 220)
+})
+
 await check('缺失 persistence 时退化为空数据而不抛错', async () => {
   const empty = new UsageCatalog({
     persistence: () => undefined,
@@ -394,23 +537,108 @@ await check('缺失 persistence 时退化为空数据而不抛错', async () => 
 console.log('ledger：本机用量账本')
 
 /** 造一条带用量的会话事件。 */
-const ledgerEvent = (seq, time, model, u) => ({
+const ledgerEvent = (seq, time, model, u, provider) => ({
   type: 'assistant/message',
   seq,
   time,
   data: {
     usage: u,
-    message: { source: { model } },
+    // provider 省略时**不带这个键**，与旧版 DSH（事件里没有 provider）一致
+    message: { source: provider === undefined ? { model } : { model, provider } },
   },
 })
 
 const ledgerPath = join(tmpdir(), `dsh-pixel-ledger-${process.pid}.jsonl`)
 rmSync(ledgerPath, { force: true })
 
-await check('记录里模型名已归一，旧名不会绕过价目表', () => {
+await check('记录里同时保留原生模型名与归一后的价目键', () => {
   const record = recordOf('s1', ledgerEvent(1, 1000, 'deepseek-chat', { inputTokens: 10, outputTokens: 1 }))
-  assert.equal(record.m, 'deepseek-flash')
-  assert.equal(recordOf('s1', ledgerEvent(2, 1000, 'deepseek-reasoner', { inputTokens: 1, outputTokens: 1 })).m, 'deepseek-flash')
+  assert.equal(record.n, 'deepseek-chat', '原生模型名要原样留着（它才查得回设置里的外显名）')
+  assert.equal(record.r, 'deepseek-flash', '价目键必须归一，否则会绕过价目表')
+  assert.equal(record.p, '', '事件里没有 provider 时留空串，不写 undefined')
+  assert.equal(recordOf('s1', ledgerEvent(2, 1000, 'deepseek-reasoner', { inputTokens: 1, outputTokens: 1 })).r, 'deepseek-flash')
+})
+
+await check('提供商是条目身份的一部分', () => {
+  const a = recordOf('s1', ledgerEvent(1, 1000, 'deepseek-v4.1-flash', { inputTokens: 1, outputTokens: 1 }, 'workbuddy-cn'))
+  const b = recordOf('s1', ledgerEvent(2, 1000, 'deepseek/deepseek-v4.1-flash', { inputTokens: 1, outputTokens: 1 }, 'commandcode'))
+  assert.equal(a.p, 'workbuddy-cn')
+  assert.equal(b.p, 'commandcode')
+  // 同一个模型、不同提供商 → 两条不同的条目身份
+  assert.equal(modelKeyOf(a), 'deepseek-flash@workbuddy-cn')
+  assert.equal(modelKeyOf(b), 'deepseek-flash@commandcode')
+  assert.notEqual(modelKeyOf(a), modelKeyOf(b))
+})
+
+await check('带发售日的变体名也折到同一个模型（否则会多出一行像另一个模型）', () => {
+  assert.equal(normalizeModel('deepseek-v4-flash-ga-260731'), 'deepseek-flash')
+  assert.equal(normalizeModel('deepseek-v4-flash-ga'), 'deepseek-flash')
+  assert.equal(normalizeModel('glm-4.7'), 'glm-5.3-flash')
+  // WorkBuddy 给同一个 Flash 起的别名（本机账本里实测存在）
+  assert.equal(normalizeModel('hy4-preview-f'), 'deepseek-flash')
+  // 认不出来的名字保持原样，不硬塞进某一行
+  assert.equal(normalizeModel('mystery-model-x'), 'mystery-model-x')
+})
+
+await check('旧布局账本记录被就地升级，且幂等键不变', () => {
+  // 旧记录：m 是模型名、r 是缓存命中 token、n 是 reasoning token，没有 p
+  const legacy = { k: 's1:7', s: 's1', t: 5000, m: 'deepseek-flash', i: 1000, r: 800, w: 0, o: 100, n: 5, u: 1900 }
+  const result = upgradeRecord(legacy)
+  assert.equal(result.upgraded, true)
+  assert.equal(result.record.k, 's1:7', '幂等键必须原样保留，否则重扫会翻倍')
+  assert.equal(result.record.h, 800, '旧的 r（缓存命中）要移到 h')
+  assert.equal(result.record.r, 'deepseek-flash', 'r 让给价目键')
+  assert.equal(result.record.g, 5, '旧的 n（reasoning）要移到 g')
+  assert.equal(result.record.n, 'deepseek-flash')
+  // 计费数字一个都不能动
+  assert.equal(result.record.i, 1000)
+  assert.equal(result.record.o, 100)
+  assert.equal(result.record.u, 1900)
+  // 已经升级过的记录再升一次必须原样返回
+  const again = upgradeRecord(result.record)
+  assert.equal(again.upgraded, false)
+  assert.equal(again.record.r, 'deepseek-flash')
+  // 斜杠形态的 id：左边是**网关的自称**，未必等于 DSH 的路由名
+  // （Command Code 的 id 前缀是 deepseek/，路由名却是 commandcode），
+  // 因此这里照实写下自称，由宿主聚合时用实时目录换成真正的路由名。
+  const slash = upgradeRecord({ k: 's2:1', t: 1, m: 'deepseek/deepseek-v4.1-flash' })
+  assert.equal(slash.record.p, 'deepseek')
+  assert.equal(slash.record.r, 'deepseek-flash', '斜杠前缀不参与归一，否则这个模型永远查不到价')
+  // 认不出来源的一律留空，不猜
+  assert.equal(upgradeRecord({ k: 's3:1', t: 1, m: 'mystery-model-x' }).record.p, '')
+})
+
+await check('重扫会话日志会把旧记录的模型与提供商补回来（否则永远是「来源未知」）', async () => {
+  // 这是最要命的一条：早先 merge 只「键不存在就追加」，于是旧记录里的
+  // `p: ''` 永远补不上——用户重扫多少次，界面上都是「来源未知」，
+  // 而且同一个模型因为原始名字被归一过，各家用量再也分不开。
+  const path = join(tmpdir(), `dsh-pixel-enrich-${process.pid}.jsonl`)
+  rmSync(path, { force: true })
+  const ledger = new UsageLedger(path)
+  // 旧记录：键是 sessionId:seq，模型名是**归一后**的 deepseek-flash，没有提供商
+  await ledger.merge([{ k: 'sa:1', s: 'sa', t: 1000, n: 'deepseek-flash', p: '', r: 'deepseek-flash', i: 100, h: 0, w: 0, o: 10, g: 0, u: 110 }])
+  // 本次扫描出来的权威记录：同一把键，带真实模型与提供商
+  const authoritative = {
+    k: 'sa:1', s: 'sa', t: 1000, n: 'deepseek-v4.1-flash', p: 'workbuddy-cn', r: 'deepseek-flash',
+    i: 999, h: 0, w: 0, o: 999, g: 0, u: 999,
+  }
+  const before = ledger.records[0]
+  assert.equal(needsRouteEnrichment(before), true, '提供商为空的旧记录应被判定为「待补全」')
+  const result = await ledger.merge([authoritative])
+  assert.equal(result.added, 0, '同键不应新增记录')
+  assert.equal(result.enriched, 1)
+  const repaired = new UsageLedger(path)
+  await repaired.load()
+  const record = repaired.records.find((row) => row.k === 'sa:1')
+  assert.equal(record.n, 'deepseek-v4.1-flash', '原生模型名要补回来')
+  assert.equal(record.p, 'workbuddy-cn', '提供商要补回来')
+  assert.equal(record.r, 'deepseek-flash')
+  // 关键：**计费数字必须保持旧账本的值**。用新扫描的字段整条覆盖会悄悄改动历史金额。
+  assert.equal(record.i, 100, '不许用新扫描的输入量覆盖旧记录')
+  assert.equal(record.u, 110, '不许用新扫描的计费量覆盖旧记录')
+  // 补全之后就不该再被判定为待补全，否则每次扫描都要重写整个账本
+  assert.equal(needsRouteEnrichment(record), false)
+  rmSync(path, { force: true })
 })
 
 await check('缓存未命中由 input 反推，不把命中算成未命中', () => {

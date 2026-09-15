@@ -1,7 +1,7 @@
 {
   "name": "dsh-pixel-dashboard",
-  "version": "2.1.0",
-  "description": "DSH 像素风皮肤与用量看板：马卡龙配色主题、Token 趋势、模型分布、活跃日历、费用估算与时段倒计时、会话费用条",
+  "version": "2.6.0",
+  "description": "DSH 像素风皮肤与用量看板：马卡龙配色主题、Token 趋势、模型分布、活跃日历、费用估算与时段倒计时、侧栏时段指示灯、会话费用条、余额与套餐额度预警、任务完成/失败/等待授权的系统通知",
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -9,7 +9,9 @@
     "cordis-plugin",
     "dashboard",
     "usage",
-    "theme"
+    "theme",
+    "notification",
+    "alert"
   ],
   "license": "MIT",
   "type": "module",
@@ -38,7 +40,9 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-theme",
         "@deepseek-ai/dsh-client-ui-sidebar",
-        "@deepseek-ai/dsh-client-ui-layout"
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-session"
       ]
     }
   },

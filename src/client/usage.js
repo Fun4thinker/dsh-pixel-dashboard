@@ -23,7 +23,7 @@ const CLIENT_VERSION = '__DSH_PIXEL_IMPL_VERSION__'
  * 本客户端需要宿主提供的能力。宿主在数据里声明它支持哪些，
  * 客户端只检查自己真正要用的项——缺少时逐项降级，而不是整页报错。
  */
-const CAPABILITIES = ['period', 'peakRule', 'sessionCost', 'calendarByDay', 'tieredRates']
+const CAPABILITIES = ['period', 'periodClock', 'peakRule', 'sessionCost', 'calendarByDay', 'tieredRates']
 
 /** 首次扫描长会话可能较慢，给足超时余量。 */
 const REQUEST_TIMEOUT_MS = 60_000

@@ -31,11 +31,16 @@ export function formatTokens(value) {
 
 /**
  * 毫秒差格式化为倒计时文本。
+ *
+ * 与 {@link compactCountdown} 一样必须显式挡掉非有限数：`Math.max(0, NaN)` 仍是
+ * `NaN`，会渲染成 `NaN 秒`。看板里那条倒计时直接读宿主字段，脏数据是会见得到的。
  * @param {number} ms - 剩余毫秒。
  * @returns {string} 形如 `3 小时 12 分 05 秒`。
  */
 export function formatCountdown(ms) {
-  const total = Math.max(0, Math.floor(Number(ms ?? 0) / 1000))
+  const raw = Number(ms)
+  if (!Number.isFinite(raw)) return '0 秒'
+  const total = Math.max(0, Math.floor(raw / 1000))
   const pad = (value) => String(value).padStart(2, '0')
   const hours = Math.floor(total / 3600)
   const minutes = Math.floor((total % 3600) / 60)
@@ -43,6 +48,32 @@ export function formatCountdown(ms) {
   if (hours > 0) return `${hours} 小时 ${pad(minutes)} 分 ${pad(seconds)} 秒`
   if (minutes > 0) return `${minutes} 分 ${pad(seconds)} 秒`
   return `${seconds} 秒`
+}
+
+/**
+ * 毫秒差格式化为**紧凑**倒计时，供侧栏那一行使用。
+ *
+ * 与 {@link formatCountdown} 的分工：那个写在悬停提示里，读得越清楚越好；
+ * 这个要塞进侧栏行图标旁边，每多一个字就少一个字给「用量看板」这个标题。
+ * `3 小时 12 分 05 秒` 有十几个字符宽（约 90px），足以把标题挤没；
+ * 紧凑版最长 5 个字符（如 `2天3时`），因此放得下。
+ *
+ * **必须显式挡掉非有限数**：`Math.max(0, NaN)` 仍然是 `NaN`，一路会渲染成
+ * `NaN天NaN时` 这种串。脏数据在真实环境里是会见到的（宿主字段缺失、时钟异常），
+ * 而这是每秒重画的一行，出问题会一直闪。读不懂就显示 `0秒`。
+ * @param {number} ms - 剩余毫秒。
+ * @returns {string} 形如 `45秒`、`45分`、`3时12分`、`2天3时`。
+ */
+export function compactCountdown(ms) {
+  const raw = Number(ms)
+  if (!Number.isFinite(raw)) return '0秒'
+  const total = Math.max(0, Math.floor(raw / 1000))
+  if (total < 60) return `${total}秒`
+  const minutes = Math.floor(total / 60)
+  if (minutes < 60) return `${minutes}分`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}时${minutes % 60}分`
+  return `${Math.floor(hours / 24)}天${hours % 24}时`
 }
 
 /**

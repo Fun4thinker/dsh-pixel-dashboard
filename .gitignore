@@ -12,12 +12,19 @@ dsh-web.log
 *.log
 
 # 打包/校验过程的临时产物
+#   打包脚本在语法错误时会落一份坏产物到 lib/client.js.invalid（仓库根就是发布包）。
+#   早先这里写的是 packages/plugin/lib/...，那是两包形态的旧路径，早已不存在——
+#   路径写错本身不报错，只会让坏产物**真的被提交进去**，所以按后缀忽略。
 *.tgz
 *.tmp
-packages/plugin/lib/client.js.invalid
+*.invalid
 
 # 编辑器与系统
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 开发笔记：踩坑记录、架构取舍、闸门意图。面向改代码的人（含 AI 助手），
+# 不是面向用户的说明（那是 README.md 的职责），因此不入库。
+AGENT.md

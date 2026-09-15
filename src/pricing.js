@@ -142,6 +142,10 @@ export const MODEL_ALIASES = {
   'deepseek-chat': 'deepseek-flash',
   'deepseek-reasoner': 'deepseek-flash',
   'deepseek-v4-pro-0813': 'deepseek-v4-pro',
+  // WorkBuddy 给同一个 DeepSeek Flash 起的别名（本机账本里有实测记录）。
+  // 不折叠就会多出一行「DeepSeek Flash / hy4-preview-f」并标成「估算价」——
+  // 明明是按 Flash 计费的同一个模型，看起来却像另一个来路不明的模型。
+  'hy4-preview-f': 'deepseek-flash',
   'glm-5.3-highspeed': 'glm-5.3',
   'glm-5.2-highspeed': 'glm-5.2',
   'glm-5.1': 'glm-5.3',
@@ -152,6 +156,11 @@ export const MODEL_ALIASES = {
 
 /**
  * 把模型名归一：旧名与带日期的版本名折叠到价目表里的键。
+ *
+ * **必须容忍带发售日 / 变体标记的名字。** DSH 的模型 id 有时是
+ * `deepseek-v4-flash-ga-260731` 这种「名字 + 变体 + 发售日」的形态，
+ * 早先只剥一个四位日期后缀（`-0813`），`-ga-260731` 就漏了：它会走兜底价，
+ * 在费用明细里多出一行看起来像另一个模型的条目（实测本机账本里就有）。
  * @param {string} model - 原始模型名。
  * @returns {string} 价目表键。
  */
@@ -161,9 +170,18 @@ export function normalizeModel(model) {
   if (MODEL_RATES[name] !== undefined) return name
   const aliased = MODEL_ALIASES[name]
   if (aliased !== undefined) return aliased
-  // 去掉可能的日期后缀再试一次，例如 deepseek-flash-0813
-  const stripped = name.replace(/-\d{4}$/, '')
-  if (MODEL_RATES[stripped] !== undefined) return stripped
+  // 逐层剥后缀：每剥掉一段都回头查一次价目表与别名表。变体标记（`-ga` /
+  // `-preview` / …）与发售日（可能是 4 位年份+月，也可能只有 4 位）可以交替
+  // 出现，因此这里循环而不是一次正则。
+  let candidate = name
+  for (let i = 0; i < 4; i += 1) {
+    const next = candidate.replace(/-(?:\d{4,6}|ga|preview|exp|beta|stable|release)$/, '')
+    if (next === candidate) break
+    candidate = next
+    if (MODEL_RATES[candidate] !== undefined) return candidate
+    const alias = MODEL_ALIASES[candidate]
+    if (alias !== undefined) return alias
+  }
   return name
 }
 
@@ -209,13 +227,28 @@ export function pricingOf(model) {
 }
 
 /**
- * 取站点时区下的“墙钟”字段。
- * @param {number} epochMs - 绝对时刻。
- * @param {string} timeZone - IANA 时区名。
- * @returns {{year:number,month:number,day:number,hour:number,minute:number,weekday:number,minuteOfDay:number}}
+ * 站点时区 → 已构造好的 formatter。
+ *
+ * **必须复用，不能每次现造。** `zonedParts()` 落在两条热路径上：导入账本时每条
+ * 记录都要判一次高峰/空闲（本机 2400 条记录 ≈ 7000 次调用），而 `periodState()`
+ * 找翻转点还要逐分钟扫几千次。实测每次新建 `Intl.DateTimeFormat` 约 51µs、
+ * 复用约 2µs（11520 次调用 592ms → 23ms，差 26 倍）。formatter 自身无状态，
+ * 按 IANA 名缓存即可，也不改变任何判定结果。
+ * @type {Map<string, Intl.DateTimeFormat>}
  */
-export function zonedParts(epochMs, timeZone = DEFAULT_TIMEZONE) {
-  const fmt = new Intl.DateTimeFormat('en-US', {
+const ZONED_FORMATTERS = new Map()
+
+/**
+ * 取（并缓存）某个时区的 formatter。
+ * @param {string} timeZone - IANA 时区名。
+ * @returns {Intl.DateTimeFormat} formatter。
+ */
+function zonedFormatter(timeZone) {
+  const cached = ZONED_FORMATTERS.get(timeZone)
+  if (cached !== undefined) return cached
+  // 非法时区名在这里抛 RangeError，与「每次现造」时的行为一致：不缓存坏结果，
+  // 因此下一次调用仍会抛出同一个错，不会把错误吞成静默降级。
+  const created = new Intl.DateTimeFormat('en-US', {
     timeZone,
     hour12: false,
     year: 'numeric',
@@ -225,8 +258,19 @@ export function zonedParts(epochMs, timeZone = DEFAULT_TIMEZONE) {
     minute: '2-digit',
     weekday: 'short',
   })
+  ZONED_FORMATTERS.set(timeZone, created)
+  return created
+}
+
+/**
+ * 取站点时区下的“墙钟”字段。
+ * @param {number} epochMs - 绝对时刻。
+ * @param {string} timeZone - IANA 时区名。
+ * @returns {{year:number,month:number,day:number,hour:number,minute:number,weekday:number,minuteOfDay:number}}
+ */
+export function zonedParts(epochMs, timeZone = DEFAULT_TIMEZONE) {
   const bag = {}
-  for (const part of fmt.formatToParts(new Date(epochMs))) {
+  for (const part of zonedFormatter(timeZone).formatToParts(new Date(epochMs))) {
     if (part.type !== 'literal') bag[part.type] = part.value
   }
   const weekdayIndex = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(bag.weekday)
@@ -269,27 +313,54 @@ const STEP_MS = 60_000
 const STEP_LIMIT = 8 * 24 * 60
 
 /**
- * 当前时段状态与下一次切换时间。
+ * 当前时段状态、下一次切换时间，以及**本段已走了多久**。
+ *
+ * 多返回 `prevChangeMs` / `periodMs` 是为了让界面能画出「本段还剩多少」的环形进度条
+ * （侧栏按钮上那枚时段指示灯）：只有 `nextChangeMs` 时，界面知道还剩多久、却不知道
+ * 这一段总长，画不出比例。
+ *
+ * 两次扫描都按**整分钟**推进，因为翻转点一定落在整分钟上（9:00 / 12:00 / 14:00 / 18:00）。
+ * 站点时区的偏移都是整分钟的倍数，所以绝对时刻的分钟边界与墙钟分钟边界一致。
+ * 返回的 `nextChangeMs + prevChangeMs` 恰好等于本段总长：
+ *   例 11:00:30（高峰 9:00–12:00）→ next = 59.5 分、prev = 120.5 分，合计 180 分。
+ * 正好站在边界上时 `prevChangeMs` 为 0，于是 `periodMs === nextChangeMs`，仍然正确。
  * @param {number} epochMs - 绝对时刻。
  * @param {string} timeZone - IANA 时区名。
- * @returns {{peak:boolean,minuteOfDay:number,weekday:number,nextChangeMs:number,nextPeak:boolean,label:string}}
+ * @returns {{peak:boolean,minuteOfDay:number,weekday:number,nextChangeMs:number,prevChangeMs:number,periodMs:number,nextPeak:boolean,label:string}}
  */
 export function periodState(epochMs, timeZone = DEFAULT_TIMEZONE) {
   const p = zonedParts(epochMs, timeZone)
   const peak = isPeak(epochMs, timeZone)
-  // 逐分钟向前找第一次状态翻转
+  // 当前时刻在本分钟里已走的毫秒数：扫描按整分钟对齐，把这段零头补上才是真实剩余。
+  const intoMinute = epochMs % STEP_MS
+
+  // 向前找第一次翻转
   let nextChangeMs = 0
   for (let i = 1; i <= STEP_LIMIT; i += 1) {
     if (isPeak(epochMs + i * STEP_MS, timeZone) !== peak) {
-      nextChangeMs = i * STEP_MS - (epochMs % STEP_MS)
+      nextChangeMs = i * STEP_MS - intoMinute
       break
     }
   }
+
+  // 向后找最近一次翻转。扫描只告诉我们「翻转发生在上一个整分钟里」，
+  // 而翻转点本身在那一分钟的**上端**，因此是 (i - 1) 而不是 i：
+  // 从 11:00:30 往回扫到 8:59:30 才变，翻转点其实是 9:00:00，已走 2 小时 0 分 30 秒。
+  let prevChangeMs = 0
+  for (let i = 1; i <= STEP_LIMIT; i += 1) {
+    if (isPeak(epochMs - i * STEP_MS, timeZone) !== peak) {
+      prevChangeMs = (i - 1) * STEP_MS + intoMinute
+      break
+    }
+  }
+
   return {
     peak,
     minuteOfDay: p.minuteOfDay,
     weekday: p.weekday,
     nextChangeMs,
+    prevChangeMs,
+    periodMs: prevChangeMs + nextChangeMs,
     nextPeak: !peak,
     label: peak ? '高峰时段' : '空闲时段',
   }

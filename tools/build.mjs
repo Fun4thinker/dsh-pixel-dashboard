@@ -4,8 +4,8 @@
  * 产出结构（`package.json` 的 main / exports / dsh.client 都指向这里）：
  *
  *   lib/index.js     装载入口。用「宿主源码哈希」做动态 import 的版本号，
- *                    于是改完实现重新构建即可热更新；哈希自动派生，
- *                    不存在「忘了加版本号」这种失败模式。
+ *                    于是重新构建后版本号必变，重启 dsh 即加载新实现；
+ *                    哈希自动派生，不存在「忘了加版本号」这种失败模式。
  *   lib/host.js      宿主半边（入口 import 的实现）
  *   lib/pricing.js   时段与价目（纯函数）
  *   lib/ledger.js    本机用量账本
@@ -30,7 +30,7 @@ const srcDir = join(root, 'src')
 const outDir = join(root, 'lib')
 
 /** 宿主侧的模块：改动这些会影响实现版本号。 */
-const HOST_SOURCES = ['host.js', 'pricing.js', 'ledger.js', 'balance.js', 'plans.js', 'volc-sign.js', 'prefs.js']
+const HOST_SOURCES = ['host.js', 'pricing.js', 'ledger.js', 'balance.js', 'plans.js', 'volc-sign.js', 'prefs.js', 'notify.js']
 
 /**
  * 由宿主源码内容算出的短哈希，用作实现版本号。
@@ -61,8 +61,9 @@ writeFileSync(
  * dsh-pixel-dashboard 装载入口（由 tools/build.mjs 生成，勿手改）。
  *
  * 实现版本：${version}（宿主源码哈希）
- * 带版本号动态 import 是为了绕开「Loader 不重新 import 同一 specifier」，
- * 因此改完 src/host.js 重新构建即可热更新。
+ * 带版本号动态 import 是为了绕开「Loader 不重新 import 同一 specifier」：
+ * 重新构建后 specifier 变了，**重启** dsh 就会加载新实现（客户端半边则刷新页面即可）。
+ * 哈希自动派生，不存在「忘了加版本号」这种失败模式。
  * @module dsh-pixel-dashboard
  */
 const { default: plugin } = await import('./host.js?v=${version}')
