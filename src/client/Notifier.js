@@ -618,9 +618,19 @@ export class NotifierRuntime {
           try {
             // 先把系统通知收掉，再切界面：否则通知中心里会留着一条已经处理过的提醒。
             notification.close?.()
-            // 页面可能被切到后台（用户是从通知中心点回来的），聚焦一下，
-            // 否则切是切了、窗口还在别的应用后面。
+            // 把窗口拉到前台——**这一步是尽力而为，不是保证**。
+            //
+            // 按规范 `window.focus()` 只是一次「请求」：MDN 明确写着它可能因用户
+            // 设置而失败，返回前也不保证窗口已在最前。浏览器普遍拒绝脚本改窗口
+            // z 序（防广告骚扰），Firefox 基本直接忽略，Chrome 也只在部分条件下认。
+            //
+            // 可靠把窗口拉到前台的是 **Service Worker 的 notificationclick**
+            // （`clients.openWindow()` / `client.focus()`），但那是另一条通知通道，
+            // 而 DSH 的 Web 端没有注册 Service Worker（见 AGENT.md）。
+            // 因此这里照常调用（有环境会生效），但绝不假设它成功。
             this.scope?.focus?.()
+            // 即使拉不到前台，**切会话这件事仍会完成**：用户手动切回窗口时，
+            // 看到的已经是那条会话。这是当前技术条件下能做到的部分。
             this.openSession(sessionId)
           } catch {
             // 切界面失败不影响这条通知已经送达的事实。

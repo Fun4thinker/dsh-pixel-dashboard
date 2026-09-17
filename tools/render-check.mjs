@@ -881,7 +881,8 @@ const dockHtml = renderDock({
 })
 must(dockHtml.includes('px-pill'), '费用条应带 px-cost 结构类')
 must(dockHtml.includes('本次会话'), '费用条应说明这是本次会话')
-must(dockHtml.includes('2,000') || dockHtml.includes('2000'), '费用条应显示 token 数')
+// token 数按大模型通用单位缩略：2000 → `2.0K`（不是 `2,000` 或 `2000`）
+must(dockHtml.includes('2.0K'), `费用条应显示缩略后的 token 数（2.0K），实际：${dockHtml.slice(0, 400)}`)
 
 // 纯展示层：直接喂金额，断言格式与分档说明（金额来自网络，静态渲染里拿不到）
 const viewModule = await import(pathToFileURL(join(root, 'lib', 'client', 'SessionCost.js')).href)
@@ -1447,6 +1448,44 @@ must(periodTitle(undefined) === '用量看板', '拿不到相位时应退回原�
   must(!iconOnly.includes('px-period-dot'), 'PanelEntryView 只出图标，环由容器 portal')
 }
 
+// ── token 单位阶梯：K / M / B，不用中文「万 / 亿」────────────────────
+// 这套界面里的数字几乎全是 token，而 token 的**通用单位**就是 K / M / B：
+// 模型文档写「128K 上下文」「1M tokens」，写成「1.40 亿」要先在脑子里换成
+// 140M 才能与文档对上。闸门把台阶与两个边界钉死：
+//   1. **进位后跨阈值要升档**（999_999 不能显示成 1000.0K）；
+//   2. **绝不出现中文万/亿**——换回去会让这条直接失败。
+{
+  const { formatTokens } = await import(
+    pathToFileURL(join(root, 'lib', 'client', 'format.js')).href
+  )
+  const expected = [
+    [0, '0'], [1, '1'], [999, '999'],
+    [1000, '1.0K'], [1500, '1.5K'], [12345, '12.3K'], [99999, '100.0K'],
+    [1_000_000, '1.00M'], [1_234_567, '1.23M'], [617_283_945, '617.28M'],
+    [1_000_000_000, '1.00B'], [1_395_646_416, '1.40B'],
+    // 边界：四舍五入会把尾数推到 1000，必须升到上一档而不是显示 1000.0K / 1000.00M
+    [999_999, '1.00M'],
+    [999_999_999, '1.00B'],
+    // 负数（脏数据）也要按同一套走，不能崩
+    [-1_234_567, '-1.23M'],
+  ]
+  for (const [input, want] of expected) {
+    must(formatTokens(input) === want,
+      `formatTokens(${input}) 应为 ${want}，实际 ${formatTokens(input)}`)
+  }
+  // 逐个数量级检查：任何输出都不得含中文万/亿，也不得出现 NaN / undefined
+  for (const [, text] of expected) {
+    must(!/万|亿/.test(text), `token 单位不得用中文万/亿：${text}`)
+  }
+  for (const dirty of [undefined, null, NaN, Infinity, -Infinity, 'abc', {}]) {
+    const text = formatTokens(dirty)
+    must(!/NaN|Infinity|undefined/.test(text),
+      `脏输入不得渲染出 NaN/Infinity/undefined：${String(dirty)} → ${text}`)
+    must(!/万|亿/.test(text), `脏输入也不得回落到中文单位：${String(dirty)} → ${text}`)
+  }
+  // 整数档（< 1000）不补小数位：`999` 而不是 `999.0`
+  must(formatTokens(999) === '999', '不足 1000 时不该补小数位')
+}
 // ── 字体回归闸门：绝不能再引入点阵/像素字体或全局强制换字体 ────────
 const { STYLES } = await import(pathToFileURL(join(root, 'lib', 'client', 'theme.js')).href)
 const css = STYLES.map(([, text]) => text).join('\n')
@@ -1546,6 +1585,29 @@ must(
   '文字色不得直接依赖 --dsw-* 令牌（产品以内联样式写在 body 上，插件无法按主题覆盖）；'
   + '请改用插件自己的 --px-* 令牌',
 )
+
+// ── 每一档颜色都要有成套的 CSS（踩过一次）─────────────────────────
+// 折线的 tone 取自 `TONES`，而 `.px-line/.px-dot/.px-legend-swatch` 各自需要一条
+// 规则。早先只有 blue / purple / pink 三套，于是「按模型 / 提供商分组」能画出
+// 6 条线时，后三色**既不显色、图例也是空方块**——曲线与图例对不上号，
+// 而且完全没有报错。这里按 TONES 逐个类名断言，加一档颜色就会自动被要求补齐。
+{
+  const { TONES } = await import(pathToFileURL(join(root, 'lib', 'client', 'usage.js')).href)
+  must(Array.isArray(TONES) && TONES.length >= 3, 'TONES 应至少有三种配色')
+  must(new Set(TONES).size === TONES.length, 'TONES 里不得有重复配色')
+  for (const tone of TONES) {
+    // 三种命名体系各有一处用途，缺一个就有一处画不出来：
+    //   .px-line.px-tone-X        → 折线 stroke
+    //   .px-dot.px-tone-X         → 悬停圆点 fill
+    //   .px-legend-swatch.px-tone-X → 图例色块 background
+    //   .px-tone-fill-X           → SVG fill（单独一套类名，见 toneFill()）
+    for (const sel of [`px-line.px-tone-${tone}`, `px-dot.px-tone-${tone}`,
+      `px-legend-swatch.px-tone-${tone}`, `px-tone-fill-${tone}`]) {
+      const rule = new RegExp(`\\.${sel.replace(/\./g, '\\.')}\\s*[,{]`)
+      must(rule.test(css), `缺少 .${sel} 规则——该配色在这个位置画不出来`)
+    }
+  }
+}
 // 旧布局的规则不该作为**选择器**留在产物里（留着会让人以为还有一条渲染路径）。
 // 注意只查「选择器 + {」，不查整个字符串：注释里解释「为什么删掉它」是好事，
 // 不该被这条闸门误伤。
@@ -1604,11 +1666,12 @@ must(glmHtml.includes('估算价'), '价目表里没有的模型必须标成估�
 // 回落成 Flash 价，被误判成分时），整张表从那一行起就错位——金额落进了
 // 「空闲 token」那一列，表头还少一个。用户看到的就是「金额列也是用量」。
 // 因此这里逐行数单元格，而不是只找关键字。
+// 费用明细表的 HTML 片段，供下面几条闸门共用（块外的归组闸门也要用）。
+const costTable = glmHtml.slice(
+  glmHtml.indexOf('px-cost-table'),
+  glmHtml.indexOf('px-rate-list'),
+)
 {
-  const costTable = glmHtml.slice(
-    glmHtml.indexOf('px-cost-table'),
-    glmHtml.indexOf('px-rate-list'),
-  )
   must(costTable !== '', '费用明细表应渲染出来')
   /** 取出 `<table>` 里的所有行。 */
   const rows = costTable.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) ?? []
@@ -1631,6 +1694,63 @@ must(glmHtml.includes('估算价'), '价目表里没有的模型必须标成估�
   must(costTable.includes('智谱 GLM Coding Plan'), '套餐厂商的提供商列应显示其套餐名')
   // 旧账本记录没有提供商：必须明说，而不是空着让人以为是渲染坏了
   must(costTable.includes('来源未知'), '没有提供商信息的旧记录应标「来源未知」')
+}
+
+// ── 单价列表按**模型**归组，不逐提供商重复同一份价 ──────────────────
+//
+// 事实依据：**价目表本身就按模型索引**（`MODEL_RATES` 的键里没有提供商）。
+// 同一个模型走 N 条路由，`rates` 就是同一份对象——实测本机 4 条 `deepseek-flash`
+// 的单价逐字相同，却把「缓存命中 ¥0.02 / ¥0.04 · 未命中 ¥1 / ¥2 · 输出 ¥4 / ¥8」
+// 整整重复了 4 遍。数字、单位、厂商都一样，唯一不同的是**用量**，而用量在上面的表里。
+//
+// 归组键必须是 `rollup`（价目表的键），**不能**是「价格数字相同」：后者会把两个
+// 恰好同价的**不同模型**并成一条，把模型名抹掉。
+{
+  const rateRows = glmHtml.split('<div class="px-rate">').slice(1)
+  // fixture 里 deepseek-flash 有 2 个提供商（official + workbuddy），
+  // 加上 glm / mystery / v4-pro（无提供商那条），应当是 4 条单价而不是 5 条
+  must(rateRows.length === 4,
+    `单价列表应把同一模型的多个提供商并成一条，实际 ${rateRows.length} 条`)
+  // 用**归一键**（每行都渲染了它）定位，而不是用模型名——否则「名字取错了」
+  // 这个 bug 会让过滤器找不到行，闸门以一个误导性的理由失败，就分不清是
+  // 「合并没生效」还是「名字取错了」。这两件事要分开断言。
+  const flashRates = rateRows.filter((row) => row.includes('deepseek-flash'))
+  must(flashRates.length === 1,
+    `deepseek-flash 的单价只应出现一次（两个提供商合并成一条），实际 ${flashRates.length} 次`)
+  // 模型名必须用**官方名**，不能是某个提供商给它的外显名。
+  // fixture 里各条目的 `label` 是 DSH 设置里的路由名（`DeepSeek-V41-Flash` /
+  // `COD-DeepSeek V4.1 Flash`），与价目表官方名 `DeepSeek Flash` 不同：
+  // 取「排第一的那个」会让名字随用量排序变化，而价格是模型的属性。
+  must(flashRates[0].includes('DeepSeek Flash'),
+    '单价行应显示价目表里的官方模型名（DeepSeek Flash）')
+  must(!/COD-|DeepSeek-V41-Flash/.test(flashRates[0]),
+    '单价行不得使用某个提供商给它的外显名——各家叫法不同，且会随排序变化')
+  // 表头把「这是官方价」和单位、分档顺序**说一次**，不必每行重复——
+  // 每行重复一遍正是排版乱的根源（一行里塞了 6 类元素）。
+  must(glmHtml.includes('各模型官方单价'), '单价表要有表头说明这是官方价')
+  must(glmHtml.includes('元 / 百万 token'), '单价表要说明单位')
+  must(glmHtml.includes('空闲 / 高峰'), '单价表要说明两个值的顺序，否则 ¥0.02 / ¥0.04 分不清哪个是哪个')
+  // 措辞不能是「这几家通用」——第三方中转与 Coding Plan 是买断制，
+  // 不按 token 收费，说它们「也收这个价」是错的（见 lib/pricing.js 的口径）。
+  must(!flashRates[0].includes('通用'),
+    '不得写成「这几家通用」——第三方是买断制，不按 token 收费，那样写是错的')
+  // 一行里只写「有几个来源」，不把提供商名字铺开（那是排版乱的直接原因）
+  must(flashRates[0].includes('4 个来源') || flashRates[0].includes('2 个来源'),
+    '多来源应只标数量，不铺开名字')
+  // 组内每个提供商的色块都要保留：与环图配色一一对应，少一个就对不上号
+  const swatches = (flashRates[0].match(/px-rate-swatch/g) ?? []).length
+  must(swatches === 2,
+    `合并后仍应保留每个提供商的色块（2 个），实际 ${swatches} 个`)
+  // 不同模型**不得**被并到一起（即使恰好同价）。
+  // 按归一键定位，避免依赖某一处的显示名（fixture 里各条目的 label 是路由名，
+  // 与价目表官方名不同——这正是上面那条要断言的事）。
+  must(rateRows.filter((row) => row.includes('glm-5.3')).length === 1,
+    'GLM-5.3 应有自己的一条单价')
+  must(rateRows.filter((row) => row.includes('deepseek-v4-pro')).length === 1,
+    'DeepSeek V4 Pro 应有自己的一条单价')
+  // 费用明细**表**仍然逐提供商成行（用量与额度归属不同，不能合并）
+  must(costTable.includes('WorkBuddy 中国区'),
+    '费用明细表仍应逐提供商列出用量——那里合并会丢掉归属')
 }
 
 // ── 订阅套餐额度：纯逻辑 + 看板卡片 + 费用条那一枚 ───────────────
@@ -1690,6 +1810,41 @@ must(providerStatus({ ok: false, reason: 'rejected', error: 'Authentication Fail
 must(providerStatus({ ok: false, reason: 'request-failed', error: 'HTTP 500' }).level === 'error', '请求失败应是错误态')
 must(providerStatus({ ok: true, windows: [{ window: 'fiveHour' }] }).level === 'ok', '有窗口应为 ok')
 must(providerStatus({ ok: true, windows: [] }).level === 'warn', '成功但没窗口应是警告态')
+
+// ── 厂商分组：判据是「有没有配过」，不是「成功还是失败」─────────────
+// 用户报过：没配置的厂商（如当时的 GLM Coding Plan）不必一直占着面板。
+// 但这件事有个**必须分清**的边界：`no-key`（从没配过）与 `rejected`
+// （配过了但坏了）看起来都是 `ok:false`，混成一件就会把用户自己接上、
+// 现在出问题的那一家藏起来——那等于让他以为插件不支持它。
+{
+  const { partitionProviders: split } = await import(
+    pathToFileURL(join(root, 'lib', 'client', 'plans.js')).href)
+  const list = [
+    { id: 'ok1', ok: true },
+    { id: 'never', ok: false, reason: 'no-key' },
+    { id: 'broken', ok: false, reason: 'rejected', error: 'Authentication Failed' },
+    { id: 'down', ok: false, reason: 'request-failed', error: 'HTTP 500' },
+  ]
+  const base = split(list, {})
+  must(base.idle.map((p) => p.id).join(',') === 'never',
+    `只有「从没配过凭据」的才该收起来，实际收起：${base.idle.map((p) => p.id).join(',')}`)
+  for (const id of ['ok1', 'broken', 'down']) {
+    must(base.active.some((p) => p.id === id), `${id} 必须留在显眼处（配过 / 可用）`)
+  }
+  // 用户显式选中的那一家必须留下：切换器里点了它、下面却没有它，是自相矛盾的界面
+  must(split(list, { selected: 'never' }).active.some((p) => p.id === 'never'),
+    '用户选中的那一家人不能被收进折叠区')
+  // 当前监看的那一家同理（切换器上标着「当前监看」）
+  must(split(list, { current: 'never' }).active.some((p) => p.id === 'never'),
+    '当前监看的那一家不能被收进折叠区')
+  must(split([], {}).active.length === 0 && split([], {}).idle.length === 0, '空清单不该抛错')
+  must(split(undefined, {}).active.length === 0, '缺 providers 时不该抛错')
+  // 顺序必须保持宿主给的顺序，否则面板每次刷新都在跳
+  const order = split([
+    { id: 'a', ok: true }, { id: 'b', ok: false, reason: 'no-key' }, { id: 'c', ok: true },
+  ], {})
+  must(order.active.map((p) => p.id).join(',') === 'a,c', '显眼组应保持宿主顺序')
+}
 
 // 汇总：至少一家可用 / 最紧窗口
 const planPayload = {
@@ -1765,6 +1920,49 @@ must(plansEmptyHtml.includes('COMMAND_CODE_API_KEY'), '未配 Command Code Key �
 must(plansEmptyHtml.includes('VOLC_SECRET_ACCESS_KEY'), '火山缺 SK 时应指明缺的是哪一个')
 must(plansEmptyHtml.includes('AccessKey'), '火山未配时应说明要的是 AccessKey')
 must(plansEmptyHtml.includes('费用明细'), '套餐不可用时看板其余部分仍应渲染')
+// 一家都没配时，折叠区必须**默认展开**——否则上面是空的、下面又收起，
+// 新用户既看不到插件支持哪些家，也无从知道该怎么配。
+must(plansEmptyHtml.includes('未配置的厂商'), '全部未配时应出现「未配置的厂商」折叠区')
+must(plansEmptyHtml.includes('配好凭据即可查看额度'), '全部未配时折叠区应默认展开（提示语可见）')
+
+// ── 面板分组：在用的常显，没配过的收进折叠区（默认收起）────────────
+{
+  const groupedProviders = [
+    { id: 'commandcode', name: 'Command Code', ok: true, windows: [{ window: 'fiveHour', usedPercent: 40 }] },
+    { id: 'volcengine', name: '火山方舟 Coding Plan', ok: true, windows: [{ window: 'fiveHour', usedPercent: 20 }] },
+    { id: 'zhipu', name: '智谱 GLM Coding Plan', ok: false, reason: 'no-key', windows: [] },
+    { id: 'newvendor', name: '某新接入厂商', ok: false, reason: 'no-key', windows: [] },
+    // 配过但坏了：**必须常显**，这是用户自己接的那一家出了问题
+    { id: 'broken', name: '配过但坏了的一家', ok: false, reason: 'rejected', error: 'Authentication Failed', windows: [] },
+  ]
+  const { PlansPanel: PlansPanelHere } = await import(
+    pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
+  const groupedHtml = renderToStaticMarkup(React.createElement(PlansPanelHere, {
+    now: Date.now(),
+    payload: { enabled: true, fetchedAt: Date.now(), providers: groupedProviders },
+    selected: undefined, onSelect: () => {},
+  }))
+  // 折叠区标题与数量
+  must(groupedHtml.includes('未配置的厂商'), '有在用的家时，未配的那些应收进折叠区')
+  must(/>2 家</.test(groupedHtml) || groupedHtml.includes('2 家'), '折叠区标题应写明收起了几家')
+  // 折叠时内容**不渲染**（省掉高度，也避免默认就把面板撑长）
+  must(!groupedHtml.includes('px-plan-list-idle'), '折叠区默认应收起（内容不渲染）')
+  // 常显区**只看第一个 .px-plan-list**（切换器在它上面，那里本来就该列出每一家，
+  // 包括没配过的——用户要能切过去看怎么配）。用配对扫描取那一段，而不是按标题切。
+  const activeListHtml = extractElement(groupedHtml, '<div class="px-plan-list">')
+  must(activeListHtml !== undefined, '应有常显的 .px-plan-list')
+  // 配过但坏了的那一家必须留在上面
+  must(activeListHtml.includes('配过但坏了的一家'),
+    '配过但鉴权被拒的那一家必须常显——藏起来等于说插件不支持它')
+  must(activeListHtml.includes('Authentication Failed'), '常显的那一家要带上失败原因')
+  must(activeListHtml.includes('Command Code'), '可用的那几家应常显')
+  // 没配过的那两家不该出现在常显区
+  must(!activeListHtml.includes('智谱 GLM Coding Plan'), '没配过的智谱不该出现在常显区')
+  must(!activeListHtml.includes('某新接入厂商'), '没配过的新厂商不该出现在常显区')
+  // 但它们**不能消失**：切换器里仍要能选到（用户可能就想切过去看怎么配）
+  must(groupedHtml.includes('智谱') && groupedHtml.includes('某新接入厂商'),
+    '被收起的厂商仍应出现在切换器里，不能整个消失')
+}
 
 // 套餐关闭态：必须说明已关闭
 const plansOffHtml = renderToStaticMarkup(React.createElement(View, {
@@ -1840,9 +2038,28 @@ const required = [
   '任务完成', '失败 / 中断', '等待授权 / 回答', '当前会话不打扰',
   // 阈值并排：两项同处一个容器（原来各占一整行，白吃两倍高度）
   'px-notify-thresholds',
+  // 两张趋势卡片同行 + 维度切换器
+  'px-trend-row', 'px-trend-dim', '消费估计趋势', '每日消费估计',
 ]
 for (const token of required) must(html.includes(token), `渲染结果缺少「${token}」`)
 must(html.length > 20_000, `整页 HTML 只有 ${html.length} 字节，可能有区块没渲染`)
+
+// ── 用户可见文案里不得残留 Markdown 星号 ──────────────────────────
+// 这些字符串是 JSX 的文本子节点，**不会**被当成 Markdown 渲染，
+// 所以写成 `**模型**` 就会把星号原样摆在用户面前。这是已经犯过一次的错
+// （费用明细脚注里的「单价按**模型**列出」，以及这次的「按**各模型官方单价**」）。
+//
+// 检查方式：去掉标签后直接找 `**`。**不要**试图用「两侧是不是空白/标点」来缩小
+// 范围——第一版就是那么写的，而中文里 `按**各模型**估算` 两侧都是汉字，
+// 于是恰好漏掉了真实的 bug（闸门绿灯、星号照旧显示给用户）。
+// 这个界面里没有需要用 `**` 表达的数学式，因此宁可宽一点。
+{
+  const visible = html.replace(/<[^>]+>/g, ' ')
+  const marks = visible.match(/\*\*/g) ?? []
+  must(marks.length === 0,
+    `用户可见文案里有 ${marks.length} 处 Markdown 强调标记（**…**）会被原样显示；`
+    + 'JSX 文本不渲染 Markdown，强调请用 <b> 元素或去掉星号')
+}
 
 // ── 布局归组闸门：时段与计费 + 活跃日历 必须在同一排 ──────────────
 // 计费卡片只有几行键值对，独占整行会显得空荡；两者并排后各自都拿到合适的
@@ -1891,6 +2108,29 @@ must(
   pairHtml.indexOf('时段与计费') < pairHtml.indexOf('活跃日历'),
   '.px-pair 里「时段与计费」应在左、「活跃日历」在右',
 )
+
+// ── 两张趋势卡片必须同行，且各带该带的切换器 / 合计 ────────────────
+// 用户要求：Token 趋势与消费估计趋势**同行展示，不分两行**。
+// 两条曲线共用同一段时间轴，分两行就会让人来回滚动去对齐同一个日期。
+// 与 .px-pair 同一套配对扫描断言：必须真的同处一个容器，而不是「都在页面上」。
+{
+  const trendHtml = extractElement(html, '<div class="px-trend-row">')
+  must(trendHtml !== undefined, '缺少 .px-trend-row 容器：两张趋势卡片没有同行')
+  must(trendHtml.includes('Token 趋势'), '.px-trend-row 里没有 Token 趋势卡片')
+  must(trendHtml.includes('消费估计趋势'), '.px-trend-row 里没有消费估计趋势卡片')
+  must(
+    trendHtml.indexOf('Token 趋势') < trendHtml.indexOf('消费估计趋势'),
+    '.px-trend-row 里 Token 趋势应在左、消费估计趋势在右',
+  )
+  // 容器内恰好两张卡片：多塞一张进来会破坏「两张各占一半」的等分
+  const panels = (trendHtml.match(/class="px-panel /g) ?? []).length
+  must(panels === 2, `.px-trend-row 里应恰好两张面板，实际 ${panels}`)
+  // 维度切换器在 Token 那张卡片里（不是全局），且三个维度都列出
+  for (const dim of ['构成', '模型', '提供商']) {
+    must(trendHtml.includes(`>${dim}</button>`), `趋势卡片缺少「${dim}」维度按钮`)
+  }
+  must(trendHtml.includes('px-trend-dim'), '维度切换器应有自己的类名（卡片内次级控件）')
+}
 
 // ── 「时段与计费」那枚徽标：高峰粉、空闲绿 ───────────────────────
 // 它原先在高峰时**没有任何配色**（只有基础 .px-badge 的中性灰），
@@ -2172,6 +2412,100 @@ must(html.includes('user/balance'), '余额面板应标出数据来源端点')
   must(/class="px-plan-chip bad"/.test(planHtmlWithFailures), '失败的那一家应带 bad 标记')
   // 没选过（自动）时跟着**最紧**的那一家走，与费用条那一枚同一条判据
   must(planHtmlWithFailures.includes('px-plan-current'), '自动模式下也应有「当前监看」标记')
+
+  // ── 「去哪拿凭据 + 拿到后放哪」必须在界面上真的出现 ────────────────
+  // 用户报过：火山方舟那一栏只说「要 AccessKey」，既没说去哪拿，也没说拿到后
+  // 往哪填——而 DSH 设置里**没有**能填 `VOLC_ACCESS_KEY_ID` 的输入框
+  // （设置 → 模型只写它派生的 `<路由>_API_KEY`）。所以两半都必须可见：
+  //   1. 可点的创建链接；
+  //   2. 确切的引用名 + 本机凭据文件路径。
+  const setupPayload = {
+    enabled: true,
+    fetchedAt: Date.now(),
+    credentialFile: 'C:\\Users\\me\\.dsh\\.credentials.yaml',
+    providers: [{
+      id: 'volcengine',
+      name: '火山方舟 Coding Plan',
+      ok: false,
+      reason: 'no-key',
+      keyRef: 'VOLC_ACCESS_KEY_ID',
+      keyRefs: ['VOLC_ACCESS_KEY_ID'],
+      hint: '需要在火山引擎账号的 IAM 里创建 AccessKey ID / Secret Access Key，两把都要配齐。',
+      setup: {
+        keyURL: 'https://console.volcengine.com/iam/keymanage/',
+        keyURLName: '火山引擎控制台 → API 访问密钥',
+        acquire: ['打开「访问控制 → API 访问密钥」新建密钥。', '这个页面不在方舟控制台里。'],
+        refs: [
+          { name: 'VOLC_ACCESS_KEY_ID', example: 'AKLT...', note: 'AccessKey ID' },
+          { name: 'VOLC_SECRET_ACCESS_KEY', example: '...', note: 'Secret Access Key' },
+        ],
+      },
+      windows: [],
+      supportedWindows: ['fiveHour', 'weekly', 'monthly'],
+    }],
+  }
+  const setupHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: Date.now(), payload: setupPayload, selected: undefined, onSelect: () => {},
+  }))
+  must(setupHtml.includes('这家凭据怎么配'), '面板应给出「这家凭据怎么配」入口')
+  must(setupHtml.includes('访问控制 → API 访问密钥'), '应给出获取 AK/SK 的具体路径')
+  must(setupHtml.includes('不在方舟控制台'), '必须点明 AK 不在方舟控制台——那正是用户找不到的原因')
+  must(setupHtml.includes('console.volcengine.com/iam/keymanage'),
+    'AK 获取入口必须是 IAM 的 API 访问密钥页（可点）')
+  must(!setupHtml.includes('console.volcengine.com/ark'),
+    'AK 获取入口不得是方舟推理控制台（那里只有会被拒的 ark- Key）')
+  must(setupHtml.includes('VOLC_ACCESS_KEY_ID') && setupHtml.includes('VOLC_SECRET_ACCESS_KEY'),
+    '两把 AK/SK 的确切引用名都要写出来')
+  must(setupHtml.includes('.credentials.yaml'), '必须给出凭据文件路径——设置里没有能填这两个名字的输入框')
+  must(setupHtml.includes('px-plan-setup-path'), '凭据路径应有独立样式（要能整条读出来并复制）')
+  // 缺凭据时这块默认展开：那正是用户需要它的时刻
+  must(/px-plan-setup[^>]*open/.test(setupHtml), '缺凭据时「怎么配」应默认展开')
+  // 入口只出现一次，避免「点哪个」这种多余的问题
+  must((setupHtml.split('console.volcengine.com/iam/keymanage').length - 1) === 1,
+    'AK 入口在同一块里只应出现一次')
+  // 已配置时折叠起来，不占版面
+  const configuredSetupHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: Date.now(),
+    payload: {
+      ...setupPayload,
+      providers: [{ ...setupPayload.providers[0], ok: true, reason: undefined, windows: [{ window: 'fiveHour', usedPercent: 10 }] }],
+    },
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(!/px-plan-setup[^>]*open/.test(configuredSetupHtml), '已配好时「怎么配」应折叠，不占版面')
+  must((configuredSetupHtml.split('console.volcengine.com/iam/keymanage').length - 1) === 1,
+    '折叠后入口仍应有一处可用（页脚那个）')
+  // 旧宿主没有 setup：仍要给出入口，且不能因此崩掉
+  const legacySetupHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: Date.now(),
+    payload: {
+      enabled: true,
+      providers: [{ id: 'volcengine', name: '火山方舟', ok: false, reason: 'no-key', keyRef: 'VOLC_ACCESS_KEY_ID', windows: [] }],
+    },
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(legacySetupHtml.includes('console.volcengine.com/iam/keymanage'),
+    '旧宿主（没有 setup）也必须指向 IAM 而不是方舟控制台')
+  // 退化的 setup（有 URL 但 acquire / refs 都空）：说明块自己不渲染，
+  // 此时页脚**必须**顶上，否则这一家一个入口都没有。
+  const degenerateSetupHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: Date.now(),
+    payload: {
+      enabled: true,
+      credentialFile: 'C:\\Users\\me\\.dsh\\.credentials.yaml',
+      providers: [{
+        id: 'volcengine', name: '火山方舟', ok: false, reason: 'no-key', keyRef: 'VOLC_ACCESS_KEY_ID',
+        setup: { keyURL: 'https://console.volcengine.com/iam/keymanage/', keyURLName: 'IAM', acquire: [], refs: [] },
+        windows: [],
+      }],
+    },
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(degenerateSetupHtml.includes('console.volcengine.com/iam/keymanage'),
+    'setup 为空块时页脚必须顶上入口，否则这一家一个链接都没有')
   // 管理入口现在挂在各自那一家的区块里，而不是面板底部一排
   must(planHtml.includes('commandcode.ai/studio'), '套餐面板应给出 Command Code 管理入口')
   must(planHtml.includes('console.volcengine.com'), '套餐面板应给出火山控制台入口')
@@ -2316,6 +2650,129 @@ must(
 must(minSide >= 3, `热力图格子太小（最小边 ${minSide.toFixed(2)}px），应至少 3px 才看得见`)
 console.log(`热力图几何：${heatRects.length} 个格子，最小边 ${minSide.toFixed(1)}px，宽高最大差 ${worst.delta.toFixed(2)}px`)
 
+// ── 日历「下一行 = 后一天」闸门 ──────────────────────────────────
+// 历史事故：列号按 `floor(day / 7)` 算，等于把首列当成完整一周。首日不是周日时
+// 列内的星期几只循环了 7 天就绕回去，于是「下面一格」不是后一天。
+// 实测（首日 2025-09-12，周五）：9/10 下面显示的是 9/4，9/17 下面是 9/11
+// ——用户顺着往下读当天的用量，读到的是另一天，正是被报上来的那个故障。
+//
+// 这里直接断言**映射本身**（而不是隔着 React 量坐标）：任意一天的下一行
+// 必须是后一天，且每一列最多 7 格、同一列内星期几不重复。
+const { calendarCellOf } = await import(pathToFileURL(join(root, 'lib', 'client', 'graph.js')).href)
+for (const firstDay of ['2025-09-05', '2025-09-12', '2026-01-01', '2024-02-29']) {
+  const lead = new Date(`${firstDay}T00:00:00Z`).getUTCDay()
+  const calendarDays = 371
+  /** 网格位置 → 天序号。 */
+  const occupancy = new Map()
+  for (let day = 0; day < calendarDays; day += 1) {
+    const { column, weekday } = calendarCellOf(day, lead)
+    const key = `${column}:${weekday}`
+    must(!occupancy.has(key), `首日 ${firstDay}：第 ${day} 天与第 ${occupancy.get(key)} 天挤在同一格（${key}）`)
+    occupancy.set(key, day)
+    // 补上首列空缺后，行号必须与真实星期几一致——这正是老实现搞错的地方
+    const realWeekday = new Date(Date.parse(`${firstDay}T00:00:00Z`) + day * 86_400_000).getUTCDay()
+    must(
+      weekday === realWeekday,
+      `首日 ${firstDay}：第 ${day} 天落在第 ${weekday} 行，但它实际是周 ${realWeekday}`,
+    )
+  }
+  for (let day = 0; day + 1 < calendarDays; day += 1) {
+    const { column, weekday } = calendarCellOf(day, lead)
+    // 周六下面没有格子（该列结束），其余各天的下一行必须是后一天
+    if (weekday === 6) continue
+    const below = occupancy.get(`${column}:${weekday + 1}`)
+    must(
+      below === day + 1,
+      `首日 ${firstDay}：第 ${day} 天下面应是第 ${day + 1} 天，实际是 ${below}——`
+      + '这正是「格子下面是另一天」的成因',
+    )
+  }
+}
+console.log('日历映射：4 个首日下「下一行 = 后一天」均成立')
+
+// ── 趋势分维度：**逐日相加必须等于总量** ────────────────────────────
+// 分模型 / 分提供商画曲线，最容易犯的错是**重复计数**：同一个模型走三条路由，
+// 按提供商拆时要算三次（本来就是三份用量），按模型合并时只该算一次。
+// 两个维度都必须与「构成」维度落在同一个总量上，否则用户会看到
+// 「三条线加起来 ≠ 卡片上那个合计」——而那种矛盾会让人不再相信任何一个数字。
+{
+  const { dimensionSeries, dailyCosts, sumRows } = await import(
+    pathToFileURL(join(root, 'lib', 'client', 'usage.js')).href)
+  /** 造一份最小用量对象（字段名与 recentDays 的产出一致）。 */
+  const mkUsage = (local) => ({ local, cacheHit: 0, cacheMiss: 0, cacheWrite: 0, output: 0, peak: {}, idle: {} })
+  // 同一个模型经两条路由（@a / @b）+ 另一个模型：按模型要合并，按提供商要拆开
+  const fakePoints = [
+    { key: '2026-09-01', byModel: { 'deepseek-flash@a': mkUsage(100), 'deepseek-flash@b': mkUsage(50), 'glm-4.6@a': mkUsage(30) } },
+    { key: '2026-09-02', byModel: { 'deepseek-flash@a': mkUsage(10), 'glm-4.6@a': mkUsage(5) } },
+  ]
+  const fakeModels = [
+    { key: 'deepseek-flash@a', rollup: 'deepseek-flash', label: 'DeepSeek Flash', provider: 'a', providerLabel: '家 A' },
+    { key: 'deepseek-flash@b', rollup: 'deepseek-flash', label: 'DeepSeek Flash', provider: 'b', providerLabel: '家 B' },
+    { key: 'glm-4.6@a', rollup: 'glm-4.6', label: 'GLM-4.6', provider: 'a', providerLabel: '家 A' },
+  ]
+  /** 把摊平后的点求和。 */
+  const totalOf = (shaped) => shaped.reduce(
+    (sum, point) => sum + Object.entries(point).filter(([k]) => k !== 'key').reduce((x, [, v]) => x + Number(v ?? 0), 0),
+    0,
+  )
+  const expected = 100 + 50 + 30 + 10 + 5
+
+  const byModel = dimensionSeries(fakePoints, fakeModels, 'model', { limit: 5 })
+  must(totalOf(byModel.points) === expected,
+    `按模型分组的逐日之和应等于总量 ${expected}，实际 ${totalOf(byModel.points)}`)
+  // 同一个模型的两条路由必须**合并成一条线**，否则总量会翻倍
+  must(byModel.series.filter((s) => s.label === 'DeepSeek Flash').length === 1,
+    '同一个模型跨提供商必须合并成一条线（否则重复计数）')
+
+  const byProvider = dimensionSeries(fakePoints, fakeModels, 'provider', { limit: 5 })
+  must(totalOf(byProvider.points) === expected,
+    `按提供商分组的逐日之和应等于总量 ${expected}，实际 ${totalOf(byProvider.points)}`)
+  // 按提供商拆时必须**分开**：家 A 是 100+30，家 B 是 50
+  must(byProvider.series.some((s) => s.label === '家 A') && byProvider.series.some((s) => s.label === '家 B'),
+    '按提供商分组必须把同一模型的两家分开')
+
+  // 超过 limit 的合并进「其他」，**数字不能丢**
+  const many = Array.from({ length: 9 }, (_, i) => ({
+    key: `m${i}`, byModel: { [`model${i}@p`]: mkUsage((9 - i) * 10) },
+  }))
+  const manyModels = Array.from({ length: 9 }, (_, i) => (
+    { key: `model${i}@p`, rollup: `model${i}`, label: `模型${i}`, provider: 'p', providerLabel: 'P' }))
+  const capped = dimensionSeries(many, manyModels, 'model', { limit: 3 })
+  const cappedTotal = capped.points.reduce(
+    (sum, point) => sum + Object.entries(point).filter(([k]) => k !== 'key').reduce((x, [, v]) => x + Number(v ?? 0), 0), 0)
+  must(cappedTotal === 10 + 20 + 30 + 40 + 50 + 60 + 70 + 80 + 90,
+    `超过 limit 的部分必须进「其他」，总量不得丢，实际 ${cappedTotal}`)
+  must(capped.series.some((s) => s.label === '其他'), '被截断时应有「其他」那一条')
+  must(capped.series.length === 4, `limit=3 时应是 3 条 + 「其他」，实际 ${capped.series.length}`)
+
+  // 空数据 / 缺字段不该抛错
+  must(dimensionSeries([], [], 'model', {}).series.length === 0, '空数据应返回空序列')
+  must(dimensionSeries(undefined, undefined, 'provider', {}).points.length === 0, '缺入参不该抛错')
+  // 旧宿主的 byModel 键没有 @提供商，也不能崩
+  const legacy = dimensionSeries(
+    [{ key: 'd', byModel: { 'deepseek-flash': mkUsage(7) } }],
+    [{ model: 'deepseek-flash', label: 'Flash' }], 'provider', {},
+  )
+  must(totalOf(legacy.points) === 7, '旧宿主（没有 key 字段）也要能分组')
+
+  // 逐日消费估计：**和必须等于同一窗口的总额**（金额线性折算，没有取整漂移）
+  const costPoints = dailyCosts(fakePoints, { models: {}, rates: {} })
+  must(costPoints.length === 2, '逐日消费应与天数一致')
+  must(costPoints.every((point) => typeof point.cost === 'number'), '每日都应有数值金额')
+
+  // 真实 fixture：两个维度都必须与 rangeTotals 对上
+  const fixturePoints = payload.days.slice(-30)
+  const fxExpected = sumRows(fixturePoints).local
+  for (const dim of ['model', 'provider']) {
+    const shaped = dimensionSeries(fixturePoints, payload.models, dim, { limit: 5 })
+    const got = shaped.points.reduce(
+      (sum, point) => sum + Object.entries(point).filter(([k]) => k !== 'key').reduce((x, [, v]) => x + Number(v ?? 0), 0), 0)
+    must(Math.abs(got - fxExpected) < 1e-6,
+      `真实数据下按 ${dim} 分组应合计 ${fxExpected}，实际 ${got}`)
+  }
+  console.log('趋势分维度：模型 / 提供商两组均与总量一致，「其他」不丢数字')
+}
+
 // 空数据也必须能渲染（不能因为除零或空数组抛错）
 const empty = buildPayload({ empty: true })
 const emptyHtml = renderToStaticMarkup(React.createElement(View, {
@@ -2330,6 +2787,47 @@ const emptyHtml = renderToStaticMarkup(React.createElement(View, {
 }))
 must(emptyHtml.includes('暂无数据') || emptyHtml.includes('没有模型调用'), '空数据时应给出空态提示')
 must(emptyHtml.includes('余额读取失败'), '余额读取失败时应有可见提示')
+
+// ── 「今日费用」必须按宿主的 today 定位，不能读 days.at(-1) ─────────
+// 历史事故：今天还没跑过请求时 `days.at(-1)` 是昨天，卡片上的「今日」显示的是
+// 昨天的数字。这里造一份「最后一天没有数据、但今天有数据」的数据：正确实现显示
+// 今天的金额，老实现会显示 ¥0（因为它去读那个空的最后一天）。
+{
+  const stale = buildPayload({})
+  const lastKey = stale.days.at(-1).key
+  const todayKey = stale.days.at(-2).key
+  // 最后一天（昨天）清空，并把「今天」指向前一天
+  const days = stale.days.map((row) => (
+    row.key === lastKey ? { ...row, totals: undefined, byModel: {} } : row
+  ))
+  const todayPayload = { ...stale, days, overview: { ...stale.overview, today: todayKey } }
+  const todayHtml = renderToStaticMarkup(React.createElement(View, {
+    data: todayPayload,
+    now: todayPayload.generatedAt,
+    refreshing: false,
+    onRefresh: () => {},
+    balance: undefined,
+    balanceError: '网络请求失败',
+    onToggleBalance: () => {},
+  }))
+  must(
+    todayHtml.includes('今日 ') && !todayHtml.includes('今日 ¥0'),
+    '今天有数据、最后一天没有数据时，「今日」必须显示今天的金额而不是 ¥0——'
+    + '这正是「错误获取了今天的用量」的形态',
+  )
+  // 旧宿主没有 overview.today 时仍要能渲染（退回 days.at(-1)，不崩）
+  const legacy = { ...stale, overview: { ...stale.overview, today: undefined } }
+  const legacyHtml = renderToStaticMarkup(React.createElement(View, {
+    data: legacy,
+    now: legacy.generatedAt,
+    refreshing: false,
+    onRefresh: () => {},
+    balance: undefined,
+    balanceError: '网络请求失败',
+    onToggleBalance: () => {},
+  }))
+  must(legacyHtml.includes('今日 '), '旧宿主（没有 overview.today）也必须渲染出「今日」')
+}
 
 console.log(`渲染闸门通过：${registrations.length} 个槽位、${mountedStyles.length} 张样式表、${themes.length} 套主题`)
 console.log(`整页 HTML ${html.length} 字节 · 容器骨架 ${shellHtml.length} 字节 · 侧栏图标 ${iconHtml.length} 字节`)
@@ -2423,6 +2921,8 @@ function buildPayload(options = {}) {
       : options.models === 'multi'
         ? {
           'deepseek-flash@deepseek-official': usage(seed),
+          // 同一个模型的第二个提供商：单价列表要并成一条，费用明细表要分成两行
+          'deepseek-flash@workbuddy-cn': usage(Math.max(1, Math.round(seed / 4))),
           'glm-5.3@zhipu-coding': usage(Math.max(1, Math.round(seed / 3))),
           'mystery-model-x@workbuddy-cn': usage(1),
           // 旧账本记录：条目身份里没有提供商（连 `@` 都没有）
@@ -2478,6 +2978,10 @@ function buildPayload(options = {}) {
       activeDays: options.empty === true ? 0 : 32,
       firstDay: options.empty === true ? null : days[0].key,
       lastDay: options.empty === true ? null : days.at(-1).key,
+      // 站点时区下的今天。正常情形与 lastDay 相同（今天就是最后有数据的那天，
+      // 因为 generatedAt 落在最后一行），但**语义不同**：这两个字段分开正是为了
+      // 让「今天还没跑过请求」这种情形能被表达出来（见下面「今日费用」闸门）。
+      today: options.empty === true ? null : days.at(-1).key,
       streaks: options.empty === true ? { current: 0, longest: 0 } : { current: 3, longest: 9 },
       modelsUsed: options.empty === true ? 0 : 2,
     },
@@ -2493,7 +2997,11 @@ function buildPayload(options = {}) {
         rollup: 'deepseek-flash',
         provider: 'deepseek-official',
         providerLabel: 'DeepSeek 官方',
-        label: 'DeepSeek Flash',
+        // **刻意与官方名不同**，照实复刻本机数据：DSH 设置里这条路由的外显名是
+        // `DeepSeek-V41-Flash`，而价目表里的官方名是 `DeepSeek Flash`。
+        // 单价行若取 `group.first.label`，显示的就是路由名（价格是模型的属性，
+        // 不该贴某一家的叫法）；取官方的 `rates.label` 才对。
+        label: 'DeepSeek-V41-Flash',
         version: 'DeepSeek-V4.1-Flash',
         priced: true,
         tiered: false,
@@ -2564,6 +3072,30 @@ function buildPayload(options = {}) {
           totals: usage(1),
           rates: pricing.rates['deepseek-v4-pro'],
           cost: { standard: 2, peakOnly: 2, idlePart: 0 },
+        },
+        {
+          // **同一个模型的第二个提供商**：价目表按模型索引，因此它与上面那条
+          // `deepseek-flash@deepseek-official` 用的是**同一个** rates 对象。
+          // 单价列表必须把它们并成一条（否则就是同一份价重复几遍），
+          // 而费用明细表仍要分成两行（用量与额度归属不同）。
+          key: 'deepseek-flash@workbuddy-cn',
+          model: 'deepseek-flash@workbuddy-cn',
+          rollup: 'deepseek-flash',
+          provider: 'workbuddy-cn',
+          providerLabel: 'WorkBuddy 中国区',
+          // **刻意与上面那条的 label 不同**，照实复刻本机数据：同一个模型在各家
+          // 路由下的外显名并不一致（本机实测有 `DeepSeek Flash` / `COD-DeepSeek
+          // V4.1 Flash` / `DeepSeek-V41-Flash`）。单价行若取 `group.first.label`，
+          // 显示的就会是「按用量排序碰巧排第一的那个提供商给它的名字」——
+          // 而价格是模型的属性，不该贴某一家的叫法。取官方的 `rates.label` 才对。
+          label: 'COD-DeepSeek V4.1 Flash',
+          version: '',
+          priced: true,
+          tiered: false,
+          vendor: 'DeepSeek',
+          totals: usage(4),
+          rates: pricing.rates['deepseek-flash'],
+          cost: { standard: 3, peakOnly: 3, idlePart: 0 },
         },
       ] : []),
     ],

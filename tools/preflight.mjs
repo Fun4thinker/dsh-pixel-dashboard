@@ -9,7 +9,7 @@
 import { strict as assert } from 'node:assert'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -278,8 +278,71 @@ assert.equal(sample.pricing.models['deepseek-flash'], sample.models[0].rates, '�
 assert.ok(sample.sessions[0].cost.standard > 0, '会话应带非零费用摘要')
 assert.equal(sample.ledger.total, 1, '账本应记录一条')
 
+// ── 「今天」必须由宿主按站点时区给出，不能拿 days.at(-1) 顶替 ──────
+// 历史事故：卡片上的「今日费用」读的是 `days.at(-1)`，那是「最后一个有数据
+// 的日子」。今天还没跑过请求时它就是昨天，于是「今日」显示的是昨天的数字。
+// 这里钉住：overview.today 必须是**生成时刻所在的站点日**，且与 windows.today
+// 同源（两者各算一次就会漂移）。
+assert.equal(
+  payload.overview.today,
+  new Intl.DateTimeFormat('en-CA', { timeZone: payload.timezone }).format(new Date(payload.generatedAt)),
+  'overview.today 必须是站点时区下的今天，而不是最后有数据的那天',
+)
+// 不写死日期（示例事件固定在 2026-09-10，而聚合跑在真实当前时刻），只钉住语义：
+// `windows.today` 必须与 overview.today 在 days 里的那一行同源——今天没有事件
+// 就是 0，**绝不能**退化成「最后有数据那天」的量。两者混同正是被报上来的故障。
+{
+  const todayRow = sample.days.find((row) => row.key === sample.overview.today)
+  assert.equal(
+    sample.windows.today.local,
+    todayRow?.totals.local ?? 0,
+    'windows.today 必须对应 overview.today 那一行，而不是最后有数据的那天',
+  )
+}
+
 const rejected = await call(dataRoute, 'POST')
 assert.equal(rejected.statusCode, 405, 'POST 应返回 405')
+
+// ── 日历每格的消费估计：索引与口径都必须和日行**完全同源** ──────────
+// 悬停某一格显示的是「那一天的消费估计」。两件事必须对上，否则用户会看到
+// 「格子上的金额」与「日行里的金额」互相矛盾：
+//   1. **索引**：`heatmap.costs[i]` 必须与 `heatmap.requests[i]` 是同一天
+//      （同一套 day 序号），不是 `days` 那种稀疏数组；
+//   2. **口径**：按每条请求**发生时刻**的时段分档算，与 `days[].cost` 一致。
+{
+  const first = Date.parse(`${sample.heatmap.firstDay}T00:00:00Z`)
+  let matched = 0
+  for (const row of sample.days) {
+    const index = Math.round((Date.parse(`${row.key}T00:00:00Z`) - first) / 86_400_000)
+    assert.ok(index >= 0 && index < sample.heatmap.days, `${row.key} 应落在日历范围内`)
+    // **严格相等**，不是「近似相等」。早先这里是两处各算一遍：记录循环里逐条累加
+    // 得到 2.1017944，而日行金额被 `sessionCost()` 四舍五入到 6 位得 2.101794。
+    // 差的是尾数，却恰好落在用户会逐位比对的同一个数字上（实测 6 天里 5 天不一致）。
+    // 现在日历金额是从 dayRows 派生的，因此必须**一位不差**。
+    assert.equal(
+      Number(sample.heatmap.costs[index]),
+      Number(row.cost.standard),
+      `日历第 ${index} 格（${row.key}）的消费估计必须与该日行金额完全相等`,
+    )
+    matched += 1
+  }
+  assert.ok(matched > 0, '示例数据应至少有一天，否则这条断言是空转')
+  // 空日历格必须是 0（不是 undefined）：客户端按 day 序号直接取，
+  // undefined 会让悬停显示成 `NaN` 或空白。
+  assert.equal(sample.heatmap.costs.length, sample.heatmap.days, 'costs 的长度应与日历天数一致')
+  assert.ok(
+    sample.heatmap.costs.every((value) => Number.isFinite(Number(value))),
+    'costs 里不得有非有限值（客户端会直接渲染它）',
+  )
+  // 「有数据的日行都写进了对应的格」：格里的钱不能凭空出现，
+  // 也不能有日行漏掉（漏掉就是悬停显示 —，而那天明明有消费）。
+  const dayTotal = sample.days.reduce((sum, row) => sum + Number(row.cost.standard), 0)
+  const cellTotal = sample.heatmap.costs.reduce((sum, value) => sum + Number(value), 0)
+  assert.ok(
+    Math.abs(dayTotal - cellTotal) < 1e-9,
+    `日历格金额之和应等于日行金额之和：${cellTotal} vs ${dayTotal}`,
+  )
+}
 
 // ── 会话预览标题：必须与 DSH 侧栏的 displayTitleOf 同一条回落链 ──────
 // 这一列曾经显示 `id.slice(8, 16)`，用户拿一串十六进制对不上侧栏任何一行。
@@ -910,6 +973,70 @@ assert.equal(halfProvider.ok, false)
 assert.equal(halfProvider.reason, 'no-key')
 assert.equal(halfProvider.keyRef, 'VOLC_SECRET_ACCESS_KEY', '应指出缺的是 SK')
 assert.ok(halfProvider.hint.includes('AccessKey'), '应说明这里要的是 AccessKey')
+
+// ── 「去哪拿、配到哪」必须随数据交下来（用户报过的坑）─────────────
+// 只写「请配成 VOLC_ACCESS_KEY_ID」是不够的：DSH 的设置界面只写它自己派生的
+// `<路由>_API_KEY`，用户**根本找不到能填这个名字的输入框**。所以每一家都必须带上
+// 一条**可点的创建链接**和一个**列出确切引用名**的说明块。
+{
+  const { resolveCredentialFilePath } = await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)
+  assert.equal(
+    resolveCredentialFilePath({ DSH_HOME: 'C:\\Users\\x\\.dsh' }),
+    join('C:\\Users\\x\\.dsh', '.credentials.yaml'),
+    '凭据文件路径应落在 DSH_HOME 下',
+  )
+  assert.equal(
+    resolveCredentialFilePath({ USERPROFILE: 'C:\\Users\\x' }),
+    join('C:\\Users\\x', '.dsh', '.credentials.yaml'),
+    '没有 DSH_HOME 时退回 ~/.dsh',
+  )
+  // 两者都没有时退回 OS 的 homedir()——这是 DSH 自己的规则，
+  // 不是「猜」：凭据文件总得落在一个确定的地方。
+  assert.equal(
+    resolveCredentialFilePath({}),
+    join(homedir(), '.dsh', '.credentials.yaml'),
+    '既没有 DSH_HOME 也没有 USERPROFILE 时应退回 OS 主目录',
+  )
+
+  // 三家都要有 setup，且必须能回答「去哪拿」和「配到哪」
+  for (const provider of volcPayload.providers) {
+    const setup = provider.setup
+    assert.ok(setup !== undefined, `${provider.id} 缺少 setup（用户无从知道去哪拿凭据）`)
+    assert.ok(setup.keyURL.startsWith('https://'), `${provider.id} 的 setup.keyURL 应是可点链接`)
+    assert.ok(setup.acquire.length > 0, `${provider.id} 的 setup 应给出获取步骤`)
+    assert.ok(setup.refs.length > 0, `${provider.id} 的 setup 应列出确切的凭据引用名`)
+    for (const ref of setup.refs) {
+      assert.ok(ref.name !== '' && ref.example !== '', `${provider.id} 的凭据项应有名字与示例`)
+      // 引用名必须与真实解析的名字一致，否则用户照着配还是配不上
+      assert.ok(
+        provider.keyRef === undefined || ref.name === provider.keyRef || ref.note !== '',
+        `${provider.id} 的凭据项 ${ref.name} 应说明它是什么`,
+      )
+    }
+  }
+
+  // 火山那一条**绝不能**把方舟推理控制台当作 AK 获取入口：
+  // 那个页面给的是 `ark-` 推理 Key，正是本接口在网关格式层拒绝的那一把。
+  const volcSetup = volcProvider.setup
+  assert.ok(
+    volcSetup.keyURL.includes('iam/keymanage'),
+    `火山的 AK 获取入口应是 IAM 的 API 访问密钥页，实际 ${volcSetup.keyURL}`,
+  )
+  assert.ok(
+    !volcSetup.keyURL.includes('console.volcengine.com/ark'),
+    '火山的 AK 获取入口不得指向方舟推理控制台（那里只有 ark- 推理 Key）',
+  )
+  assert.ok(
+    volcSetup.acquire.join(' ').includes('不在方舟控制台'),
+    '火山必须明说这个页面不在方舟控制台里——这是用户找不到 AK 的根本原因',
+  )
+  // 「配到哪」：负载里要带上这台机器的凭据文件路径
+  assert.equal(
+    volcPayload.credentialFile,
+    resolveCredentialFilePath({}),
+    '负载应带上本机凭据文件路径，供界面直接显示',
+  )
+}
 
 // 鉴权被拒：必须给出「这里要 AK/SK 而不是推理 Key」这条唯一有用的提示
 const rejectedService = new (await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)).PlansService({

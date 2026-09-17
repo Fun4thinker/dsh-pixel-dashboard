@@ -22,6 +22,7 @@ import {
   pricingOf,
   ratesOf,
   zonedParts,
+  CANONICAL_COLLISIONS,
 } from '../lib/pricing.js'
 import { UsageCatalog } from '../lib/host.js'
 import {
@@ -578,6 +579,55 @@ await check('带发售日的变体名也折到同一个模型（否则会多出�
   assert.equal(normalizeModel('hy4-preview-f'), 'deepseek-flash')
   // 认不出来的名字保持原样，不硬塞进某一行
   assert.equal(normalizeModel('mystery-model-x'), 'mystery-model-x')
+})
+
+// 用户为**自己配的任意第三方提供商**路由模型，路由名由那家网关决定。只要名字能
+// 找到价目表归属，看板就该给出金额估算并按模型监看；找不到才退化成「只有调用量」。
+// 因此识别必须宽容——用户举的三个例子全都属于「同一个模型的不同写法」。
+await check('第三方网关的各种写法都认得出是同一个模型（用户举的三个例子）', () => {
+  // 用户原话：「deepseek/deepseek-flash 和 deepseek-V4.1-Flash 和 deepseekv41flash
+  // 都对应同一个模型同一份价格」。这三个早先**全部落空**（当成未知模型：
+  // 既标「估算价」又另起一行），因为当时只做「精确匹配 + 剥后缀」。
+  assert.equal(normalizeModel('deepseek/deepseek-flash'), 'deepseek-flash', '带「提供商/」前缀')
+  assert.equal(normalizeModel('deepseek-V4.1-Flash'), 'deepseek-flash', '大小写混杂')
+  assert.equal(normalizeModel('deepseekv41flash'), 'deepseek-flash', '连分隔符都没有')
+  // 同一族的其它写法
+  assert.equal(normalizeModel('DeepSeek-Flash'), 'deepseek-flash')
+  assert.equal(normalizeModel('DEEPSEEK-FLASH'), 'deepseek-flash')
+  assert.equal(normalizeModel('deepseek_v4.1_flash'), 'deepseek-flash')
+  assert.equal(normalizeModel('deepseek_v4_flash'), 'deepseek-flash')
+  assert.equal(normalizeModel('deepseek/deepseek-v4.1-flash'), 'deepseek-flash')
+  assert.equal(normalizeModel('DeepSeek-Flash-0813'), 'deepseek-flash')
+  assert.equal(normalizeModel('zai/glm-5.3'), 'glm-5.3')
+  assert.equal(normalizeModel('GLM-5.3-Flash'), 'glm-5.3-flash')
+  assert.equal(normalizeModel('glm53flash'), 'glm-5.3-flash', '智谱也适用')
+  assert.equal(normalizeModel('deepseek/deepseek-v4-pro'), 'deepseek-v4-pro')
+  // 都是**已知价**（有金额估算），不是兜底
+  for (const name of ['deepseek/deepseek-flash', 'deepseek-V4.1-Flash', 'deepseekv41flash']) {
+    assert.equal(pricingOf(name).known, true, `${name} 应有金额估算`)
+  }
+})
+
+// 宽容不能变成乱认：把别家的模型按 DeepSeek 计价比认不出更危险，
+// 因为界面上数字有、也不报错，只是**错的**。
+await check('宽容归一不得把别的模型错认成价目表里的条目', () => {
+  const mustMiss = [
+    'doubao-seed-2-0-pro', 'qwen3.6-max', 'gpt-5.6-sol', 'claude-sonnet-4-6',
+    'glm-4.5-air', 'kimi-k2-thinking', 'minimax-m2.5',
+    // 未来的版本号：价目表里没有就**不能**认
+    'deepseek-v5', 'glm-6', 'deepseek-v4-pro-max',
+  ]
+  for (const name of mustMiss) {
+    assert.equal(pricingOf(name).known, false, `${name} 不应被认成已知价`)
+    // 认不出来时保留原名，好在「只有调用量」的监看里认出它
+    assert.equal(normalizeModel(name), name, `${name} 认不出时应原样保留`)
+  }
+})
+
+// 规范化会主动撞车时不能任选一个——那会把 A 的价按到 B 头上，且界面看不出来。
+await check('规范化索引没有冲突（有冲突必须显式加别名）', () => {
+  assert.deepEqual(CANONICAL_COLLISIONS, [],
+    `规范化后互相冲突：${CANONICAL_COLLISIONS.join('、')}；请加显式别名而不是让它自动挑一个`)
 })
 
 await check('旧布局账本记录被就地升级，且幂等键不变', () => {

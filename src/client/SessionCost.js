@@ -210,7 +210,11 @@ export function SessionCostPills(props) {
         : formatCny(cost.standard),
       warn: failed === true,
       tag: unpricedList.length === 0 ? undefined : '估算',
-      title: `${detail}${accountDetail}${unpricedDetail}｜空闲价 = 高峰价的一半，金额为本地估算`,
+      // 与看板「费用明细」同一口径：这是「全走官方 API 要多少钱」的假设，
+      // 不是实际账单。不说死「DeepSeek 官方」——价目表里也有智谱 GLM 的行。
+      title: `${detail}${accountDetail}${unpricedDetail}｜按各模型官方单价估算`
+        + `（即“这些 token 若全部走官方 API 需要花多少钱”）；`
+        + `第三方中转与 Coding Plan 是买断制、不按 token 计费，不在此列`,
     }),
     showTokens && tokens !== undefined && tokens > 0
       ? h(Pill, { tone: 'blue', value: `${formatTokens(tokens)} tokens` })

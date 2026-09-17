@@ -352,6 +352,12 @@ const DASHBOARD = `
 .px-seg-btn:hover { color: var(--px-ink-2); }
 .px-seg-btn[aria-selected='true'] { color: var(--px-ink); }
 
+/* 卡片内的次级分段控件（趋势维度）：比顶部那个窗口切换器小一号。
+   两者若长得一样重，用户会以为「模型 / 提供商」也是全局窗口设置。 */
+.px-trend-dim { padding: 2px; }
+.px-trend-dim .px-seg-thumb { top: 2px; bottom: 2px; left: 2px; border-radius: 5px; }
+.px-trend-dim .px-seg-btn { padding: 3px 9px; font-size: 11px; }
+
 .px-panel {
   background: var(--px-surface);
   border: 1px solid var(--px-line);
@@ -537,12 +543,18 @@ const DASHBOARD = `
 .px-line.px-tone-blue { stroke: var(--px-tone-blue); }
 .px-line.px-tone-purple { stroke: var(--px-tone-purple); }
 .px-line.px-tone-pink { stroke: var(--px-tone-pink); }
+.px-line.px-tone-green { stroke: var(--px-tone-green); }
+.px-line.px-tone-yellow { stroke: var(--px-tone-yellow); }
+.px-line.px-tone-red { stroke: var(--px-tone-red); }
 .px-area { stroke: none; }
 .px-hover-line { fill: var(--px-ink); opacity: 0.16; }
 .px-dot { stroke: var(--px-surface); stroke-width: 2; }
 .px-dot.px-tone-blue { fill: var(--px-tone-blue); }
 .px-dot.px-tone-purple { fill: var(--px-tone-purple); }
 .px-dot.px-tone-pink { fill: var(--px-tone-pink); }
+.px-dot.px-tone-green { fill: var(--px-tone-green); }
+.px-dot.px-tone-yellow { fill: var(--px-tone-yellow); }
+.px-dot.px-tone-red { fill: var(--px-tone-red); }
 
 /* 跟随光标的读数浮层 */
 .px-tip {
@@ -572,6 +584,11 @@ const DASHBOARD = `
 .px-legend-swatch.px-tone-blue { background: var(--px-tone-blue); }
 .px-legend-swatch.px-tone-purple { background: var(--px-tone-purple); }
 .px-legend-swatch.px-tone-pink { background: var(--px-tone-pink); }
+/* 另外三色必须补齐：按模型 / 提供商分组时最多会有 6 条线（TONES 全用上），
+   缺一组 swatch 就会画出一个没有底色的空方块——图例与曲线对不上号。 */
+.px-legend-swatch.px-tone-green { background: var(--px-tone-green); }
+.px-legend-swatch.px-tone-yellow { background: var(--px-tone-yellow); }
+.px-legend-swatch.px-tone-red { background: var(--px-tone-red); }
 .px-legend-value {
   font-family: var(--px-num-font); color: var(--px-ink); min-width: 58px;
   opacity: 0; transform: translateY(2px);
@@ -667,6 +684,25 @@ const DASHBOARD = `
 .px-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 12px; }
 .px-grid-2 .px-panel { margin-bottom: 12px; }
 
+/* 两张趋势卡片（Token / 消费）并排一行。
+   两条曲线共用同一段时间轴，分两行会让人来回滚动去对齐同一个日期，
+   因此**等宽两列**并排（1fr 1fr 而不是 auto-fit）：等宽才能让两张图的横轴
+   刻度落在同一列上，读数时不必横向换算。
+   窄屏塌回单列——两张图各只有 300px 时曲线会挤成一团。 */
+.px-trend-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  align-items: start;
+}
+.px-trend-row .px-panel { margin-bottom: 12px; }
+/* 标题行右侧的维度切换器：卡片标题与它同排，不占额外高度。
+   切换器自身在小屏会换行，这里允许它换行而不是硬挤。 */
+.px-trend-row .px-panel-extra .px-seg { flex-wrap: wrap; }
+@media (max-width: 1080px) {
+  .px-trend-row { grid-template-columns: 1fr; }
+}
+
 /* 时段与计费 + 活跃日历 并排一行。
    日历是 53 列宽的图形，格子边长**直接随这栏宽度线性变化**（见 graph.js 里
    cell 的算法），所以比例不能随便给：左栏只留一份够放倒计时与三行键值对的最小
@@ -683,18 +719,57 @@ const DASHBOARD = `
 .px-pair .px-period { grid-template-columns: 1fr; }
 .px-pair .px-panel { margin-bottom: 12px; }
 
-/* 单价说明：竖排，避免挤在表格单元格里换行 */
+/* 各模型官方单价：一张小表，不是一行塞满的标签云。
+   早先把「色块×N + 模型名 + 提供商列表 + 三组价格 + 厂商」全塞进一个
+   flex-wrap 容器，元素一多就折成好几行、右侧参差不齐。
+   现在按两列排：左边是谁（色块 + 模型名 + 厂商），右边是三档价。
+   价格区自己再分三列，于是每行的「缓存命中 / 未命中 / 输出」竖直对齐，
+   纵向扫一眼就能比价——这正是这张表的用途。
+   注意：这整段 CSS 是模板字符串，注释里**不能出现反引号**（会提前闭合字符串，
+   症状是打包时报「Unexpected identifier」而源文件语法检查却是通过的）。 */
 .px-rate-list { display: grid; gap: 6px; margin-top: 12px; }
+.px-rate-caption {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: 11px; color: var(--px-muted);
+}
+.px-rate-unit { font-variant-numeric: tabular-nums; }
 .px-rate {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px 12px;
   padding: 7px 10px;
   border-radius: var(--px-r-sm);
   background: var(--px-surface-2);
   font-size: 11.5px; color: var(--px-muted);
 }
-.px-rate > b { color: var(--px-ink); font-size: 12px; }
-.px-rate > span { font-variant-numeric: tabular-nums; }
+/* 左列：色块 + 模型名 + 厂商。允许收缩，不把右列挤走 */
+.px-rate-who {
+  grid-column: 1; grid-row: 1;
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  min-width: 0;
+}
+.px-rate-who > b { color: var(--px-ink); font-size: 12px; }
+.px-rate-prices {
+  grid-column: 2; grid-row: 1;
+  display: grid; grid-template-columns: repeat(3, minmax(0, auto));
+  gap: 3px 14px;
+  font-variant-numeric: tabular-nums;
+}
+.px-rate-prices > span { display: flex; align-items: baseline; gap: 5px; white-space: nowrap; }
+.px-rate-prices em { font-style: normal; color: var(--px-muted); font-size: 11px; }
+.px-rate-prices code {
+  font-family: var(--px-num-font); color: var(--px-ink); font-size: 11.5px;
+}
 .px-rate-swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+/* 一个模型可能由多家提供商提供，这里并排它们的色块（与环图同一套配色）。
+   收窄间距并让它们成组，读起来才像「同一个模型的几个来源」而不是几件不相干的东西。 */
+.px-rate-tones { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+/* 窄屏：价格换到第二行，不要横向挤成参差 */
+@media (max-width: 720px) {
+  .px-rate { grid-template-columns: 1fr; }
+  .px-rate-prices { grid-column: 1; grid-row: 2; justify-content: start; }
+}
 
 /* 数据来源脚注 */
 .px-source {
@@ -924,6 +999,12 @@ const DASHBOARD = `
 
 /* 订阅套餐额度：一家一块，每块里按窗口（5 小时 / 每周 / 每月）逐条画进度 */
 .px-plan-list { display: grid; gap: 16px; }
+/* 折叠区里那几家：间距收紧一点，并且整体压暗——
+   它们此刻没有数据（就是「还没配」），不该与上面真正在用的那几家抢注意力，
+   但仍然要能一眼看清「插件还支持哪些家、各自怎么配」。 */
+.px-plan-list-idle { gap: 12px; margin-top: 10px; }
+.px-plan-list-idle .px-plan { background: var(--px-surface); }
+.px-plan-list-idle .px-plan-name { color: var(--px-ink-2); }
 .px-plan {
   padding: 9px 11px 10px;
   border: 1px solid var(--px-line);
@@ -964,6 +1045,68 @@ const DASHBOARD = `
   font-family: var(--px-num-font);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   max-width: 60%;
+}
+
+/* 「这家凭据怎么配」：去哪拿 + 拿到后放哪。
+   缺凭据时默认展开（那正是用户需要它的时刻），所以这一块必须自己读得懂，
+   不能只写「请配成 XXX」——DSH 设置里没有能填这个名字的输入框。 */
+.px-plan-setup {
+  margin: 10px 0 0;
+  padding: 8px 11px;
+  border: 1px solid var(--px-line-2);
+  border-radius: var(--px-r-sm);
+  background: var(--px-surface-2);
+}
+.px-plan-setup > summary { font-size: 11.5px; }
+.px-plan-steps {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 11.5px; line-height: 1.75; color: var(--px-ink-2);
+}
+.px-plan-steps li { margin-bottom: 4px; }
+.px-plan-setup-link { margin: 8px 0 0; font-size: 11.5px; }
+.px-plan-setup-link a {
+  color: var(--px-tone-pink);
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.px-plan-setup-link a:hover { color: var(--px-pink-deep); }
+.px-plan-setup-where {
+  margin-top: 9px; padding-top: 8px;
+  border-top: 1px dashed var(--px-line-2);
+  font-size: 11.5px; line-height: 1.7; color: var(--px-muted);
+}
+.px-plan-setup-where > p { margin: 0; }
+/* 路径要能整条读出来并复制：换行而不是省略号截断 */
+.px-plan-setup-path {
+  display: block;
+  margin: 5px 0 0;
+  padding: 5px 8px;
+  border-radius: var(--px-r-sm);
+  background: var(--px-surface);
+  border: 1px solid var(--px-line);
+  font-family: var(--px-num-font);
+  font-size: 11px; color: var(--px-ink-2);
+  word-break: break-all;
+  user-select: all;
+}
+.px-plan-setup-refs {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  list-style: none;
+}
+.px-plan-setup-refs li { margin-bottom: 3px; }
+.px-plan-setup-refs code {
+  font-family: var(--px-num-font);
+  font-size: 11px; color: var(--px-ink);
+}
+.px-plan-setup-note {
+  margin-left: 6px;
+  font-size: 11px; color: var(--px-muted);
+}
+.px-plan-setup-hint { margin: 8px 0 0; font-size: 11px; line-height: 1.7; color: var(--px-muted); }
+.px-plan-setup-hint code {
+  font-family: var(--px-num-font);
+  font-size: 11px; color: var(--px-ink-2);
 }
 
 /* 「当前监看」切换器：一排小 chip。

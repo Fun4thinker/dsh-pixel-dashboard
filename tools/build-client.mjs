@@ -195,6 +195,11 @@ try {
   writeFileSync(badFile, bundle, 'utf8')
   console.error(`client.js 存在语法错误，已中止打包：${error.message}`)
   console.error(`坏产物已写出：${relative(root, badFile)}`)
+  // 最常见的成因单独点一下：theme.js 的 CSS 是**模板字符串**，注释里混进一个
+  // 反引号就会提前闭合它。症状很有辨识度——`node --check` 源文件是通过的
+  // （单个文件仍是合法 ESM），只有打包后的脚本体才炸。踩过一次。
+  console.error('提示：若报错位置在中文注释里且源文件本身能通过 node --check，'
+    + '多半是 theme.js 的 CSS 注释里混入了反引号（模板字符串被提前闭合）。')
   process.exit(1)
 }
 

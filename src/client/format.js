@@ -17,16 +17,73 @@ export function formatCny(value) {
 }
 
 /**
- * token 数按中文习惯缩略。
+ * 坐标轴用的紧凑金额：**按数量级选小数位**，而不是固定保留。
+ *
+ * 与 {@link formatCny} 的分工：那个用在读数与合计上，越精确越好；这个要塞进
+ * Y 轴左边那 48px 里，而消费估计的刻度常常是 `¥0.0075` 这种——固定 4 位小数会
+ * 让标签比刻度间距还宽，两个标签叠在一起就都读不出来了。
+ * 按数量级降到 3 位左右有效数字，宽度就稳定在 6~7 个字符以内。
+ * @param {number} value - 金额。
+ * @returns {string} 形如 `¥12`、`¥1.5`、`¥0.038`。
+ */
+export function formatCnyAxis(value) {
+  const amount = Number(value ?? 0)
+  if (!Number.isFinite(amount) || amount === 0) return '¥0'
+  const abs = Math.abs(amount)
+  if (abs >= 1000) return `¥${Math.round(amount)}`
+  if (abs >= 10) return `¥${amount.toFixed(0)}`
+  if (abs >= 1) return `¥${amount.toFixed(1)}`
+  if (abs >= 0.1) return `¥${amount.toFixed(2)}`
+  if (abs >= 0.01) return `¥${amount.toFixed(3)}`
+  return `¥${amount.toFixed(4)}`
+}
+
+/**
+ * token 数按**大模型通用单位**缩略：K / M / B。
+ *
+ * 刻意**不用**中文的「万 / 亿」。这套界面里的数字几乎全是 token，而 token 的
+ * 通用单位就是 K / M / B——模型文档写「128K 上下文」「1M tokens」，读者不需要
+ * 二次换算；写成「1.40 亿」则要先在脑子里换成 140M 才能与文档对上。
+ *
+ * 四档阶梯（阈值取千进制，与 K/M/B 的字面含义一致）：
+ *
+ * | 数量级 | 单位 | 小数位 | 例 |
+ * |---|---|---|---|
+ * | ≥ 10 亿 | `B` | 2 | `1.40B` |
+ * | ≥ 100 万 | `M` | 2 | `617.28M` |
+ * | ≥ 1 千 | `K` | 1 | `300.0K` |
+ * | 其余 | — | 0 | `999` |
+ *
+ * **进位后跨过阈值时要升档**：`999_999` 按 K 算是 `999.999K`，四舍五入成
+ * `1000.0K`——那既难看又会让同一个数在两处以两种单位出现。因此先取可用档位，
+ * 再检查四舍五入后的尾数是否已达 1000，是就升到上一档（得到 `1.00M`）。
  * @param {number} value - token 数。
- * @returns {string} 形如 `1.23 亿`。
+ * @returns {string} 形如 `1.40B`、`617.28M`、`300.0K`、`999`。
  */
 export function formatTokens(value) {
   const amount = Number(value ?? 0)
-  if (amount >= 100_000_000) return `${(amount / 100_000_000).toFixed(2)} 亿`
-  if (amount >= 100_000) return `${(amount / 10_000).toFixed(1)} 万`
-  if (amount >= 10_000) return `${(amount / 10_000).toFixed(2)} 万`
-  return String(Math.round(amount))
+  // 显式挡掉非有限数：下面所有比较对 NaN 都为 false，会一路走到
+  // `String(Math.round(NaN))`，把字面的 `NaN` 渲染出来。这些数字直接来自宿主字段。
+  if (!Number.isFinite(amount)) return '0'
+  const abs = Math.abs(amount)
+  /** 从小到大：先定位可用的最小档位，再按需向上进位。 */
+  const LADDER = [
+    { scale: 1e3, digits: 1, suffix: 'K' },
+    { scale: 1e6, digits: 2, suffix: 'M' },
+    { scale: 1e9, digits: 2, suffix: 'B' },
+  ]
+  let index = -1
+  for (let i = 0; i < LADDER.length; i += 1) if (abs >= LADDER[i].scale) index = i
+  if (index === -1) return String(Math.round(amount))
+  // 四舍五入可能把尾数推到 1000（见上面 `999_999` 的例子），那就升一档。
+  // 最大档不再升：token 数到 `1000.00B` 已不现实，而凭空造一个 `T` 更糟。
+  while (index < LADDER.length - 1) {
+    const step = LADDER[index]
+    if (Number((amount / step.scale).toFixed(step.digits)) < 1000) break
+    index += 1
+  }
+  const step = LADDER[index]
+  return `${(amount / step.scale).toFixed(step.digits)}${step.suffix}`
 }
 
 /**

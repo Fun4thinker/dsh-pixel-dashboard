@@ -267,3 +267,38 @@ export function providerChoices(payload) {
     }))
 }
 
+/**
+ * 把厂商分成「该一直显示」与「可以收起来」两组。
+ *
+ * **判据是「有没有配过」，不是「成功还是失败」。** 这两件事容易被混成一件，
+ * 混掉的后果正好相反：
+ *
+ *   - `no-key` —— 从没配过凭据。用户根本没打算用这一家，那就是一块**噪音**：
+ *     随着适配的第三方变多，每加一家就往面板里塞一大块「没配凭据」。收起来。
+ *   - `rejected` / `request-failed` —— **配过了但坏了**。这是用户自己接上的那一家
+ *     出问题了，藏起来等于让他以为插件不支持它。必须一直显示。
+ *
+ * 因此这里只有 `reason === 'no-key'` 才归入「可以收起来」那一组。
+ *
+ * 两个例外一律留在显眼组，否则用户会找不到自己刚点的东西：
+ *   1. 用户**显式选中**的那一家（切换器里点了它，下面却没有它，是自相矛盾的界面）；
+ *   2. 当前监看的那一家（`current` 判据由调用方给，与切换器同源）。
+ * @param {object[]} providers - 宿主给的全部厂商结果。
+ * @param {{selected?:string, current?:string}} [options] - 选中 / 当前监看的 id。
+ * @returns {{active:object[], idle:object[]}} 两组（各自保持宿主给的顺序）。
+ */
+export function partitionProviders(providers, options = {}) {
+  const list = Array.isArray(providers) ? providers : []
+  const pinned = (provider) => provider?.id === options.selected || provider?.id === options.current
+  const active = []
+  const idle = []
+  for (const provider of list) {
+    if (provider === null || typeof provider !== 'object') continue
+    // 只有「从没配过凭据」才收起来；配过但失败的一律留下
+    const unconfigured = provider.ok !== true && provider.reason === 'no-key'
+    if (unconfigured && !pinned(provider)) idle.push(provider)
+    else active.push(provider)
+  }
+  return { active, idle }
+}
+

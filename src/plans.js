@@ -81,6 +81,76 @@ export const VOLC_QUOTA_PATH = `/?Action=<Action>&Version=${VOLC_API_VERSION}`
 export const VOLC_QUOTA_HOST = VOLC_OPENAPI_HOST
 
 /**
+ * 火山方舟 AK/SK 的创建入口（IAM 的「API 访问密钥」页）。
+ *
+ * 刻意**不是**方舟控制台。AK/SK 是账号级 IAM 凭据，在「访问密钥」页新建；而
+ * 方舟控制台（`console.volcengine.com/ark`）里能拿到的是推理用的 `ark-` Key
+ * ——恰好是本接口在网关格式层就会拒掉的那一把。早先唯一的链接指向方舟控制台，
+ * 用户照着找只会拿到错误的凭据，然后一直失败。
+ */
+export const VOLC_KEY_URL = 'https://console.volcengine.com/iam/keymanage/'
+
+/** 智谱编程套餐页（套餐专属 Key 在这里新建）。 */
+export const ZHIPU_KEY_URL = 'https://www.bigmodel.cn/coding-plan/personal/usage'
+
+/** Command Code 工作台（API Key 在这里创建）。 */
+export const COMMAND_CODE_KEY_URL = 'https://commandcode.ai/studio'
+
+/**
+ * 构造一家的「凭据去哪拿、配到哪」说明块。
+ *
+ * **这一节存在的理由（别删）**：DSH 的设置界面里**没有通用的凭据编辑器**。
+ * 「设置 → 模型」只把你填的 Key 存到它自己派生的 `<路由名>_API_KEY` 之下
+ * （见 ui-settings-models 的 `deriveKeyRef`），而火山要的
+ * `VOLC_ACCESS_KEY_ID` / `VOLC_SECRET_ACCESS_KEY` **永远不可能**由那条规则推导出来。
+ * 于是用户看到「请配成 VOLC_ACCESS_KEY_ID」时，界面里根本没有能输入的框——
+ * 只说「写进 DSH 凭据库」等于没说。
+ *
+ * 真正能写进去的只有两处，界面上必须把这两处都写出来：
+ *   1. 凭据文件 `<DSH_HOME>/.credentials.yaml` 的 `refs:` 段；
+ *   2. 同名环境变量（含 `<DSH_HOME>/.env`、项目 `.env`，或启动前 export）。
+ * @param {object} spec - keyURL / keyURLName / acquire / refs / where。
+ * @returns {object} 说明块（纯数据，供界面直接渲染）。
+ */
+export function setupOf(spec) {
+  return {
+    keyURL: String(spec.keyURL ?? ''),
+    keyURLName: String(spec.keyURLName ?? ''),
+    acquire: Array.isArray(spec.acquire) ? spec.acquire.map(String) : [],
+    refs: (Array.isArray(spec.refs) ? spec.refs : []).map((item) => ({
+      name: String(item.name ?? ''),
+      example: String(item.example ?? ''),
+      note: String(item.note ?? ''),
+    })),
+  }
+}
+
+/**
+ * 解析 DSH 凭据文件路径，供界面告诉用户「这两行写进哪个文件」。
+ *
+ * 与 DSH 自己的规则一致（`dsh-credentials-local` 的默认 `path`）：
+ * `$DSH_HOME/.credentials.yaml`，`DSH_HOME` 缺省为 `~/.dsh`。
+ *
+ * **为什么不直接让用户去设置界面填**：DSH 的设置里没有通用凭据编辑器，
+ * 「设置 → 模型」只会写它自己派生的 `<路由>_API_KEY`。所以对
+ * `VOLC_ACCESS_KEY_ID` 这类名字，文件是唯一可靠的去处——界面必须把**路径**
+ * 写出来，而不是只说「写进 DSH 凭据库」。
+ * @param {object} [env] - 环境变量来源（默认 process.env）。
+ * @returns {string} 绝对路径（最后的兜底是 OS 主目录，因此总是有值）。
+ */
+export function resolveCredentialFilePath(env = process.env) {
+  const home = env?.DSH_HOME
+  if (typeof home === 'string' && home.trim() !== '') {
+    return join(home.trim(), '.credentials.yaml')
+  }
+  // USERPROFILE 优先（Windows），其余平台用 homedir()。
+  // 兜底到 OS 主目录而不是返回空串：DSH 自己的默认就是 `~/.dsh`，
+  // 这里返回空串只会让界面少一行路径，用户反而更不知道该写哪。
+  const base = env?.USERPROFILE ?? homedir()
+  return join(base, '.dsh', '.credentials.yaml')
+}
+
+/**
  * 火山方舟的两个用量 Action，按探测顺序排列。
  *
  * 同一账号可能订的是 Agent Plan（回**绝对值** Quota/Used）或 Coding Plan
@@ -664,7 +734,14 @@ export class PlansService {
       this.#readVolcengine(),
     ])
       .then((providers) => {
-        const payload = { enabled: true, fetchedAt: Date.now(), providers }
+        const payload = {
+          enabled: true,
+          fetchedAt: Date.now(),
+          providers,
+          // 「配到哪」：DSH 设置里没有通用的凭据编辑器，文件是唯一可靠的去处。
+          // 路径在宿主解析（浏览器拿不到 env），浏览器只负责显示。
+          credentialFile: resolveCredentialFilePath(this.env),
+        }
         this.cache = payload
         this.cacheAt = Date.now()
         return payload
@@ -702,12 +779,21 @@ export class PlansService {
     const base = {
       id: 'zhipu',
       name: '智谱 GLM Coding Plan',
-      docURL: 'https://www.bigmodel.cn/coding-plan/personal/usage',
+      docURL: ZHIPU_KEY_URL,
       endpoint: ZHIPU_QUOTA_PATH,
       // 官方只有 5 小时与每周两个额度，没有月度——界面上要说明这点，
       // 否则用户会以为月度那一栏是坏的。
       supportedWindows: ['fiveHour', 'weekly'],
       note: '官方只设 5 小时与每周额度，没有月度额度。',
+      setup: setupOf({
+        keyURL: ZHIPU_KEY_URL,
+        keyURLName: '智谱「个人编程套餐」页',
+        acquire: [
+          '在「个人编程套餐」里**新建**一把 Key——必须是套餐专属的那把。',
+          '平台普通的 API Key **不通用**：标准模型调用能过，但额度查询会报 Authentication Failed。',
+        ],
+        refs: [{ name: 'ZHIPU_CODING_API_KEY', example: '...', note: '编程套餐专属 Key' }],
+      }),
     }
     const key = await this.resolveKey(ZHIPU_KEY_ENVS)
     if (key === undefined) {
@@ -762,10 +848,19 @@ export class PlansService {
     const base = {
       id: 'commandcode',
       name: 'Command Code',
-      docURL: 'https://commandcode.ai/studio',
+      docURL: COMMAND_CODE_KEY_URL,
       endpoint: COMMAND_CODE_CREDITS_PATH,
       supportedWindows: ['fiveHour', 'weekly', 'monthly'],
       note: '',
+      setup: setupOf({
+        keyURL: COMMAND_CODE_KEY_URL,
+        keyURLName: 'Command Code 工作台',
+        acquire: [
+          '在工作台里创建 API Key。',
+          '已经装过 Command Code CLI 并登录过的话**不用手动配**：插件会自动读本机的凭据文件。',
+        ],
+        refs: [{ name: 'COMMAND_CODE_API_KEY', example: '...', note: '装过 CLI 时可留空' }],
+      }),
     }
     const authFile = this.commandCodeAuthFile ?? commandCodeAuthPath(this.env)
     const key = await this.resolveKey(COMMAND_CODE_KEY_ENVS, authFile)
@@ -822,11 +917,26 @@ export class PlansService {
     const base = {
       id: 'volcengine',
       name: '火山方舟 Coding Plan',
-      docURL: 'https://console.volcengine.com/ark',
+      docURL: VOLC_KEY_URL,
       endpoint: VOLC_QUOTA_PATH,
       supportedWindows: ['fiveHour', 'weekly', 'monthly'],
       // 界面上必须说清楚这里要的是 AK/SK 而不是推理 Key——这是唯一容易配错的地方
       note: '用量接口在控制面，需火山账号的 AccessKey ID / Secret（与推理用的 ark- Key 是两套凭据）。',
+      // 「去哪拿、配到哪」——见 setupOf 的注释：DSH 设置里没有能填这两个名字的输入框，
+      // 只说「配成 VOLC_ACCESS_KEY_ID」用户是做不到的。
+      setup: setupOf({
+        keyURL: VOLC_KEY_URL,
+        keyURLName: '火山引擎控制台 → API 访问密钥',
+        acquire: [
+          '登录火山引擎控制台，打开「访问控制 → API 访问密钥」（也常写作「密钥管理」）。',
+          '点「新建密钥」，按提示完成身份认证，然后下载凭证——Secret Access Key 只在创建时显示一次，关掉就再也看不到。',
+          '注意：这个页面在火山引擎账号的 IAM 里，不在方舟控制台里。方舟控制台给的是推理用的 ark- Key，那个这里用不了。',
+        ],
+        refs: [
+          { name: 'VOLC_ACCESS_KEY_ID', example: 'AKLT...', note: 'AccessKey ID' },
+          { name: 'VOLC_SECRET_ACCESS_KEY', example: '...', note: 'Secret Access Key（两把都要配齐）' },
+        ],
+      }),
     }
     const accessKeyId = await this.resolveKey(VOLC_AK_ENVS)
     const secretAccessKey = await this.resolveKey(VOLC_SK_ENVS)
@@ -839,7 +949,9 @@ export class PlansService {
         reason: 'no-key',
         keyRef: missing,
         keyRefs: accessKeyId === undefined ? VOLC_AK_ENVS : VOLC_SK_ENVS,
-        hint: '需要在火山引擎控制台创建 AccessKey（不是方舟的推理 API Key），两者都要配齐。',
+        // 这句话必须同时回答「去哪拿」和「拿到后放哪」，只答一半用户就卡住了。
+        // 下面 setup 块给出可点的链接与完整步骤，这里只留一句摘要。
+        hint: '需要在火山引擎账号的 IAM 里创建 AccessKey ID / Secret Access Key（不是方舟的推理 API Key），两把都要配齐；界面上找不到能填这两个名字的输入框，往凭据文件里写——展开下面的「这家凭据怎么配」有完整步骤与本机路径。',
         windows: [],
       }
     }
@@ -856,7 +968,7 @@ export class PlansService {
             reason: 'rejected',
             error: call.error,
             hint: '这里要的是火山账号的 AccessKey ID / Secret Access Key，而不是方舟推理用的 ark- 开头的 Key；'
-              + '请到火山引擎控制台「访问控制 → 访问密钥」创建。',
+              + 'AK/SK 在火山引擎账号的 IAM「API 访问密钥」里创建（见下面的「怎么配」）。',
             keyRef: accessKeyId.ref,
             keySource: accessKeyId.source,
             keyHint: `AK ${maskSecret(accessKeyId.value)}`,

@@ -551,6 +551,86 @@ const results = []
   results.push('无相位：不渲染')
 }
 
+// ── 7) 活跃日历悬停：大数格式化 + 消费估计必须真的画出来 ─────────────
+// 静态渲染（render-check）拿不到 hover——`useState` 初值是 null，提示行永远是
+// 那句「每格 = 一天…」。所以「悬停到底显示了什么」只能在真实 DOM 里用鼠标事件
+// 触发一次才算测到。这里挂真组件、派发 mouseover、再读提示行。
+{
+  const { ActivityCalendar } = await import(
+    pathToFileURL(join(root, 'lib', 'client', 'graph.js')).href)
+  const host = window.document.createElement('div')
+  window.document.body.appendChild(host)
+  const DAYS = 14
+  // 第 5 天：token = 123_456_789 × 5 = 617,283,945 → `617.28M`；金额 ≈ ¥6.17。
+  // 两个断言都落在非零值上，避免在 0 上假通过。
+  const PICK = 5
+  await renderInto(host, React.createElement(ActivityCalendar, {
+    firstDay: '2026-09-01',
+    days: DAYS,
+    requests: Array.from({ length: DAYS }, (_, i) => i),
+    sessions: Array.from({ length: DAYS }, () => 2),
+    tokens: Array.from({ length: DAYS }, (_, i) => i * 123_456_789),
+    costs: Array.from({ length: DAYS }, (_, i) => i * 1.2345),
+    maxRequests: DAYS,
+  }))
+  const tip = host.querySelector('.px-heat-tip')
+  must(tip !== null, '日历应渲染提示行')
+  must(tip.textContent.includes('悬停看当天用量与消费估计'), '未悬停时应提示可以悬停')
+
+  // 取**第 PICK 个日格**：图例里也有 .px-heat 的 rect，所以不能拿「第一个匹配」
+  // 当日期格——那是第 0 天（全 0），断言会在 0 上假通过。
+  const dayCells = host.querySelectorAll('svg > rect.px-heat')
+  must(dayCells.length === DAYS, `日历日格数应为 ${DAYS}，实际 ${dayCells.length}`)
+  const target = dayCells[PICK]
+  await React.act(async () => {
+    target.dispatchEvent(new window.MouseEvent('mouseover', { bubbles: true }))
+  })
+  await settle()
+
+  const shown = host.querySelector('.px-heat-tip').textContent
+  // 大数必须按**大模型通用单位**缩略：617,283,945 → `617.28M`。
+  // 这里刻意同时钉住「用了 M」与「没用中文万/亿」两侧——换回万/亿会让这条失败。
+  must(shown.includes('617.28M'),
+    `悬停应把 token 缩略成大模型通用单位 617.28M，实际：${shown}`)
+  must(!shown.includes('亿') && !shown.includes('万'),
+    `token 缩略不得再用中文「万 / 亿」，实际：${shown}`)
+  must(!shown.includes(String(PICK * 123_456_789)),
+    `悬停不该显示未缩略的原始 token 数：${shown}`)
+  // 消费估计必须出现，且是金额形态
+  must(shown.includes('消费估计'), `悬停应显示消费估计，实际：${shown}`)
+  must(shown.includes('¥6.17'), `悬停应显示 ¥6.17 这个金额，实际：${shown}`)
+  must(shown.includes('次请求') && shown.includes('个会话'), '悬停仍应保留请求数与会话数')
+  results.push('活跃日历悬停：token 缩略成 617.28M（K/M/B 单位）+ 消费估计 ¥6.17')
+}
+
+// ── 7b) 日历缺金额时显示「—」而不是 ¥0 ─────────────────────────────
+// 「不知道」与「真的是 0」是两件事。旧宿主没有 heatmap.costs，
+// 若渲染成 ¥0 就等于替一个没查到的数字下了结论。
+{
+  const { ActivityCalendar } = await import(
+    pathToFileURL(join(root, 'lib', 'client', 'graph.js')).href)
+  const host = window.document.createElement('div')
+  window.document.body.appendChild(host)
+  await renderInto(host, React.createElement(ActivityCalendar, {
+    firstDay: '2026-09-01',
+    days: 7,
+    requests: [0, 1, 2, 3, 4, 5, 6],
+    sessions: [1, 1, 1, 1, 1, 1, 1],
+    tokens: [0, 1, 2, 3, 4, 5, 6],
+    // costs 整个缺失 = 旧宿主
+    maxRequests: 7,
+  }))
+  const cells = host.querySelectorAll('svg > rect.px-heat')
+  await React.act(async () => {
+    cells[3].dispatchEvent(new window.MouseEvent('mouseover', { bubbles: true }))
+  })
+  await settle()
+  const shown = host.querySelector('.px-heat-tip').textContent
+  must(shown.includes('消费估计 —'), `没有金额数据时应显示「—」，实际：${shown}`)
+  must(!shown.includes('消费估计 ¥0'), '缺金额不得显示成 ¥0（那是替未知下结论）')
+  results.push('活跃日历悬停：缺金额显示「—」而不是 ¥0')
+}
+
 // ── 8) 样式闸门：文字靠右、两色不同、没有残留的环样式 ─────────────
 {
   const { STYLES } = await import(pathToFileURL(join(root, 'lib', 'client', 'theme.js')).href)

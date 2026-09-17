@@ -30,6 +30,7 @@ import {
 import {
   fetchPlans,
   formatReset,
+  partitionProviders,
   providerChoices,
   providerStatus,
   quotaTone,
@@ -42,6 +43,7 @@ import { PLAN_SHORT } from './provider.js'
 import {
   formatCountdown,
   formatCny,
+  formatCnyAxis,
   formatDateTime,
   formatMinuteOfDay,
   formatTokens,
@@ -49,6 +51,8 @@ import {
 } from './format.js'
 import { ActivityCalendar, BarList, DonutChart, TrendChart, useCountUp } from './graph.js'
 import {
+  dailyCosts,
+  dimensionSeries,
   fetchDashboard,
   priceByModel,
   ratesFor,
@@ -74,6 +78,30 @@ const SERIES = [
   { key: 'cacheMiss', label: '未缓存输入', tone: 'purple' },
   { key: 'output', label: '输出', tone: 'pink' },
 ]
+
+/**
+ * Token 趋势的分组维度选项。
+ *
+ * `type` 是逐日行上已经算好的三段字段，另外两个维度要现场按 `byModel` 聚合
+ * （见 `dimensionSeries`）。**只显示一个维度**而不是把三个叠加：三种维度会把
+ * 同一个 token 数重复计入，叠在一起就得到一个假的总量。
+ */
+const TREND_DIMENSIONS = [
+  { id: 'type', label: '构成' },
+  { id: 'model', label: '模型' },
+  { id: 'provider', label: '提供商' },
+]
+
+/**
+ * 按模型 / 提供商分组时最多画几条线。
+ *
+ * 老账本里能出现十几个 `模型@提供商` 条目，全画上去就是一团互相压住的线，
+ * 图例也会长到把面板撑开。超出的合成「其他」（见 `dimensionSeries`）。
+ */
+const TREND_SERIES_LIMIT = 5
+
+/** 消费估计趋势的序列定义（单条：每日金额）。 */
+const COST_SERIES = [{ key: 'cost', label: '每日消费估计', tone: 'pink' }]
 
 /** 把高峰窗口数组渲染成 `9:00–12:00、14:00–18:00`。 */
 function formatWindows(windows) {
@@ -109,7 +137,7 @@ function splitTokens(byModel) {
  * @returns {object} React 元素。
  */
 function Segmented(props) {
-  const { options, value, onChange } = props
+  const { options, value, onChange, className } = props
   const listRef = useRef(null)
   const [thumb, setThumb] = useState({ left: 3, width: 0 })
 
@@ -132,7 +160,7 @@ function Segmented(props) {
 
   return h(
     'div',
-    { className: 'px-seg', ref: listRef, role: 'tablist' },
+    { className: `px-seg${className === undefined ? '' : ` ${className}`}`, ref: listRef, role: 'tablist' },
     h('span', {
       className: 'px-seg-thumb',
       style: { transform: `translateX(${thumb.left - 3}px)`, width: thumb.width },
@@ -421,6 +449,15 @@ export function View(props) {
     plans, plansError, plansBusy, onTogglePlans,
   } = props
   const [rangeId, setRangeId] = useState('30')
+  /**
+   * Token 趋势的分组维度。
+   *
+   * 三种维度回答三个不同问题，**不互相替代**，因此做成切换而不是叠加：
+   *   - 构成（缓存命中 / 未缓存 / 输出）：量花在哪一段；
+   *   - 模型：哪个模型用得最多（同一个模型跨提供商合并，否则会重复计数）；
+   *   - 提供商：量从哪条路由来。
+   */
+  const [trendBy, setTrendBy] = useState('type')
   const range = RANGES.find((item) => item.id === rangeId) ?? RANGES[1]
   const period = usePeriod(data, now)
   // 用户在看板上手动指定的「当前监看的套餐」（undefined = 自动挑最紧的那一家）。
@@ -431,15 +468,31 @@ export function View(props) {
   const rangeTotals = useMemo(() => sumRows(points), [points])
   const rangeByModel = useMemo(() => sumByModel(points.map((point) => point.byModel)), [points])
   const rangeCost = useMemo(() => priceByModel(rangeByModel, data.pricing), [rangeByModel, data.pricing])
-  const todayCost = useMemo(
-    () => priceByModel(data.days.at(-1)?.byModel ?? {}, data.pricing),
-    [data.days, data.pricing],
-  )
+  // 「今日」按宿主的 `overview.today`（站点时区的今天）去 days 里定位，
+  // 找不到就是今天还没有任何请求——此时费用是 0，而不是「最后有数据那天」的费用。
+  // 旧宿主没有这个字段时才退回 days.at(-1)（可能偏一天，但至少不空白）。
+  const todayCost = useMemo(() => {
+    const key = data.overview?.today
+    const row = typeof key === 'string' && key !== ''
+      ? data.days.find((day) => day.key === key)
+      : data.days.at(-1)
+    return priceByModel(row?.byModel ?? {}, data.pricing)
+  }, [data.days, data.pricing, data.overview?.today])
 
   const overview = data.overview
   const activeInRange = points.filter((point) => Number(point.totals.requests) > 0).length
   const split = splitTokens(rangeByModel)
   const peakShare = split.peak + split.idle > 0 ? split.peak / (split.peak + split.idle) : 0
+
+  // Token 趋势按维度摊开：`type` 直接用逐日行上的三段字段（recentDays 已经算好），
+  // 模型 / 提供商则从每天的 byModel 现场聚合（见 dimensionSeries 的注释）。
+  const trend = useMemo(() => {
+    if (trendBy === 'type') return { series: SERIES, points }
+    return dimensionSeries(points, data.models, trendBy, { limit: TREND_SERIES_LIMIT })
+  }, [trendBy, points, data.models])
+
+  // 消费估计趋势：与「费用估算」卡片同一口径（逐日 priceByModel 之和）。
+  const costPoints = useMemo(() => dailyCosts(points, data.pricing), [points, data.pricing])
 
   // 切换监看的套餐：直接写共享存储，看板与输入框下方那一枚同时跟着变。
   const onSelectPlan = useCallback((planId) => { planViewStore().select(planId) }, [])
@@ -567,6 +620,9 @@ export function View(props) {
         requests: data.heatmap.requests ?? [],
         sessions: data.heatmap.sessions ?? [],
         tokens: data.heatmap.tokens ?? [],
+        // 每格的消费估计，与 requests 同一套 day 索引。
+        // 旧宿主没有这个字段 → 悬停显示「消费估计 —」，而不是假装是 ¥0。
+        costs: data.heatmap.costs ?? [],
         maxRequests: data.heatmap.maxRequests ?? 1,
       }))),
 
@@ -596,8 +652,45 @@ export function View(props) {
         compact: true,
       }))),
 
-    h(Panel, { title: `${range.label} Token 趋势`, tone: 'blue', delay: 300 },
-      h(TrendChart, { points, series: SERIES, formatAxis: formatTokens, formatValue: formatTokens })),
+    // 两张趋势卡片**同行**（.px-trend-row）：它们回答同一段时间里的两个问题
+    // （用了多少 / 花了多少），分两行会让读的人来回滚动对不上横轴。
+    // 窄屏由 .px-trend-row 的媒体查询塌回单列（见 theme.js）。
+    h('div', { className: 'px-trend-row' },
+      h(Panel, {
+        title: `${range.label} Token 趋势`,
+        tone: 'blue',
+        delay: 300,
+        // 维度切换器放在标题行右侧：它改的正是这张卡片画什么
+        extra: h(Segmented, {
+          // 比顶部那个窗口切换器小一号：它是**卡片内**的次级选择，
+          // 与「7 日 / 30 日 / 90 日」那种全局窗口不该看起来一样重。
+          className: 'px-trend-dim',
+          options: TREND_DIMENSIONS,
+          value: trendBy,
+          onChange: setTrendBy,
+        }),
+      },
+      h(TrendChart, {
+        points: trend.points,
+        series: trend.series,
+        formatAxis: formatTokens,
+        formatValue: formatTokens,
+      })),
+
+      h(Panel, {
+        title: `${range.label}消费估计趋势`,
+        tone: 'pink',
+        delay: 320,
+        // 合计金额写在标题行：曲线的形状告诉「哪天贵」，这一行回答「一共多少」
+        extra: formatCny(rangeCost.standard),
+      },
+      h(TrendChart, {
+        points: costPoints,
+        series: COST_SERIES,
+        // 轴用紧凑金额（`¥0.038`），读数与合计仍用完整的 formatCny
+        formatAxis: formatCnyAxis,
+        formatValue: formatCny,
+      }))),
 
     h(Panel, {
       title: '通知与预警',
@@ -638,7 +731,10 @@ export function View(props) {
         target: '_blank',
         rel: 'noreferrer',
       }, 'DeepSeek 官方定价页'),
-      '，费用为本地估算，实际账单以服务商为准。'),
+      // 「实际账单以服务商为准」在买断制下是误导：第三方中转 / Coding Plan
+      // 不按 token 计费，所以这里的金额与它们毫无关系，而不是「略有出入」。
+      '。所有金额都是按各模型官方单价做的估算——第三方中转与 Coding Plan 是买断制，'
+      + '不按 token 计费，不在此估算范围内。'),
   )
 }
 
@@ -760,30 +856,116 @@ function QuotaWindow(props) {
 }
 
 /**
- * 各家的管理 / 充值入口。
+ * 各家的管理 / 充值入口（**旧宿主的回落**）。
  *
- * 刻意做成一张表按 id 取，而不是在面板底部写死一行三个链接：链接挪进它所属
- * 那一家的区块里之后，「看到额度快满了」到「去管理」的距离从「翻到面板底部、
- * 再从三个链接里挑出对的那个」缩短成同一块里的一次点击。
+ * 新宿主在每一家里交下 `setup.keyURL` / `keyURLName`（含「去哪拿凭据」的完整步骤），
+ * 这里只服务没有 `setup` 的旧宿主。**注意火山的入口是 IAM 的「API 访问密钥」页，
+ * 不是方舟控制台**——AK/SK 是账号级 IAM 凭据，方舟控制台给的是推理用的 `ark-` Key，
+ * 那个恰好是本接口会拒掉的一把。早先这里指向方舟控制台，正是用户找不到 AK 的原因。
  */
 const PLAN_LINKS = {
   zhipu: { href: 'https://www.bigmodel.cn/coding-plan/personal/usage', label: '智谱套餐用量 ↗' },
   commandcode: { href: 'https://commandcode.ai/studio', label: 'Command Code 工作室 ↗' },
-  volcengine: { href: 'https://console.volcengine.com/ark', label: '火山方舟控制台 ↗' },
+  volcengine: { href: 'https://console.volcengine.com/iam/keymanage/', label: '火山引擎 API 访问密钥 ↗' },
+}
+
+/**
+ * 「这家凭据怎么配」的可展开说明。
+ *
+ * 只有两件事要回答，**缺任何一件用户都会卡住**：
+ *   1. **去哪拿**（`acquire` + `keyURL`）；
+ *   2. **拿到后放哪**（`refs` + 凭据文件路径）。
+ *
+ * 第 2 点容易被漏掉，因为「设置 → 模型」里根本没有能填 `VOLC_ACCESS_KEY_ID` 的输入框
+ * ——DSH 只会写它自己派生的 `<路由>_API_KEY`。所以这里必须把凭据文件**路径**写出来。
+ * @param {object} props - setup / credentialFile / open。
+ * @returns {object|null} React 元素；没有 setup 时 null。
+ */
+function SetupHelp(props) {
+  const { setup, credentialFile, open = false } = props
+  if (!hasSetupHelp(setup)) return null
+  const acquire = Array.isArray(setup.acquire) ? setup.acquire : []
+  const refs = Array.isArray(setup.refs) ? setup.refs : []
+  const file = typeof credentialFile === 'string' && credentialFile !== '' ? credentialFile : ''
+
+  return h('details', { className: 'px-details px-plan-setup', open },
+    h('summary', null, '这家凭据怎么配'),
+    acquire.length === 0
+      ? null
+      : h('ol', { className: 'px-plan-steps' },
+        acquire.map((step, index) => h('li', { key: index }, step))),
+    // 入口只在**展开时**画在这里：`<details>` 折叠时子节点仍在 DOM 里，
+    // 无条件渲染会与页脚那一个入口重复，同一块里出现两个同样的链接
+    // 会让「点哪个」变成多余的问题。
+    !open || setup.keyURL === undefined || setup.keyURL === ''
+      ? null
+      : h('p', { className: 'px-plan-setup-link' },
+        h('a', { href: setup.keyURL, target: '_blank', rel: 'noreferrer' },
+          `${setup.keyURLName === '' ? '打开创建页' : setup.keyURLName} ↗`)),
+    refs.length === 0
+      ? null
+      : h('div', { className: 'px-plan-setup-where' },
+        h('p', null, '把下面这些项写进 DSH 凭据文件（或设成同名环境变量）：'),
+        file === ''
+          ? null
+          : h('code', { className: 'px-plan-setup-path' }, file),
+        h('ul', { className: 'px-plan-setup-refs' },
+          refs.map((item) => h('li', { key: item.name },
+            h('code', null, `${item.name}: ${item.example === '' ? '…' : item.example}`),
+            item.note === '' ? null : h('span', { className: 'px-plan-setup-note' }, item.note))))),
+    // 两条路的重载方式不同，必须分开说：凭据文件由 DSH **自动重载**（改完不必重启），
+    // 环境变量在启动时就快照固定了（必须重启）。混成一句会让用户白重启一次，
+    // 或者反过来一直等一个永远不会生效的值。
+    h('p', { className: 'px-plan-setup-hint' },
+      '凭据文件改完由 DSH 自动重载，不用重启；环境变量则要写进 ',
+      h('code', null, '<DSH_HOME>/.env'),
+      ' 或启动 dsh 前 export，然后重启 dsh 才生效。'),
+  )
+}
+
+/**
+ * 这一家有可显示的「怎么配」说明吗。
+ *
+ * 单独抽出来是为了让**页脚**与说明块用同一条判据：说明块为空时它自己返回 null，
+ * 页脚若还按「有 setup 就不画链接」去抑制，这一家就一个入口都没有了。
+ * @param {object} setup - 宿主的 setup 块。
+ * @returns {boolean} 是否有内容可显示。
+ */
+function hasSetupHelp(setup) {
+  if (setup === undefined || setup === null) return false
+  const acquire = Array.isArray(setup.acquire) ? setup.acquire : []
+  const refs = Array.isArray(setup.refs) ? setup.refs : []
+  return acquire.length > 0 || refs.length > 0
 }
 
 /**
  * 一家厂商的额度区块。
- * @param {object} props - provider / now / current。
+ * @param {object} props - provider / now / current / credentialFile。
  * @returns {object} React 元素。
  */
 function ProviderQuota(props) {
-  const { provider, now, current = false } = props
+  const { provider, now, current = false, credentialFile } = props
   const status = providerStatus(provider)
   const windows = WINDOW_ORDER
     .map((key) => (provider?.windows ?? []).find((win) => win.window === key))
     .filter(Boolean)
   const link = PLAN_LINKS[provider?.id]
+  // 新宿主的 setup 优先；旧宿主没有它时才用写死的表。
+  const setup = provider?.setup
+  // 缺凭据时把说明**默认展开**：那正是用户需要它的时刻。
+  // 配好了就折叠起来，不占版面。
+  const needsKey = provider?.ok !== true && provider?.reason === 'no-key'
+  const setupURL = setup?.keyURL === undefined || setup.keyURL === '' ? undefined : setup.keyURL
+  const setupLabel = setup?.keyURLName === undefined || setup.keyURLName === ''
+    ? '创建页 ↗'
+    : `${setup.keyURLName} ↗`
+  // 入口在同一块里**只出现一次**。展开时它跟在步骤后面（就在眼前），
+  // 此时页脚不再重复；折叠（或旧宿主没有 setup）时由页脚那个常驻入口承担。
+  // 判据必须与 SetupHelp 自己的渲染条件一致（`hasSetupHelp`）：
+  // 说明块为空时它渲染 null，页脚若还抑制链接，这一家就一个入口都没有了。
+  const setupShowsLink = needsKey && hasSetupHelp(setup) && setupURL !== undefined
+  const keyURL = setupShowsLink ? undefined : (setupURL ?? link?.href)
+  const keyLabel = setupURL === undefined ? link?.label : setupLabel
 
   return h('div', { className: `px-plan${current ? ' px-plan-current' : ''}` },
     h('div', { className: 'px-plan-head' },
@@ -801,15 +983,16 @@ function ProviderQuota(props) {
     provider?.warning === undefined
       ? null
       : h('p', { className: 'px-balance-state px-warn' }, provider.warning),
+    h(SetupHelp, { setup, credentialFile, open: needsKey }),
     windows.length === 0
       ? null
       : h('div', { className: 'px-quota-list' }, windows.map((win) => h(QuotaWindow, { key: win.window, win, now }))),
     // 这一家的入口与这一家的数据源说明并排一行：两者都是「关于这一家」的补充信息，
     // 各占一行会让三家堆出六行来。
     h('p', { className: 'px-plan-foot' },
-      link === undefined
+      keyURL === undefined
         ? null
-        : h('a', { href: link.href, target: '_blank', rel: 'noreferrer' }, link.label),
+        : h('a', { href: keyURL, target: '_blank', rel: 'noreferrer' }, keyLabel),
       provider?.endpoint === undefined
         ? null
         : h('span', { className: 'px-plan-endpoint', title: '未文档化的内部接口，可能随官方改动失效' },
@@ -869,6 +1052,24 @@ export function PlansPanel(props) {
   const locked = payload?.lockedByEnv === true
   const providers = Array.isArray(payload?.providers) ? payload.providers : []
   const choices = providerChoices(payload)
+  // 当前监看的那一家（与切换器同一条判据）。它必须留在显眼组：
+  // 切换器里标着「当前监看」而下面找不到它，是自相矛盾的界面。
+  const currentId = (() => {
+    if (selected !== undefined && selected !== '') return selected
+    return tightestWindow({ providers })?.planId
+  })()
+  // 没配过凭据的那几家收进折叠区（见 partitionProviders 的注释：判据是
+  // 「有没有配过」而不是「成功还是失败」——配过但坏了的一直显示）。
+  const { active, idle } = partitionProviders(providers, { selected, current: currentId })
+  /** 渲染一家。 */
+  const renderProvider = (provider) => h(ProviderQuota, {
+    key: provider.id,
+    provider,
+    now,
+    current: isCurrentPlan(selected, providers, provider.id),
+    // 「配到哪」的路径由宿主解析（浏览器拿不到 env），这里只往下传。
+    credentialFile: payload?.credentialFile,
+  })
 
   return h('div', { className: compact === true ? 'px-account-col' : null },
     h('div', { className: 'px-balance-head' },
@@ -903,12 +1104,27 @@ export function PlansPanel(props) {
     providers.length === 0
       ? null
       : h('div', { className: 'px-plan-list' },
-        providers.map((provider) => h(ProviderQuota, {
-          key: provider.id,
-          provider,
-          now,
-          current: isCurrentPlan(selected, providers, provider.id),
-        }))),
+        active.map(renderProvider)),
+
+    // 没配凭据的那几家折起来：它们此刻没有任何信息量（就是「还没配」），
+    // 但**不能删掉**——随着适配的第三方变多，用户需要一处能看见
+    // 「插件还支持哪些家、怎么配」。标题行写明有几家，收起的是内容不是事实。
+    //
+    // **一家都没配时默认展开**：那时上面是空的，折叠起来整张卡片就只剩一行字，
+    // 新用户既看不到支持哪些家、也无从知道该怎么配。有在用的家时才收起。
+    idle.length === 0
+      ? null
+      : h(Collapse, {
+        // 用 key 让「该展开」这件事变化时重新挂载：Collapse 的 open 是内部 state，
+        // 只读初始值，光改 defaultOpen 是改不动的。
+        key: `idle-${active.length === 0}`,
+        title: '未配置的厂商',
+        hint: active.length === 0 ? '配好凭据即可查看额度' : '配好凭据后会自动移到上面',
+        summary: `${idle.length} 家`,
+        defaultOpen: active.length === 0,
+      },
+      h('div', { className: 'px-plan-list px-plan-list-idle' },
+        idle.map(renderProvider))),
 
     // 同上：折进 <details>，默认不占版面
     h('details', { className: 'px-details' },
@@ -924,10 +1140,13 @@ export function PlansPanel(props) {
         '（在「个人编程套餐」里新建，与平台普通 API Key 不通用）。',
         '火山方舟的用量接口在',
         h('b', null, '控制面 OpenAPI'),
-        '上，要的是账号的 AccessKey ID / Secret Access Key（',
+        '上，要的是',
+        h('b', null, '火山账号'),
+        '的 AccessKey ID / Secret Access Key（',
         h('b', null, '不是'),
-        '方舟推理用的 ark- 开头的 Key，那把在网关会被直接拒绝），'
-        + '请到火山引擎控制台「访问控制 → 访问密钥」创建，并配成 VOLC_ACCESS_KEY_ID 与 VOLC_SECRET_ACCESS_KEY。')),
+        '方舟推理用的 ark- 开头的 Key，那把在网关会被直接拒绝）。这两把在火山引擎的',
+        h('b', null, 'IAM「API 访问密钥」'),
+        '里创建——不在方舟控制台里。每一家的「这家凭据怎么配」里有完整步骤与凭据文件路径。')),
   )
 }
 
@@ -1303,7 +1522,7 @@ function entryKeyOf(model) {
 function CostTable(props) {
   const { models, rangeByModel, pricing, rangeCost, split, rangeLabel } = props
   const rows = models
-    .map((model) => {
+    .map((model, index) => {
       const key = entryKeyOf(model)
       const usage = rangeByModel[key]
       if (usage === undefined) return null
@@ -1320,6 +1539,9 @@ function CostTable(props) {
         // 这一条合并了哪些路由 id，悬停可查（同一个模型在网关里有多个叫法是常态）
         routes: Array.isArray(model.routes) ? model.routes.filter((name) => typeof name === 'string') : [],
         rates,
+        // 配色按**在 `models` 里的下标**取，与「模型分布」环图完全同源：
+        // 两处若各按自己的过滤后下标取色，同一个条目会在两张图里显示成不同颜色。
+        tone: TONES[index % TONES.length],
         // 不分时的模型 peak 与 idle 相同；按 peak 判定即可
         flat: Number(rates.cacheMiss?.peak ?? 0) === Number(rates.cacheMiss?.idle ?? 0)
           && Number(rates.output?.peak ?? 0) === Number(rates.output?.idle ?? 0),
@@ -1342,6 +1564,34 @@ function CostTable(props) {
   const anyTiered = rows.some((row) => row.tiered)
   const anyUnpriced = rows.some((row) => !row.priced)
   const anyUnknownProvider = rows.some((row) => row.provider === '')
+
+  /**
+   * 单价按**模型**归组，而不是逐条（逐提供商）重复列出。
+   *
+   * 依据是一个事实：**价目表本身就按模型索引**（`MODEL_RATES` 的键里没有提供商，
+   * 见 lib/pricing.js）。同一个模型走四条路由，`rates` 是**同一份对象**——
+   * 实测本机 4 条 `deepseek-flash` 的单价逐字相同，却把
+   * 「缓存命中 ¥0.02 / ¥0.04 · 未命中 ¥1 / ¥2 · 输出 ¥4 / ¥8」整整重复了 4 遍。
+   * 数字一样、单位一样、厂商一样，唯一的差别在**用量**上——而用量在上面的表里。
+   *
+   * 归组键取 `rollup`（价目表的键），不是「价格数字相同」：后者会把两个
+   * 恰好同价的**不同模型**并成一条，抹掉模型名。
+   *
+   * 组内**保留每一个提供商的色块**：色块与「模型分布」环图同源（见 row.tone），
+   * 每个提供商在环图里占一片，因此这里也必须一个不少，否则图例就对不上号了。
+   */
+  const rateGroups = []
+  const rateGroupIndex = new Map()
+  for (const row of rows) {
+    const groupKey = row.rollup === '' ? row.key : row.rollup
+    const found = rateGroupIndex.get(groupKey)
+    if (found === undefined) {
+      rateGroupIndex.set(groupKey, { key: groupKey, first: row, rows: [row] })
+      rateGroups.push(rateGroupIndex.get(groupKey))
+    } else {
+      found.rows.push(row)
+    }
+  }
 
   return h('div', null,
     h('div', { className: 'px-table-wrap' },
@@ -1383,23 +1633,71 @@ function CostTable(props) {
             h('td', { className: 'px-num' }, formatTokens(split.idle)),
             h('td', { className: 'px-num' }, formatCny(rangeCost.standard)))))),
     h('div', { className: 'px-rate-list' },
-      rows.map((row, index) =>
-        h('div', { key: `rate-${row.key}`, className: 'px-rate' },
-          h('i', { className: `px-rate-swatch ${toneFill(TONES[index % TONES.length])}` }),
-          h('b', null, row.label),
-          row.providerLabel === '' ? null : h('span', null, row.providerLabel),
-          h('span', null, row.flat
-            // 不分时：只写一个价，不要摆一对相同的数字
-            ? `缓存命中 ¥${row.rates.cacheHit.peak} · 未命中 ¥${row.rates.cacheMiss.peak} · 输出 ¥${row.rates.output.peak}`
-            : `缓存命中 ¥${row.rates.cacheHit.idle} / ¥${row.rates.cacheHit.peak}`),
-          row.flat ? null : h('span', null, `未命中 ¥${row.rates.cacheMiss.idle} / ¥${row.rates.cacheMiss.peak}`),
-          row.flat ? null : h('span', null, `输出 ¥${row.rates.output.idle} / ¥${row.rates.output.peak}`),
-          row.vendor === '' ? null : h('span', { className: 'px-muted' }, row.vendor)))),
+      // 表头：把单位和「空闲 / 高峰」的顺序**说一次**，下面每一行就不必重复，
+      // 也省掉「¥0.02 / ¥0.04 哪个是哪个」的歧义。
+      h('div', { className: 'px-rate-caption' },
+        h('span', null, '各模型官方单价'),
+        h('span', { className: 'px-rate-unit' }, '元 / 百万 token · 空闲 / 高峰')),
+      rateGroups.map((group) => {
+        const row = group.first
+        /**
+         * 这一行用**价目表里的官方模型名**，而不是 `row.label`。
+         *
+         * `row.label` 是 **DSH 设置里那条路由的外显名**，逐提供商不同：同一个
+         * `deepseek-flash` 在 WorkBuddy 下叫「DeepSeek Flash」、在 commandcode 下叫
+         * 「COD-DeepSeek V4.1 Flash」。若直接取 `group.first.label`，显示的就是
+         * 「按用量排序碰巧排第一的那个提供商给它的名字」——价格明明是模型的属性，
+         * 却被贴上某一家的叫法，换个窗口就会变。
+         *
+         * 兜底价（不在价目表里）例外：那时 `rates` 是 Flash 的兜底条目，
+         * `rates.label` 会把它误标成「DeepSeek Flash」，所以退回它自己的名字。
+         */
+        const officialLabel = row.priced && typeof row.rates?.label === 'string' && row.rates.label !== ''
+          ? row.rates.label
+          : row.label
+        return h('div', { key: `rate-${group.key}`, className: 'px-rate' },
+          // 左列：色块 + 模型名 + 归一后的键。价格本身与提供商无关，
+          // 色块只是让读者能把这一行对回到上面的用量行。
+          h('span', { className: 'px-rate-who' },
+            h('span', { className: 'px-rate-tones' },
+              group.rows.map((item) => h('i', {
+                key: item.key,
+                className: `px-rate-swatch ${toneFill(item.tone)}`,
+                title: item.providerLabel === '' ? '来源未知' : item.providerLabel,
+              }))),
+            h('b', null, officialLabel),
+            h('span', { className: 'px-muted px-mono' }, group.key),
+            row.priced ? null : h('span', { className: 'px-badge' }, '估算价'),
+            // 哪几家的用量落在这个模型上：只在多家时才点出来，一家时是废话
+            group.rows.length > 1
+              ? h('span', { className: 'px-muted' }, `${group.rows.length} 个来源`)
+              : null),
+          h('span', { className: 'px-rate-prices' },
+            h('span', null,
+              h('em', null, '缓存命中'),
+              h('code', null, row.flat
+                // 不分时：只写一个价，不要摆一对相同的数字
+                ? `¥${row.rates.cacheHit.peak}`
+                : `¥${row.rates.cacheHit.idle} / ¥${row.rates.cacheHit.peak}`)),
+            h('span', null,
+              h('em', null, '未命中'),
+              h('code', null, row.flat
+                ? `¥${row.rates.cacheMiss.peak}`
+                : `¥${row.rates.cacheMiss.idle} / ¥${row.rates.cacheMiss.peak}`)),
+            h('span', null,
+              h('em', null, '输出'),
+              h('code', null, row.flat
+                ? `¥${row.rates.output.peak}`
+                : `¥${row.rates.output.idle} / ¥${row.rates.output.peak}`))))
+      })),
     h('p', { className: 'px-muted px-note' },
-      `一条 = 一个模型 + 一个提供商。同一个模型由不同提供商提供服务时分开计算，`
-      + `因为单价、余额与套餐额度都不同。`,
-      `单价单位元 / 百万 token；标「不分时」的模型高峰与空闲同价，故只列一个价、`
-      + `两档 token 合成「高峰 token」一列。`,
+      // 口径必须写清楚，否则用户会把「按官方价估算」误读成「我的实际账单」。
+      // 说「各模型的官方价」而不是「DeepSeek 官方价」：表里既有 DeepSeek 也有
+      // 智谱 GLM 的行，后者的官方价来自智谱，不是 DeepSeek。
+      `金额口径：按各模型官方公布的单价估算，即“这些 token 若全部走官方 API 需要花多少钱”。`
+      + `第三方中转与 Coding Plan 是事先一次性买断的订阅，不按 token 计费，因此不在此列。`,
+      `单价单位元 / 百万 token；写成一个值的模型不分时（高峰与空闲同价），`
+      + `写成两个值的按「空闲 / 高峰」分档。`,
       `${rangeLabel}内若全部落在空闲时段可省 ${formatCny(rangeCost.saved)}。`,
       anyTiered ? '标「按最低档」的模型官方按输入长度分档定价，这里只按最低档估算。' : '',
       anyUnpriced ? '标「估算价」的模型不在价目表里，暂按 Flash 单价估算，仅供参考。' : '',
