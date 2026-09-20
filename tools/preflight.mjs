@@ -681,7 +681,8 @@ for (const banned of ['Bearer ', 'sk-', 'eyJ']) {
 const plansModule = await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)
 const {
   parseZhipuQuota, parseCommandCodeCredits, maskSecret, readCommandCodeKey,
-  deriveKeyRef, COMMAND_CODE_KEY_ENVS,
+  deriveKeyRef, COMMAND_CODE_KEY_ENVS, commandCodePlanInfo, COMMAND_CODE_USAGE_PATH,
+  COMMAND_CODE_CAP_TOLERANCE,
 } = plansModule
 
 // 凭据名派生必须与 DSH **逐字一致**：用户用「自定义提供商」添加服务时，DSH 按路由名
@@ -755,6 +756,166 @@ const bareMonth = ccBare.windows.find((win) => win.window === 'monthly')
 assert.equal(bareMonth.remaining, 42.5, '裸数字应作为剩余额度')
 assert.equal(bareMonth.usedPercent, undefined, '没有总额时不得编造百分比')
 assert.equal(bareMonth.total, undefined, '没有总额时 total 应是 undefined 而不是 0')
+
+// ── 套餐身份（planId）与月度百分比 ──────────────────────────────
+// 用户报过：能配好套餐、5 小时与每周都正常，**只有月度永远是 0%**。
+// 根因是三件事叠在一起：credits 接口对月度只给「剩余」（裸数字），宿主因此算不出
+// 百分比，而客户端把「不知道」兜底成了 0。修法是补齐另外两个接口：
+//   `subscriptions` 给 planId（套餐身份 → 名义月额度与显示名），
+//   `usage/summary` 给「本计费周期已用」。
+// 这一组断言钉的就是这三者拼起来的口径。
+assert.ok(COMMAND_CODE_USAGE_PATH.endsWith('/usage/summary'),
+  `月度已用要去用量汇总接口取，实际路径 ${COMMAND_CODE_USAGE_PATH}`)
+
+// 套餐表：Go / GOAT 的月额度必须不同——这正是用户问的那点
+assert.equal(commandCodePlanInfo('individual-go')?.name, 'Go')
+assert.equal(commandCodePlanInfo('individual-go')?.monthlyCredits, 10, 'Go 是 $10/月')
+assert.equal(commandCodePlanInfo('individual-goat')?.name, 'GOAT')
+assert.equal(commandCodePlanInfo('individual-goat')?.monthlyCredits, 70, 'GOAT 是 $70/月')
+assert.equal(commandCodePlanInfo('individual-go')?.monthlyCredits
+  !== commandCodePlanInfo('individual-goat')?.monthlyCredits, true, 'Go 与 GOAT 的额度不得混同')
+// 只按完整 id 精确匹配：老一代 Pro 是 $30，现在的 Pro（v1）是 $80。
+// 前缀匹配会让新套餐继承旧额度，然后整整一个计费周期的百分比都是错的。
+assert.equal(commandCodePlanInfo('individual-pro')?.monthlyCredits, 30, '老一代 Pro 是 $30')
+assert.equal(commandCodePlanInfo('individual-pro-v1')?.monthlyCredits, 80, '现在的 Pro 是 $80')
+assert.equal(commandCodePlanInfo('individual-pro-v2'), undefined, '未收录的代次不得继承上一代的额度')
+assert.equal(commandCodePlanInfo('individual-max')?.monthlyCredits, 150, 'Max 10× 是 $150')
+assert.equal(commandCodePlanInfo('individual-ultra')?.monthlyCredits, 300, 'Max 20× 是 $300')
+assert.equal(commandCodePlanInfo('teams-pro')?.monthlyCredits, 40, 'Team Pro 是 $40')
+assert.equal(commandCodePlanInfo('individual_goat')?.name, 'GOAT', '下划线写法应归一')
+assert.equal(commandCodePlanInfo(undefined), undefined)
+assert.equal(commandCodePlanInfo(''), undefined)
+assert.ok(COMMAND_CODE_CAP_TOLERANCE > 0 && COMMAND_CODE_CAP_TOLERANCE < 1, '容差应是比例而不是绝对值')
+
+// 真实账号的形状（2026-09 实测）：月度只有剩余余额，已用在用量汇总接口里
+const ccLive = parseCommandCodeCredits({
+  credits: { belowThreshold: false, monthlyCredits: 65.5512769625, freeCredits: 0, purchasedCredits: 0 },
+  windowLimits: {
+    limited: true,
+    fiveHour: { used: 0.094074736, cap: 14, exceeded: false, resetAt: 1_789_880_547_252 },
+    weekly: { used: 4.4487230375, cap: 35, exceeded: false, resetAt: 1_789_994_691_968 },
+  },
+}, {
+  success: true,
+  data: { planId: 'individual-goat', status: 'active', currentPeriodEnd: '2026-10-14T12:26:13.000Z' },
+}, {
+  totalCount: 1350,
+  totalCredits: 4.429013998500001,
+  totalMonthlyCredits: 4.429013998500001,
+  periodBasis: 'billing-period',
+})
+assert.equal(ccLive.plan, 'GOAT', 'planId 应归一成套餐显示名')
+assert.equal(ccLive.planId, 'individual-goat', 'planId 也要原样交下来供诊断')
+const ccLiveMonth = ccLive.windows.find((win) => win.window === 'monthly')
+assert.equal(ccLiveMonth.used, 4.43, '月度已用应来自用量汇总接口（4.429 → 4.43）')
+assert.equal(ccLiveMonth.total, 69.98, '月度总额 = 已用 + 剩余（69.9803 → 69.98）')
+assert.equal(ccLiveMonth.remaining, 65.55, '月度剩余来自 credits 的裸数字')
+assert.equal(ccLiveMonth.usedPercent, 6.33, `月度真实已用约 6.33%，实际 ${ccLiveMonth.usedPercent}`)
+assert.notEqual(ccLiveMonth.usedPercent, 0, '月度百分比绝不能是 0（那是「未知被画成 0」的老毛病）')
+
+// 用量汇总接口取不到时：有套餐身份就按名义额度反推，并把「这是推算」说出来
+const ccNoUsage = parseCommandCodeCredits(
+  { credits: { monthlyCredits: 65.5512769625 } },
+  { data: { planId: 'individual-goat' } },
+)
+const ccNoUsageMonth = ccNoUsage.windows.find((win) => win.window === 'monthly')
+assert.equal(ccNoUsageMonth.total, 70, '没有用量接口时应回落到套餐名义额度')
+assert.equal(ccNoUsageMonth.used, 4.45, '已用 = 名义额度 - 剩余（4.4487 → 4.45）')
+assert.equal(ccNoUsageMonth.usedPercent, 6.36, `按名义额度算出的百分比，实际 ${ccNoUsageMonth.usedPercent}`)
+assert.ok(String(ccNoUsageMonth.note).includes('名义额度'), '推算出来的百分比必须标注来源，不能伪装成官方数字')
+
+// Go 套餐（$10）：同一套逻辑，额度更小
+const ccGo = parseCommandCodeCredits({ credits: { monthlyCredits: 9 } }, { data: { planId: 'individual-go' } })
+const ccGoMonth = ccGo.windows.find((win) => win.window === 'monthly')
+assert.equal(ccGoMonth.total, 10, 'Go 的月度总额应是 $10 而不是 $70')
+assert.equal(ccGoMonth.usedPercent, 10, 'Go：已用 1/10 = 10%')
+
+// 未收录的套餐：没有名义额度可推算，但「已用 + 剩余」仍能给出百分比
+const ccUnknownPlan = parseCommandCodeCredits(
+  { credits: { monthlyCredits: 30 } },
+  { data: { planId: 'individual-future' } },
+  { totalMonthlyCredits: 10 },
+)
+const ccUnknownMonth = ccUnknownPlan.windows.find((win) => win.window === 'monthly')
+assert.equal(ccUnknownPlan.plan, 'individual-future', '未收录的档位原样报 id，也比空白强')
+assert.equal(ccUnknownMonth.usedPercent, 25, '没有名义额度时用「已用 + 剩余」算（10/40）')
+
+// 跨计费周期 / 换套餐：两个接口的两个数不属于同一周期时，**一个百分比都不给**
+const ccMismatch = parseCommandCodeCredits(
+  { credits: { monthlyCredits: 200 } },
+  { data: { planId: 'individual-goat' } },
+  { totalMonthlyCredits: 300 },
+)
+const ccMismatchMonth = ccMismatch.windows.find((win) => win.window === 'monthly')
+assert.equal(ccMismatchMonth.usedPercent, undefined, '对不上名义额度时不得给百分比')
+assert.equal(ccMismatchMonth.used, undefined, '对不上时也不能给出「已用」这个假事实')
+assert.equal(ccMismatchMonth.total, undefined, '对不上时不能给出总额')
+assert.equal(ccMismatchMonth.remaining, 200, '能确定的那一项（剩余余额）照常给')
+assert.ok(String(ccMismatchMonth.note).includes('对不上'), '不给百分比时必须说明原因，界面据此显示 —')
+
+// 买过充值信用额：基线要把 free / purchased 一起算，否则整个周期都拿不到百分比
+const ccPurchased = parseCommandCodeCredits(
+  { credits: { monthlyCredits: 120, freeCredits: 0, purchasedCredits: 100 } },
+  { data: { planId: 'individual-goat' } },
+  { totalMonthlyCredits: 50 },
+)
+const ccPurchasedMonth = ccPurchased.windows.find((win) => win.window === 'monthly')
+assert.equal(ccPurchasedMonth.total, 170, '充值过的账号：总额 = 已用 + 剩余')
+assert.equal(ccPurchasedMonth.usedPercent, 29.41, `50/170 = 29.41%，实际 ${ccPurchasedMonth.usedPercent}`)
+
+// 剩余比名义额度还大（换套餐当天等）：既不推算，也不生成负数已用
+const ccOverNominal = parseCommandCodeCredits(
+  { credits: { monthlyCredits: 80 } },
+  { data: { planId: 'individual-goat' } },
+)
+const ccOverNominalMonth = ccOverNominal.windows.find((win) => win.window === 'monthly')
+assert.equal(ccOverNominalMonth.usedPercent, undefined, '剩余超过名义额度时不得反推出负数已用')
+assert.equal(ccOverNominalMonth.remaining, 80, '剩余照实显示')
+
+// 端到端（注入 fetch）：三个接口都要真的发出去，月度百分比随之出现——
+// 只调 credits 那一个接口，正是「月度永远 0%」的成因。
+const ccRequests = []
+const ccService = new plansModule.PlansService({
+  credentials: () => ({
+    resolve: async (ref) => (ref === 'COMMAND_CODE_API_KEY'
+      ? { value: 'user_cc_e2e_0123456789', source: 'file' }
+      : undefined),
+  }),
+  prefs: async () => ({ plansEnabled: true }),
+  env: {},
+  fetchImpl: async (url, init) => {
+    ccRequests.push({ url, auth: init?.headers?.authorization })
+    const json = (body) => new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+    if (url.endsWith('/alpha/billing/credits')) {
+      return json({
+        credits: { monthlyCredits: 65.5512769625, freeCredits: 0, purchasedCredits: 0 },
+        windowLimits: { fiveHour: { used: 0.09, cap: 14, resetAt: 1_789_880_547_252 } },
+      })
+    }
+    if (url.endsWith('/alpha/billing/subscriptions')) {
+      return json({ success: true, data: { planId: 'individual-goat', currentPeriodEnd: '2026-10-14T12:26:13.000Z' } })
+    }
+    if (url.endsWith('/alpha/usage/summary')) return json({ totalMonthlyCredits: 4.429013998500001 })
+    return new Response('{}', { status: 404 })
+  },
+})
+const ccEnd = (await ccService.read({ refresh: true })).providers.find((item) => item.id === 'commandcode')
+assert.equal(ccEnd.ok, true, `Command Code 应取数成功：${JSON.stringify(ccEnd)}`)
+assert.equal(ccEnd.plan, 'GOAT', '卡片上的套餐徽标应显示 GOAT')
+assert.equal(ccEnd.planId, 'individual-goat')
+const ccEndMonth = ccEnd.windows.find((win) => win.window === 'monthly')
+assert.equal(ccEndMonth.usedPercent, 6.33, `端到端月度百分比应算出来，实际 ${ccEndMonth.usedPercent}`)
+assert.ok(ccRequests.some((item) => item.url.endsWith('/alpha/usage/summary')),
+  '必须请求用量汇总接口——少了它月度只有剩余余额，界面就只能显示 —')
+assert.ok(ccRequests.some((item) => item.url.endsWith('/alpha/billing/subscriptions')),
+  '必须请求订阅接口拿 planId')
+// 隐私：Key 只能出现在 Authorization 头里，响应体里一个字节都不能有
+assert.ok(!JSON.stringify(ccEnd).includes('user_cc_e2e_0123456789'), '响应里泄露了 Command Code Key')
+assert.ok(ccRequests.every((item) => String(item.auth ?? '').startsWith('Bearer ')),
+  'Command Code 的鉴权必须是 Bearer 头')
 
 // 打码：不得还原出密钥，且短值整体打码
 assert.equal(maskSecret('sk-abcdefghijklmnop'), '…mnop', '长密钥只露尾 4 位')

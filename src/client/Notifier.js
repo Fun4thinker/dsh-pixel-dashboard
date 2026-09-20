@@ -33,9 +33,11 @@ import {
   composeInteraction,
   composeNotice,
   composeQuotaAlert,
+  conversationOnScreen,
   fetchNotices,
   permissionOf,
   quotaAlerts,
+  shouldStayQuiet,
 } from './notify.js'
 import { fetchPlans } from './plans.js'
 
@@ -472,7 +474,10 @@ export class NotifierRuntime {
       }
       for (const notice of fresh) {
         if (!this.#enabled(notice.category === 'done' ? 'notifyDone' : 'notifyError')) continue
-        if (this.#quiet(notice)) continue
+        if (this.#quiet(notice)) {
+          this.#noteQuiet(notice)
+          continue
+        }
         this.#fire(composeNotice(notice), notice.category)
       }
     } catch (error) {
@@ -531,18 +536,48 @@ export class NotifierRuntime {
   /**
    * 这条会话结束通知是否应当**不打扰**。
    *
-   * 判据是「页面正被看着」且「就是当前选中的会话」——两者同时成立才跳过。
-   * 只判焦点会漏掉「浏览器开着、正在看别的会话」；只判会话会漏掉「切到别的
-   * 标签页干别的事」。
+   * 判据是「页面正被看着」且「就是当前选中的会话」且「那条会话的界面确实在屏幕上」。
+   * 只判焦点会漏掉「浏览器开着、正在看别的会话」；只判会话会漏掉「切到别的标签页
+   * 干别的事」。
+   *
+   * 第三条（界面在屏幕上）原先漏了，而那正是用户报的**漏提醒**：`list.current`
+   * 是**持久化的选中项**，不是「屏幕上是什么」。主区停在「用量看板」这类全局面板
+   * 上时会话界面整个不挂载，`current` 却仍停在上次那条会话上，于是那条会话完成
+   * 时提醒被静默吞掉。判定细节与「判不出来就不静默」的理由见
+   * {@link shouldStayQuiet} / {@link conversationOnScreen}。
    * @param {object} notice - 宿主通知记录。
    * @returns {boolean} 是否跳过。
    */
   #quiet(notice) {
-    if (this.config?.notifyQuietFocused === false) return false
-    const doc = this.scope?.document
-    if (doc?.hasFocus?.() !== true) return false
-    const current = this.sessions?.()?.list?.getSnapshot?.()?.current
-    return current !== undefined && String(current) === String(notice?.sessionId ?? '')
+    return shouldStayQuiet(notice, {
+      config: this.config,
+      focused: this.scope?.document?.hasFocus?.() === true,
+      current: this.sessions?.()?.list?.getSnapshot?.()?.current,
+      onScreen: conversationOnScreen(this.scope?.document),
+    })
+  }
+
+  /**
+   * 记下一条**被刻意静默**的提醒。
+   *
+   * 静默不等于「当它没发生」。用户报的正是「漏了很多通知」——而一条**悄悄消失**
+   * 的提醒与一条**从未产生**的提醒在界面上完全一样，用户无从判断是功能坏了还是
+   * 本来就没有。因此被静默的提醒照样落进「最近通知」，只是不带系统通知、也不弹
+   * 页面内提示条（那两样正是「不打扰」要避免的）。
+   *
+   * 这条记录本身就是「降级不静默」那条口径的落点：任何时候少了一条弹窗，用户都能
+   * 在面板里看到它、知道它为什么没弹。
+   * @param {object} notice - 宿主通知记录。
+   */
+  #noteQuiet(notice) {
+    const spec = composeNotice(notice)
+    this.store.pushRecent({
+      at: Date.now(),
+      category: 'quiet',
+      ...spec,
+      // 面板据此把这行标成「静默」，而不是让用户以为它本该弹却没弹。
+      quiet: true,
+    })
   }
 
   /**

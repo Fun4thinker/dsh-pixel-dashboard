@@ -53,7 +53,7 @@ export const NOTIFY_FLAGS = [
   { key: 'notifyInteraction', label: '等待授权 / 回答', hint: '需要你点授权，或 AI 提问等你回答时提醒' },
   { key: 'notifyBalance', label: '余额预警', hint: '账户余额低于下面设定的阈值时提醒' },
   { key: 'notifyQuota', label: '套餐额度预警', hint: '任一套餐窗口已用比例达到阈值时提醒' },
-  { key: 'notifyQuietFocused', label: '当前会话不打扰', hint: '正在看的那个会话完成时不弹通知，避免自己吓自己' },
+  { key: 'notifyQuietFocused', label: '当前会话不打扰', hint: '你正开着、正看着的那个会话跑完时不弹通知，避免自己吓自己；别的会话照常提醒' },
 ]
 
 /** 浏览器通知权限的展示文案。 */
@@ -62,6 +62,32 @@ export const PERMISSION_TEXT = {
   denied: '已被浏览器拒绝，请在地址栏左侧的站点设置里重新允许',
   default: '尚未授权，点击右侧按钮申请',
   unsupported: '当前环境没有 Notification API（可能是非安全上下文），只能用页面内提示',
+}
+
+/**
+ * 「最近通知」里给**被静默**那条加的尾注。
+ *
+ * 单独放这里而不是写死在面板里：运行时写入的 `quiet` 标记与面板展示的这句话是
+ * 同一件事的两半，两边各写一份就会出现「标了 quiet 但界面不说明」这种半截状态。
+ * 闸门也对它断言，因此改了文案就必须同步改测试——不会静默漂移。
+ */
+export const QUIET_MARK = '（已静默，未弹窗）'
+
+/**
+ * 「最近通知」里某一行的正文。
+ *
+ * 抽成纯函数是为了让闸门能直接断言它——面板把「最近通知」默认收起，
+ * 整页静态渲染根本到不了这一块（`Collapse` 收起时**不渲染**内容），
+ * 写死在 JSX 里的文案就等于永远没被验过。
+ * @param {object} item - `store.recent` 里的一项。
+ * @returns {string} 行正文。
+ */
+export function composeRecentLine(item) {
+  const title = String(item?.title ?? '')
+  const body = item?.body === undefined || item.body === '' ? '' : ` — ${String(item.body)}`
+  // 被「当前会话不打扰」静默的那条照样列出来，并明说它没弹：否则用户看到的是
+  // 「有个会话完成了却什么都没发生」，只会以为功能漏了提醒。
+  return `${title}${body}${item?.quiet === true ? QUIET_MARK : ''}`
 }
 
 /**
@@ -79,6 +105,86 @@ export function permissionOf(scope = globalThis) {
   if (typeof Notification !== 'function') return 'unsupported'
   const value = Notification.permission
   return value === 'granted' || value === 'denied' ? value : 'default'
+}
+
+/**
+ * 会话界面的 DOM 锚点：DSH 的 `ConversationRoot` 把这个属性打在滚动容器上。
+ *
+ * 用它而不是某个 CSS 类名（类名是压缩产物，一升级就变），也不用
+ * `list.current`——**「选中了哪条会话」与「屏幕上是什么」是两件事**，
+ * 见 {@link shouldStayQuiet}。
+ */
+export const CONVERSATION_ANCHOR_SELECTOR = '[data-conversation-scroll]'
+
+/** 主区被某个浮层占满时的标记：会话界面还在 DOM 里，但用户看不见它。 */
+export const FULLSCREEN_OVERLAY_SELECTOR = '[data-rightbar-fullscreen]'
+
+/**
+ * 「会话界面此刻真的在屏幕上吗」。
+ *
+ * ## 为什么要问这一句
+ *
+ * DSH 的主区是**一个 keyed 槽位**（`renderSlot('main', {}, { entryKey: panelId ?? 'conversation' })`）：
+ * 选中「用量看板」这类全局面板时，会话界面**整个不挂载**——而
+ * `sessions.list.current` 仍然停在上次选中的那条会话上。
+ *
+ * 于是只比较 `current` 就会得出「他正在看这条会话」的错误结论，把提醒静默吞掉。
+ * 用户正在看**看板**时收到「别的会话完成了」本该弹的提醒，表现就是「漏提醒」。
+ *
+ * ## 判不出来时一律返回 false（= 不静默）
+ *
+ * 少静默一次最多是「你盯着它跑完，通知和界面同时响」这种轻微打扰；多静默一次
+ * 则是**一条永远不会被看见的提醒**。两者不对称，所以任何读不出来的情况
+ * （没有 `document`、选择器被上游改掉、查询抛错）都必须落到「不静默」那一侧。
+ * @param {object} [doc] - `document` 之类能 querySelector 的对象。
+ * @returns {boolean} 会话界面是否确实在屏幕上。
+ */
+export function conversationOnScreen(doc) {
+  if (typeof doc?.querySelector !== 'function') return false
+  try {
+    // 浮层占满主区时会话界面并没有被卸载，只是被盖住了——对用户而言同样是「没在看」。
+    if (doc.querySelector(FULLSCREEN_OVERLAY_SELECTOR) !== null) return false
+    return doc.querySelector(CONVERSATION_ANCHOR_SELECTOR) !== null
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 这条会话结束提醒是否应当**不打扰**。
+ *
+ * 四个条件**同时**成立才跳过，缺一个就照常提醒：
+ *
+ *   1) 开关开着（默认开着）；
+ *   2) 页面确实有焦点——否则用户切去了别的标签页 / 别的应用，正是最该提醒的时候；
+ *   3) 这条提醒说的**就是**当前选中的那条会话；
+ *   4) 那条会话的界面**真的在屏幕上**（见 {@link conversationOnScreen}）。
+ *
+ * 第 4 条是后补的，也正是原先漏掉的一条：只比 `current` 会把「主区停在看板上」
+ * 误判成「正在看这条会话」，于是那条会话完成时提醒被静默吞掉。
+ *
+ * 纯函数：所有环境读数由调用方取好传进来，因此闸门可以逐条钉住这四件事。
+ * @param {object} notice - 宿主通知记录。
+ * @param {object} view - 当前视图事实。
+ * @param {object|undefined} view.config - 通知配置。
+ * @param {boolean} view.focused - 页面是否有焦点。
+ * @param {unknown} view.current - 当前选中的会话 id。
+ * @param {boolean} view.onScreen - 会话界面是否在屏幕上。
+ * @returns {boolean} 是否跳过这条提醒。
+ */
+export function shouldStayQuiet(notice, view) {
+  // 配置还没到手时**不静默**：`undefined` 是「还没读到用户设置」，不是「用户开了它」。
+  // 生产路径上此时 `#enabled` 已经先一步跳过（没配置就一律不派发），这一条只是把
+  // 契约钉死，免得日后有人绕过 `#enabled` 直接调它。
+  if (view?.config === undefined) return false
+  if (view.config.notifyQuietFocused === false) return false
+  if (view?.focused !== true) return false
+  const sessionId = String(notice?.sessionId ?? '')
+  // 没有会话 id 的提醒（余额 / 套餐阈值）不属于任何会话，谈不上「正在看它」。
+  if (sessionId === '') return false
+  const current = view?.current
+  if (current === undefined || String(current) !== sessionId) return false
+  return view?.onScreen === true
 }
 
 /**

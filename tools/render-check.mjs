@@ -770,6 +770,128 @@ must(
   throwing.dispose()
 }
 
+// 9d) 「当前会话不打扰」必须**只**静默屏幕上那一条会话的提醒。
+//
+// 用户报的问题：「开启后遗漏了很多通知」。根因是旧判据只比 `sessions.list.current`
+// ——而它是**持久化的选中项**，不是「屏幕上是什么」。主区是 keyed 槽位
+// （`renderSlot('main', {}, { entryKey: panelId ?? 'conversation' })`），停在
+// 「用量看板」这类全局面板时**会话界面整个不挂载**，`current` 却仍停在上次那条
+// 会话上，于是它完成时提醒被静默吞掉。因此判据必须含「界面真的在屏幕上」。
+{
+  const { NotifierRuntime } = await import(pathToFileURL(join(root, 'lib', 'client', 'Notifier.js')).href)
+  const { shouldStayQuiet, conversationOnScreen, CONVERSATION_ANCHOR_SELECTOR } = notifyModule
+
+  // ── 纯函数层：四个条件逐个钉死，缺任何一个都不许静默 ──────────────
+  const view = { config: { notifyQuietFocused: true }, focused: true, current: 'session-A', onScreen: true }
+  const noticeA = { sessionId: 'session-A', category: 'done' }
+  must(shouldStayQuiet(noticeA, view) === true, '四个条件都成立时应静默（你正盯着那条会话跑完）')
+  must(shouldStayQuiet(noticeA, { ...view, focused: false }) === false,
+    '页面没有焦点时不得静默——切去别的标签页正是最该提醒的时候')
+  must(shouldStayQuiet({ sessionId: 'session-B' }, view) === false,
+    '**别的会话**完成时绝不许静默——这正是用户报的「漏提醒」，也是本块存在的理由')
+  must(shouldStayQuiet(noticeA, { ...view, onScreen: false }) === false,
+    '会话界面不在屏幕上时不得静默（主区停在看板 / 全屏浮层盖住）')
+  must(shouldStayQuiet(noticeA, { ...view, config: { notifyQuietFocused: false } }) === false,
+    '开关关掉后一律不静默')
+  must(shouldStayQuiet({ sessionId: '' }, view) === false,
+    '没有会话 id 的提醒（余额 / 套餐阈值）不属于任何会话，不该被静默')
+  must(shouldStayQuiet(noticeA, { ...view, current: undefined }) === false,
+    '没有选中会话时不得静默')
+  must(shouldStayQuiet(noticeA, { ...view, config: undefined }) === false,
+    '配置还没到手时不得静默——「没读到设置」不等于「用户开了它」')
+
+  // 判不出来时必须落到「不静默」。两者代价不对称：少静默一次只是轻微打扰，
+  // 多静默一次是一条**永远不会被看见**的提醒。
+  must(conversationOnScreen(undefined) === false, '没有 document 时判为「不在屏幕上」→ 不静默')
+  must(conversationOnScreen({}) === false, 'document 没有 querySelector 时判为「不在屏幕上」→ 不静默')
+  must(conversationOnScreen({ querySelector: () => { throw new Error('boom') } }) === false,
+    'querySelector 抛错时必须落到「不静默」——读不出来就不许吞提醒')
+  must(conversationOnScreen({ querySelector: (sel) => (sel === '[data-conversation-scroll]' ? {} : null) }) === true,
+    '会话锚点存在时应判为「在屏幕上」')
+  must(conversationOnScreen({ querySelector: (sel) => (sel === '[data-rightbar-fullscreen]' ? {} : {}) }) === false,
+    '全屏浮层盖住主区时会话界面虽还在 DOM 里，但用户看不见，必须判为「没在看」')
+
+  // ── 运行时层：同一个判定必须真的作用在派发路径上 ──────────────────
+  /** 造一个运行时并驱动一轮日志轮询，返回弹了哪些通知、记了哪些最近通知。 */
+  async function runQuiet({ current, anchor, events }) {
+    const fired = []
+    function QuietNotification(title, options) { fired.push({ title, ...options }) }
+    QuietNotification.permission = 'granted'
+    const doc = {
+      hasFocus: () => true,
+      // 只有「会话锚点」这一条选择器会被命中；其余（含浮层标记）返回 null。
+      querySelector: (sel) => (sel === CONVERSATION_ANCHOR_SELECTOR && anchor ? {} : null),
+      createElement: (tag) => fakeElement(tag),
+      getElementById: () => null,
+      body: { appendChild: (child) => child },
+    }
+    const store = new NotifyStore()
+    const runtime = new NotifierRuntime({
+      store,
+      uiSession: () => undefined,
+      sessions: () => ({ list: { getSnapshot: () => ({ current }) } }),
+      scope: { Notification: QuietNotification, document: doc },
+    })
+    store.setConfig({ ...NOTIFY_CONFIG_STUB })
+    // 游标记为已知，这样首轮不会走「只学游标」的分支，事件会真的被派发。
+    runtime.seen.cursor = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ config: NOTIFY_CONFIG_STUB, cursor: 2, events, dropped: false }),
+      text: async () => '',
+    })
+    try {
+      await runtime.pollNotices()
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    runtime.dispose()
+    return { fired, recent: store.recent }
+  }
+
+  const doneA = { id: 1, at: Date.now(), sessionId: 'session-A', workspace: 'demo', turn: 1, category: 'done', level: 'ok', label: '已完成' }
+  const doneB = { id: 2, at: Date.now(), sessionId: 'session-B', workspace: 'demo', turn: 1, category: 'done', level: 'ok', label: '已完成' }
+
+  // (a) 正在看 A（会话界面在屏幕上）：A 不弹，B 照弹
+  const watching = await runQuiet({ current: 'session-A', anchor: true, events: [doneA, doneB] })
+  const watchingTags = watching.fired.map((item) => item.tag)
+  must(!watchingTags.includes('dsh-pixel-session-A-1'),
+    `正在看的那条会话完成时不应弹通知，实际弹了 ${JSON.stringify(watchingTags)}`)
+  must(watchingTags.includes('dsh-pixel-session-B-1'),
+    `别的会话完成时**必须**弹通知（用户报的就是这条漏了），实际弹了 ${JSON.stringify(watchingTags)}`)
+  must(watching.recent.some((item) => item.sessionId === 'session-A' && item.quiet === true),
+    '被静默的提醒仍必须记进「最近通知」并标 quiet——悄悄消失的提醒与从未产生的提醒在界面上无法区分')
+  must(watching.recent.some((item) => item.sessionId === 'session-B' && item.quiet !== true),
+    '正常弹过的那条不该被打上 quiet 标记')
+
+  // (b) **回归本体**：还是选中 A，但主区停在看板上（会话界面没挂载）→ A 也必须弹。
+  //     旧实现只比 current，这一条会失败，而它正是用户感受到的「漏提醒」。
+  const onPanel = await runQuiet({ current: 'session-A', anchor: false, events: [doneA] })
+  must(onPanel.fired.some((item) => item.tag === 'dsh-pixel-session-A-1'),
+    '停在「用量看板」时，选中的那条会话完成必须弹通知——'
+    + '会话界面这时根本没挂在屏幕上，静默它就是用户报的漏提醒')
+  must(onPanel.recent.every((item) => item.quiet !== true),
+    '会话界面不在屏幕上时不该产生任何「已静默」记录')
+
+  // (c) 被静默的那条必须在面板里**看得出来**。
+  //     「最近通知」默认收起（收起时内容不渲染），整页静态渲染到不了这里，
+  //     所以直接断言这份行文案的纯函数。
+  must(typeof notifyModule.composeRecentLine === 'function',
+    'composeRecentLine 应被导出（否则这行文案永远没被断言过）')
+  const quietLine = notifyModule.composeRecentLine({ title: 'demo · 已完成', body: '第 1 轮', quiet: true })
+  must(quietLine.includes(notifyModule.QUIET_MARK),
+    `被静默的行必须标出「没弹窗」，否则用户无法区分「静默了」与「功能漏了」：${quietLine}`)
+  const loudLine = notifyModule.composeRecentLine({ title: 'demo · 已完成', body: '第 1 轮' })
+  must(!loudLine.includes(notifyModule.QUIET_MARK),
+    `正常弹过的那行不该标「已静默」：${loudLine}`)
+  must(loudLine.includes('demo') && loudLine.includes('第 1 轮'),
+    `行文案必须同时带标题与正文：${loudLine}`)
+  must(notifyModule.composeRecentLine({ title: 'x' }) === 'x',
+    '没有正文时不该留下多余的分隔符')
+}
+
 // 9b) 授权行的**三种状态必须措辞不同**，且各自的下一步动作不同。
 //     这条来自用户的实感：「我点了申请授权，还是说我没授权」——混成一句「未授权」
 //     会让人反复点一个不会有任何反应的按钮（unsupported 下申请授权是无效动作，
@@ -1448,12 +1570,14 @@ must(periodTitle(undefined) === '用量看板', '拿不到相位时应退回原�
   must(!iconOnly.includes('px-period-dot'), 'PanelEntryView 只出图标，环由容器 portal')
 }
 
-// ── token 单位阶梯：K / M / B，不用中文「万 / 亿」────────────────────
-// 这套界面里的数字几乎全是 token，而 token 的**通用单位**就是 K / M / B：
-// 模型文档写「128K 上下文」「1M tokens」，写成「1.40 亿」要先在脑子里换成
-// 140M 才能与文档对上。闸门把台阶与两个边界钉死：
+// ── token 单位阶梯：K / M / 亿，只有 M 用英文 ────────────────────────
+// K 与 M 保留英文：模型文档写「128K 上下文」「1M tokens」，用同一套单位读者不必
+// 二次换算。十亿档改用中文「亿」——但**「亿」是 10⁸，`B` 是 10⁹，不是同一个数**，
+// 所以这一档的阈值必须跟着换成 1e8，否则同一个数字会平白差一个数量级。
+// 闸门把台阶与三个边界钉死：
 //   1. **进位后跨阈值要升档**（999_999 不能显示成 1000.0K）；
-//   2. **绝不出现中文万/亿**——换回去会让这条直接失败。
+//   2. **M → 亿 的比值是 100 而不是 1000**（99_999_999 要显示 1.00亿，不是 100.00M）；
+//   3. **绝不出现中文「万」**——那是被明确去掉的单位。
 {
   const { formatTokens } = await import(
     pathToFileURL(join(root, 'lib', 'client', 'format.js')).href
@@ -1461,27 +1585,35 @@ must(periodTitle(undefined) === '用量看板', '拿不到相位时应退回原�
   const expected = [
     [0, '0'], [1, '1'], [999, '999'],
     [1000, '1.0K'], [1500, '1.5K'], [12345, '12.3K'], [99999, '100.0K'],
-    [1_000_000, '1.00M'], [1_234_567, '1.23M'], [617_283_945, '617.28M'],
-    [1_000_000_000, '1.00B'], [1_395_646_416, '1.40B'],
-    // 边界：四舍五入会把尾数推到 1000，必须升到上一档而不是显示 1000.0K / 1000.00M
+    [1_000_000, '1.00M'], [1_234_567, '1.23M'],
+    [100_000_000, '1.00亿'], [617_283_945, '6.17亿'],
+    [1_000_000_000, '10.00亿'], [1_395_646_416, '13.96亿'],
+    // 边界：四舍五入会把尾数推到下一档起点，必须升档而不是显示 1000.0K / 100.00M
     [999_999, '1.00M'],
-    [999_999_999, '1.00B'],
+    [99_999_999, '1.00亿'],
+    [999_999_999, '10.00亿'],
     // 负数（脏数据）也要按同一套走，不能崩
     [-1_234_567, '-1.23M'],
+    [-1_395_646_416, '-13.96亿'],
   ]
   for (const [input, want] of expected) {
     must(formatTokens(input) === want,
       `formatTokens(${input}) 应为 ${want}，实际 ${formatTokens(input)}`)
   }
-  // 逐个数量级检查：任何输出都不得含中文万/亿，也不得出现 NaN / undefined
+  // 「亿」这一档必须真的出现，且 M 这一档必须仍在：只有 B 换成了中文，K/M 不动
+  must(expected.some(([, text]) => text.includes('亿')), 'token 十亿档应使用中文「亿」')
+  must(expected.some(([, text]) => text.includes('M')), 'M 档应保留英文写法')
+  must(expected.some(([, text]) => text.includes('K')), 'K 档应保留英文写法')
+  // 逐个数量级检查：任何输出都不得含中文万，也不得出现遗留的 B 后缀
   for (const [, text] of expected) {
-    must(!/万|亿/.test(text), `token 单位不得用中文万/亿：${text}`)
+    must(!/万/.test(text), `token 单位不得用中文「万」：${text}`)
+    must(!/B$/.test(text), `token 单位不再使用 B 后缀（应为亿）：${text}`)
   }
   for (const dirty of [undefined, null, NaN, Infinity, -Infinity, 'abc', {}]) {
     const text = formatTokens(dirty)
     must(!/NaN|Infinity|undefined/.test(text),
       `脏输入不得渲染出 NaN/Infinity/undefined：${String(dirty)} → ${text}`)
-    must(!/万|亿/.test(text), `脏输入也不得回落到中文单位：${String(dirty)} → ${text}`)
+    must(!/万/.test(text), `脏输入也不得回落到中文「万」：${String(dirty)} → ${text}`)
   }
   // 整数档（< 1000）不补小数位：`999` 而不是 `999.0`
   must(formatTokens(999) === '999', '不足 1000 时不该补小数位')
@@ -1789,6 +1921,33 @@ must(wOver.percent !== wOver.barPercent || wOver.over === true, '超限信息不
 // 负数百分比没有意义，应挡掉
 must(windowProgress({ usedPercent: -5 }).percent === 0, '负百分比应归零')
 
+// ── 「百分比未知」不是 0 ────────────────────────────────────────
+// 用户报过：套餐配好了、5 小时与每周都正常，**只有月度永远是 0.0%**。
+// 成因是官方对月度只报了余额（没有已用、没有总额），而这里早先写的是
+// `percent = hasPercent ? usedPercent : 0`——把「不知道」画成了「一点没用」。
+// 现在必须报 `percentKnown: false`，界面据此显示 —（而不是 0.0%）。
+const wRemainingOnly = windowProgress({
+  window: 'monthly', label: '每月', remaining: 65.55, note: '月度总额按套餐名义额度（$70）推算',
+})
+must(wRemainingOnly.usable === true, '只有余额时窗口仍可用（余额与重置时间都要显示）')
+must(wRemainingOnly.percentKnown === false, '只有余额时百分比必须标成未知，不能兜底成 0')
+must(wRemainingOnly.barPercent === 0, '未知百分比不画条')
+must(wRemainingOnly.remainingText === '65.55', `剩余余额要照实显示，实际 ${wRemainingOnly.remainingText}`)
+must(wRemainingOnly.note.includes('名义额度'), 'note 必须透传给界面（说明为什么没有百分比）')
+// 官方只报了余额、连 note 都没有时，界面也要能说清是「不知道」而不是「没用」
+must(windowProgress({ window: 'monthly', remaining: 12 }).percentKnown === false,
+  '没有 note 的「只有余额」窗口同样不得被当成 0%')
+// 有绝对值、只是没给百分比字段：自己算，不该掉进「未知」
+must(windowProgress({ used: 30, total: 100 }).percentKnown === true, '有绝对值就应算出百分比')
+must(windowProgress({ used: 30, total: 100 }).percent === 30, '30/100 应算成 30%')
+// `Number(null)` 与 `Number('')` 都等于 0：字段缺失时不得变成「已用 0 / 总额 0」
+const wNullFields = windowProgress({ used: null, total: null, remaining: null, usedPercent: null })
+must(wNullFields.usable === false, 'null 字段必须当成缺失，不能变成 0')
+must(wNullFields.percentKnown === false, 'null 字段不得被算成 0%')
+must(windowProgress({ used: '', total: '', remaining: '' }).usable === false, '空串字段同样算缺失')
+// 总额为 0 时不能拿去做除法（会得到 Infinity/NaN）
+must(windowProgress({ used: 0, total: 0 }).percentKnown === false, '总额为 0 时不画百分比')
+
 // 色调阈值
 must(quotaTone(10, false) === 'green', '低占用应是绿色')
 must(quotaTone(80, false) === 'yellow', '80% 应是黄色')
@@ -1871,6 +2030,19 @@ const tightest = tightestWindow(planPayload)
 must(tightest !== undefined, '应能找出最紧窗口')
 must(tightest.percent === 61.8, `最紧窗口应是智谱 5 小时（61.8%），实际 ${tightest?.percent}`)
 must(tightestWindow({ providers: [] }) === undefined, '没有数据时应返回 undefined')
+// 百分比未知的窗口不参与「最紧」：它的深度没法比，选出来只会让徽标显示一个假数字
+must(tightestWindow({
+  providers: [{ id: 'cc', name: 'Command Code', ok: true, windows: [{ window: 'monthly', remaining: 65.55 }] }],
+}) === undefined, '全是「未知百分比」的窗口时，不应选出一个假的 0%')
+const mixedTight = tightestWindow({
+  providers: [{
+    id: 'cc',
+    name: 'Command Code',
+    ok: true,
+    windows: [{ window: 'monthly', remaining: 65.55 }, { window: 'weekly', used: 5, total: 35 }],
+  }],
+})
+must(mixedTight?.window?.window === 'weekly', '应跳过未知的那个，选中能算出百分比的窗口')
 
 // 看板：带上套餐数据渲染，断言卡片与进度条都出现
 const plansHtml = renderToStaticMarkup(React.createElement(View, {
@@ -1897,6 +2069,46 @@ must(plansHtml.includes('AccessKey'), '套餐面板应说明火山要的是 Acce
 must(plansHtml.includes('commandcode.ai/studio'), '套餐面板应给出 Command Code 管理入口')
 must(plansHtml.includes('console.volcengine.com'), '套餐面板应给出火山控制台入口')
 must(plansHtml.includes('platform.deepseek.com/usage'), '余额面板应给出 DeepSeek 官方用量/充值入口')
+
+// ── 卡片上的「未知百分比」：显示 — 与原因，绝不显示 0.0% ──────────
+// 这一块是用户报的那个 bug 的正面回归：Command Code 的月度窗口只有余额时，
+// 卡片必须说「不知道」，而不是画一条 0.0% 的空条。
+const unknownPercentHtml = renderToStaticMarkup(React.createElement(View, {
+  data: payload,
+  now: payload.generatedAt,
+  refreshing: false,
+  onRefresh: () => {},
+  plans: {
+    enabled: true,
+    providers: [
+      {
+        id: 'commandcode',
+        name: 'Command Code',
+        ok: true,
+        plan: 'GOAT',
+        windows: [
+          { window: 'monthly', label: '每月', remaining: 65.55, note: '月度总额按套餐名义额度（$70）推算' },
+        ],
+      },
+      {
+        id: 'unknownvendor',
+        name: '某家只报余额的厂商',
+        ok: true,
+        windows: [{ window: 'monthly', label: '每月', remaining: 12 }],
+      },
+    ],
+  },
+  onTogglePlans: () => {},
+}))
+must(unknownPercentHtml.includes('GOAT'), '卡片上应显示套餐类型（GOAT），它来自 subscriptions 的 planId')
+must(unknownPercentHtml.includes('65.55'), '只有余额时仍要显示余额')
+must(unknownPercentHtml.includes('名义额度'), 'note 里的原因要显示出来，用户才知道为什么没有百分比')
+must(unknownPercentHtml.includes('官方只报了余额'), '连 note 都没有时，界面也要说清是官方没给已用额度')
+const unknownQuota = extractElement(unknownPercentHtml, '<div class="px-quota">')
+must(unknownQuota !== undefined, '应有额度窗口那一块')
+must(unknownQuota.includes('—'), '百分比未知时应显示 —')
+must(!unknownQuota.includes('0.0%'), `未知百分比绝不能渲染成 0.0%：${unknownQuota}`)
+must(!unknownQuota.includes('px-quota-fill'), '未知百分比不该画进度条（空条看起来像「一点没用」）')
 
 // 没配 Key 的两家：必须给出可读原因，且看板其余部分照常
 const plansEmptyHtml = renderToStaticMarkup(React.createElement(View, {

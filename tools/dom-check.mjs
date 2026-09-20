@@ -561,8 +561,10 @@ const results = []
   const host = window.document.createElement('div')
   window.document.body.appendChild(host)
   const DAYS = 14
-  // 第 5 天：token = 123_456_789 × 5 = 617,283,945 → `617.28M`；金额 ≈ ¥6.17。
+  // 第 5 天：token = 123_456_789 × 5 = 617,283,945 → `6.17亿`；金额 ≈ ¥6.17。
   // 两个断言都落在非零值上，避免在 0 上假通过。
+  // 这个数**故意**落在亿档：它是端到端唯一能看到「亿」这个新单位的地方，
+  // 而亿档正是这轮改动里阈值变过（1e9 → 1e8）的档位。
   const PICK = 5
   await renderInto(host, React.createElement(ActivityCalendar, {
     firstDay: '2026-09-01',
@@ -588,19 +590,22 @@ const results = []
   await settle()
 
   const shown = host.querySelector('.px-heat-tip').textContent
-  // 大数必须按**大模型通用单位**缩略：617,283,945 → `617.28M`。
-  // 这里刻意同时钉住「用了 M」与「没用中文万/亿」两侧——换回万/亿会让这条失败。
-  must(shown.includes('617.28M'),
-    `悬停应把 token 缩略成大模型通用单位 617.28M，实际：${shown}`)
-  must(!shown.includes('亿') && !shown.includes('万'),
-    `token 缩略不得再用中文「万 / 亿」，实际：${shown}`)
+  // 大数必须缩略：617,283,945 落在亿档 → `6.17亿`（阈值 1e8，不是 B 的 1e9）。
+  // 这是端到端唯一能看到「亿」新单位的地方：若阈值忘了跟着后缀一起改，
+  // 它会显示成 `6.17亿` 之外的数（沿用 1e9 会得到 `0.62亿`），这条立刻失败。
+  must(shown.includes('6.17亿'),
+    `悬停应把 token 缩略成 6.17亿，实际：${shown}`)
+  must(!shown.includes('万'),
+    `token 缩略不得使用中文「万」，实际：${shown}`)
+  must(!/\d\s*B\b/.test(shown),
+    `token 缩略不应再出现 B 后缀（十亿档已改用「亿」），实际：${shown}`)
   must(!shown.includes(String(PICK * 123_456_789)),
     `悬停不该显示未缩略的原始 token 数：${shown}`)
   // 消费估计必须出现，且是金额形态
   must(shown.includes('消费估计'), `悬停应显示消费估计，实际：${shown}`)
   must(shown.includes('¥6.17'), `悬停应显示 ¥6.17 这个金额，实际：${shown}`)
   must(shown.includes('次请求') && shown.includes('个会话'), '悬停仍应保留请求数与会话数')
-  results.push('活跃日历悬停：token 缩略成 617.28M（K/M/B 单位）+ 消费估计 ¥6.17')
+  results.push('活跃日历悬停：token 缩略成 6.17亿（K/M 英文 + 亿档）+ 消费估计 ¥6.17')
 }
 
 // ── 7b) 日历缺金额时显示「—」而不是 ¥0 ─────────────────────────────
