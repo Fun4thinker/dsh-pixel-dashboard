@@ -316,16 +316,29 @@ const themeStub = {
   },
 }
 /**
- * 待办交互的可观察量替身（`ctx.uiSession.pendingInteractions`）。
+ * 待办交互的可观察量替身，**新版 `ctx.uiSession.sessionStatus`**。
  *
- * 插件的「等待授权 / 回答」提醒直接订阅它。这里必须给一个**真的**可观察量：
- * 给 undefined 会让那条分支静默跳过，闸门全绿却什么都没测到。
+ * DSH 0.1.6-alpha.2 删掉了 `uiSession.pendingInteractions`，待办改为挂在
+ * `sessionStatus` 那张 `Map<SessionId, SessionStatus>` 的 `pendingInteraction` 上。
+ * 插件必须走新版，因此这里的替身**刻意只提供新版**——若代码回退到旧属性，
+ * 这个替身会让它一条待办都读不到，闸门立刻失败（这正是我们要防的静默失效）。
+ *
+ * 必须给一个**真的**可观察量：给 undefined 会让那条分支静默跳过，闸门全绿却
+ * 什么都没测到。
  */
 const pendingListeners = new Set()
 const pendingSnapshot = new Map()
+/** 会话 id → 待办；测试往里塞，再由下面包装成 SessionStatus 形态。 */
+function statusSnapshotOf() {
+  const out = new Map()
+  for (const [sessionId, interaction] of pendingSnapshot) {
+    out.set(sessionId, { running: false, pendingInteraction: interaction, completionUnread: false })
+  }
+  return out
+}
 const uiSessionStub = {
-  pendingInteractions: {
-    getSnapshot: () => pendingSnapshot,
+  sessionStatus: {
+    getSnapshot: () => statusSnapshotOf(),
     subscribe: (listener) => { pendingListeners.add(listener); return () => { pendingListeners.delete(listener) } },
   },
 }
@@ -949,7 +962,16 @@ must(
   const runtimeStore = new NotifyStore()
   const runtime = new NotifierRuntime({
     store: runtimeStore,
-    uiSession: () => ({ pendingInteractions: { getSnapshot: () => pendingMap, subscribe: () => () => {} } }),
+    // 新版 sessionStatus 形态：待办嵌在每条 SessionStatus 的 pendingInteraction 上
+    uiSession: () => ({
+      sessionStatus: {
+        getSnapshot: () => new Map([...pendingMap].map(([id, interaction]) => [
+          id,
+          { running: false, pendingInteraction: interaction, completionUnread: false },
+        ])),
+        subscribe: () => () => {},
+      },
+    }),
     sessions: () => undefined,
     scope: {
       document: undefined,
@@ -1883,11 +1905,70 @@ const costTable = glmHtml.slice(
   // 费用明细**表**仍然逐提供商成行（用量与额度归属不同，不能合并）
   must(costTable.includes('WorkBuddy 中国区'),
     '费用明细表仍应逐提供商列出用量——那里合并会丢掉归属')
+
+  // ── 自定义单价编辑器必须在页面上（用户要求的「加价不方便」入口）──────
+  //
+  // 早先想给一个价目表里没有的模型补价，唯一的路是改源码再重新构建。这里钉住
+  // 编辑器真的渲染出来、且六个价框齐全——少了它，用户没有任何可用的入口，
+  // 而症状是「那个模型永远显示估算价」，没有任何报错。
+  must(glmHtml.includes('px-price-editor'), '费用明细则下应有自定义单价编辑器')
+  must(glmHtml.includes('自定义单价'), '编辑器标题应写明它能做什么')
+  for (const label of ['模型键', '显示名', '厂商', '缓存命中', '未命中', '输出']) {
+    must(glmHtml.includes(label), `编辑器缺少「${label}」这一项`)
+  }
+  // 空闲 / 高峰必须成对出现：填错档位是这里最可能的错法
+  // 注意匹配要带边界：类名 `px-rate-pairs`（复数容器）也含 `px-rate-pair` 这段子串，
+  // 用不带边界的正则会把容器一起数进来，于是数目永远多一个。
+  must((glmHtml.match(/class="px-rate-pair"/g) ?? []).length === 3,
+    '三个价档（缓存命中 / 未命中 / 输出）各应有一对空闲 / 高峰输入框')
+  // 价目文件的绝对路径要显示出来：用户想一次补一批时，得知道去改哪个文件
+  must(glmHtml.includes('px-price-form'), '编辑器要有实际可用的表单')
+  // 六个数字框挤在三列里，**必须**允许收缩，否则会横向溢出到面板外面。
+  // 两个 min-width 缺一不可：flex 项默认 min-width:auto，会被输入框的固有宽度
+  // （浏览器默认约 20 字符 ≈ 179px）撑住不收缩——实测溢出 66px。
+  must(
+    /\.px-rate-field\s*\{[^}]*min-width:\s*0/.test(css),
+    '单价字段容器必须有 min-width:0，否则输入框的固有宽度会把整行撑出面板',
+  )
+  must(
+    /\.px-input\s*\{[^}]*flex:\s*1 1 0/.test(css),
+    '输入框的 flex basis 必须是 0（写成 auto 会用固有宽度，同样溢出）',
+  )
+
+  // ── 单价行的三列必须**跨行竖直对齐**（用户报的「有的行缩进了」）────────
+  //
+  // 病因是每一行各自算列宽：`repeat(3, minmax(0, auto))` 让「缓存命中 / 未命中 /
+  // 输出」三列的宽度取决于**本行文字长度**。DeepSeek 那行有 ¥0.02 / ¥0.04 这种长
+  // 数字，GLM 那行只有 ¥2 / ¥8 / ¥28，于是三列在行间错开（实测第一列起点
+  // 818 / 911 / 793），看起来就像「有的行缩进了、有的没有」。
+  //
+  // 修法是整张列表定义一组轨道（.px-rate-list 的 grid-template-columns），每行用
+  // subgrid 继承，于是列宽由**全表最宽的那一格**决定。
+  //
+  // 这条只能靠真实排版验证：字符串断言看不出列宽，而 jsdom 不做布局。因此这里读
+  // CSS，确认「列表定义轨道 + 行与价格区都用 subgrid」三件事同时成立——少任何一件，
+  // 列宽就退回各行自算。（真实浏览器里的逐行对齐由 headless 测量另行验证。）
+  const rateListRule = css.match(/.px-rate-list\s*\{[^}]*\}/)?.[0] ?? ''
+  const rateRowRule = css.match(/.px-rate\s*\{[^}]*\}/)?.[0] ?? ''
+  const ratePricesRule = css.match(/.px-rate-prices\s*\{[^}]*\}/)?.[0] ?? ''
+  must(
+    /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto\s+auto\s+auto/.test(rateListRule),
+    '单价列表必须自己定义四列轨道（否则每一行各算一份列宽，列就会在行间错开）',
+  )
+  must(
+    /grid-template-columns:\s*subgrid/.test(rateRowRule),
+    '单价行必须用 subgrid 继承列表的列轨道（否则列宽又变回逐行自算）',
+  )
+  must(
+    /grid-template-columns:\s*subgrid/.test(ratePricesRule),
+    '价格区必须继续用 subgrid 往下继承，三个价格列才会与别的行对齐',
+  )
 }
 
 // ── 订阅套餐额度：纯逻辑 + 看板卡片 + 费用条那一枚 ───────────────
 const {
-  formatQuota, windowProgress, quotaTone, formatReset, providerStatus, hasAnyQuota, tightestWindow,
+  formatQuota, windowProgress, quotaTone, formatReset, formatResetAt, formatResetLine,
+  providerStatus, hasAnyQuota, tightestWindow,
 } = await import(pathToFileURL(join(root, 'lib', 'client', 'plans.js')).href)
 
 // 单位：智谱是积分、Command Code 是美元信用额，数值必须带单位前缀
@@ -1960,6 +2041,25 @@ must(formatReset(RESET_BASE + 3 * 3600_000 + 12 * 60_000, RESET_BASE) === '3 小
 must(formatReset(RESET_BASE + 2 * 86_400_000, RESET_BASE) === '2 天 0 小时后重置', '跨天应显示天数')
 must(formatReset(RESET_BASE - 1000, RESET_BASE) === '即将重置', '已过期应显示即将重置')
 must(formatReset(undefined, RESET_BASE) === undefined, '无时刻时应返回 undefined')
+
+// 重置时刻要同时给**绝对日期**与剩余时间：用户报过「看不出月额度多久后重置」。
+// 只给「还剩 9 天」时还得自己心算日子；月额度这种长周期，日期才是他要的答案。
+must(formatResetAt(Date.parse('2026-10-14T12:26:13.000Z'), 'UTC') === '10/14 12:26',
+  `绝对日期应渲染成 MM/DD HH:MM，实际 ${formatResetAt(Date.parse('2026-10-14T12:26:13.000Z'), 'UTC')}`)
+// 时区必须真的生效：同一时刻在东八区是 20:26，不是 12:26
+must(formatResetAt(Date.parse('2026-10-14T12:26:13.000Z'), 'Asia/Shanghai') === '10/14 20:26',
+  '绝对日期应跟随站点时区，而不是写死 UTC')
+must(formatResetAt(undefined, 'UTC') === undefined, '无时刻时绝对日期应返回 undefined')
+// 时区名损坏（站点配置写错）不该让整块面板崩掉：退回本机时区照常给日期
+must(typeof formatResetAt(Date.parse('2026-10-14T12:26:13.000Z'), 'Bogus/Zone') === 'string',
+  '非法时区名应回落到本机时区，而不是抛错炸掉面板')
+// 合成一句：日期在前、剩余时间在后，避免两处重复说同一件事
+const RESET_AT_UTC = Date.parse('2026-10-14T12:26:13.000Z')
+const resetLine = formatResetLine(RESET_AT_UTC, RESET_AT_UTC - 9 * 86_400_000 - 8 * 3600_000, 'UTC')
+must(resetLine === '10/14 12:26 重置（9 天 8 小时后）', `重置说明应是「日期 + 剩余」，实际 ${resetLine}`)
+must(formatResetLine(RESET_AT_UTC - 1000, RESET_AT_UTC, 'UTC') === '10/14 12:26 重置（即将）',
+  '已到期的重置说明也要带上日期')
+must(formatResetLine(undefined, RESET_BASE, 'UTC') === undefined, '无时刻时整句应为 undefined')
 
 // 状态文案：每种降级都要可读，且要指出该配哪个凭据
 must(providerStatus({ ok: false, reason: 'no-key', keyRef: 'ZHIPU_CODING_API_KEY' }).text.includes('ZHIPU_CODING_API_KEY'),
@@ -2624,6 +2724,71 @@ must(html.includes('user/balance'), '余额面板应标出数据来源端点')
   must(/class="px-plan-chip bad"/.test(planHtmlWithFailures), '失败的那一家应带 bad 标记')
   // 没选过（自动）时跟着**最紧**的那一家走，与费用条那一枚同一条判据
   must(planHtmlWithFailures.includes('px-plan-current'), '自动模式下也应有「当前监看」标记')
+
+  // ── 重置时刻必须真的画在卡片上（用户报「看不出月额度多久后重置」）─────
+  // 宿主修好了 `resetAt`（ISO 的 currentPeriodEnd 此前被静默读成 undefined），
+  // 但那只保证数据到手；**卡片不画出来，用户看到的还是「没有」**。
+  // 这一条从 payload 一路验到 DOM：月度窗口既要绝对日期，也要剩余时间。
+  const NOW_GATE = Date.parse('2026-10-05T04:26:13.000Z')
+  const resetHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: NOW_GATE,
+    timeZone: 'UTC',
+    payload: {
+      enabled: true,
+      providers: [{
+        id: 'commandcode',
+        name: 'Command Code',
+        ok: true,
+        plan: 'GOAT',
+        windows: [{
+          window: 'monthly',
+          label: '每月',
+          used: 6.65,
+          total: 70,
+          remaining: 63.36,
+          usedPercent: 9.5,
+          resetAt: Date.parse('2026-10-14T12:26:13.000Z'),
+        }],
+      }],
+    },
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(resetHtml.includes('10/14 12:26'), '月度卡片必须画出重置的**绝对日期**——「还有几天」还得自己算日子')
+  must(resetHtml.includes('后重置') || resetHtml.includes('后）'), '月度卡片同时要给剩余时间')
+  must(/10\/14 12:26 重置（9 天 8 小时后）/.test(resetHtml),
+    `重置说明应是「日期 + 剩余」，实际片段 ${(resetHtml.match(/\d\d\/\d\d \d\d:\d\d[^<]*/) ?? ['(无)'])[0]}`)
+  // 时区要跟着站点走，而不是写死 UTC：同一时刻在东八区应显示 20:26
+  const resetTzHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: NOW_GATE,
+    timeZone: 'Asia/Shanghai',
+    payload: {
+      enabled: true,
+      providers: [{
+        id: 'commandcode', name: 'Command Code', ok: true,
+        windows: [{ window: 'monthly', label: '每月', usedPercent: 9.5, resetAt: Date.parse('2026-10-14T12:26:13.000Z') }],
+      }],
+    },
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(resetTzHtml.includes('10/14 20:26'), '重置日期必须跟随站点时区（东八区应为 20:26，而不是 12:26）')
+  // 没有 resetAt 的窗口（旧宿主 / 接口没给）不得因此崩掉，也不得编一个日期出来
+  const noResetHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: NOW_GATE,
+    timeZone: 'UTC',
+    payload: {
+      enabled: true,
+      providers: [{
+        id: 'commandcode', name: 'Command Code', ok: true,
+        windows: [{ window: 'monthly', label: '每月', usedPercent: 9.5 }],
+      }],
+    },
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(!/\d\d\/\d\d \d\d:\d\d/.test(noResetHtml),
+    '没有重置时刻时不得编一个日期出来——宁可整句不渲染')
 
   // ── 「去哪拿凭据 + 拿到后放哪」必须在界面上真的出现 ────────────────
   // 用户报过：火山方舟那一栏只说「要 AccessKey」，既没说去哪拿，也没说拿到后

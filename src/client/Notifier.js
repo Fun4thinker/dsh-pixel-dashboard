@@ -7,8 +7,15 @@
  * 设置面板时提醒才生效，这显然不对。因此这里用插件 fiber 上的 effect 起一个
  * 自带定时器的循环，随插件加载而活、随插件卸载而停。
  *
- * 于是也**不需要 React**：待办交互从 `ctx.uiSession.pendingInteractions` 上
- * 直接读快照并订阅（那是 DSH 自己发布的全局可观察量），不必借助 hook。
+ * 于是也**不需要 React**：待办交互从 `ctx.uiSession` 上直接读快照并订阅
+ * （那是 DSH 自己发布的全局可观察量），不必借助 hook。
+ *
+ * **待办的可观察量有两代，必须都认。** DSH 在 `0.1.6-alpha.2` 把待办从
+ * `uiSession.pendingInteractions` 搬进了 `uiSession.sessionStatus`
+ * （`Map<SessionId, {running, pendingInteraction, completionUnread}>`），旧属性被删除。
+ * 而旧代码写的是 `uiSession.pendingInteractions`——属性不存在时可选链会把
+ * 「API 没了」静默吞成 undefined，表现是**授权/提问永远不提醒**，既不报错也无迹象。
+ * 见 {@link NotifierRuntime#pendingSource}。
  *
  * ## 三条数据源与各自的节奏
  *
@@ -399,10 +406,65 @@ export class NotifierRuntime {
    */
   #ensurePendingSubscription() {
     if (this.disposed || this.unsubscribe !== undefined) return
-    const source = this.uiSession?.()?.pendingInteractions
-    if (source === undefined || typeof source.subscribe !== 'function') return
-    this.unsubscribe = source.subscribe(() => { this.readPending() })
+    const found = this.#pendingSource()
+    if (found === undefined || typeof found.observable.subscribe !== 'function') return
+    this.unsubscribe = found.observable.subscribe(() => { this.readPending() })
     this.readPending()
+  }
+
+  /**
+   * 待办可观察量：**新版走 `sessionStatus`，旧版走 `pendingInteractions`**。
+   *
+   * DSH 0.1.6-alpha.2 起把待办搬进了 `uiSession.sessionStatus`：那是一张
+   * `Map<SessionId, SessionStatus>`，每条含 `running` / `pendingInteraction` /
+   * `completionUnread`；原先直接发布待办的 `uiSession.pendingInteractions`
+   * （`Map<SessionId, interaction>`）**已被删除**。
+   *
+   * 为什么两代都认而不是直接改新接口：读不到属性时可选链得到的是 undefined，
+   * 那不是「暂时没有待办」，而是「我们与宿主对不上话」——两者在界面上完全一样
+   * （都不提醒），只认一代就会在对方那一代上永久静默失效。**先新后旧**，因为新版
+   * 是当前契约；旧的只作为还没升上来的宿主回落。
+   * @returns {{observable:object,read:(snapshot:object)=>Array<object>}|undefined} 可观察量与读数方式。
+   */
+  #pendingSource() {
+    const session = this.uiSession?.()
+    if (session === null || session === undefined) return undefined
+    // 新版：值是一层 SessionStatus，待办在它的 pendingInteraction 上
+    const status = session.sessionStatus
+    if (status !== undefined && status !== null && typeof status.getSnapshot === 'function') {
+      return {
+        observable: status,
+        read: (snapshot) => {
+          const out = []
+          snapshot.forEach((value, key) => {
+            const interaction = value?.pendingInteraction
+            if (interaction === undefined || interaction === null) return
+            // 会话 id 以状态表的键为准：它是这份数据的权威来源。待办自身若已带上
+            // 同名字段就原样保留（正常情况两者相同），缺失时才补，避免出现
+            // 「通知点了切不到会话」——那正是这条提醒存在的意义。
+            out.push(typeof interaction.sessionId === 'string' && interaction.sessionId !== ''
+              ? interaction
+              : { ...interaction, sessionId: String(key) })
+          })
+          return out
+        },
+      }
+    }
+    // 旧版：值**就是**那条待办
+    const legacy = session.pendingInteractions
+    if (legacy !== undefined && legacy !== null && typeof legacy.getSnapshot === 'function') {
+      return {
+        observable: legacy,
+        read: (snapshot) => {
+          const out = []
+          snapshot.forEach((interaction) => {
+            if (interaction !== undefined && interaction !== null) out.push(interaction)
+          })
+          return out
+        },
+      }
+    }
+    return undefined
   }
 
   /** 停止工作。插件卸载时调用，必须能把所有定时器与订阅都撤掉。 */
@@ -420,12 +482,11 @@ export class NotifierRuntime {
    * 当前的待办列表（写进 store，并派发尚未提醒过的那些）。
    */
   readPending() {
-    const source = this.uiSession?.()?.pendingInteractions
-    const snapshot = source?.getSnapshot?.()
-    const list = []
-    if (snapshot !== undefined && typeof snapshot.forEach === 'function') {
-      snapshot.forEach((interaction) => { list.push(interaction) })
-    }
+    const found = this.#pendingSource()
+    const snapshot = found?.observable.getSnapshot?.()
+    const list = snapshot !== undefined && typeof snapshot.forEach === 'function'
+      ? found.read(snapshot)
+      : []
     this.store.patch({ pending: list })
     this.#notifyPending()
   }

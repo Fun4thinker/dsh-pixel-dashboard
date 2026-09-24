@@ -182,7 +182,7 @@ function canonicalOf(name) {
  * 因此撞车的形式会从索引里**删除**并记进 `CANONICAL_COLLISIONS`，
  * 由闸门断言它为空；将来真撞上时打包/测试会直接失败，逼人加显式别名。
  */
-const CANONICAL_INDEX = (() => {
+function buildIndex(rates, aliases) {
   const index = new Map()
   const collisions = new Set()
   const add = (name, key) => {
@@ -198,13 +198,132 @@ const CANONICAL_INDEX = (() => {
       index.delete(canonical)
     }
   }
-  for (const key of Object.keys(MODEL_RATES)) add(key, key)
-  for (const [alias, key] of Object.entries(MODEL_ALIASES)) add(alias, key)
+  for (const key of Object.keys(rates)) add(key, key)
+  for (const [alias, key] of Object.entries(aliases)) add(alias, key)
   return { index, collisions }
-})()
+}
 
-/** 规范化后互相冲突的模型名（应为空；非空时闸门会失败）。 */
-export const CANONICAL_COLLISIONS = Object.freeze([...CANONICAL_INDEX.collisions])
+const BUILTIN_INDEX = buildIndex(MODEL_RATES, MODEL_ALIASES)
+
+/** 规范化后互相冲突的**内置**模型名（应为空；非空时闸门会失败）。 */
+export const CANONICAL_COLLISIONS = Object.freeze([...BUILTIN_INDEX.collisions])
+
+/**
+ * 当前生效的价目表：内置表 + 用户补充的条目（见 {@link setCustomRates}）。
+ *
+ * 之所以要一层「视图」而不是直接用 MODEL_RATES：用户想给一个价目表里没有的模型
+ * （比如某个新发布的模型）补一个官方价，不该改源码、更不该重新构建。因此运行时
+ * 可换一整套合并后的表，而 MODEL_RATES 始终是那份**内置**事实，供测试与
+ * 「哪些是内置」的判断使用。
+ */
+let RATES_VIEW = MODEL_RATES
+let ALIASES_VIEW = MODEL_ALIASES
+let INDEX_VIEW = BUILTIN_INDEX
+/** 用户补充的模型键（用于界面标注「自定义价」）。 */
+let CUSTOM_KEYS = new Set()
+
+/** 当前生效的价目表（只读用途）。 */
+export function activeRates() { return RATES_VIEW }
+
+/** 该模型键的价是否来自用户补充（而不是内置表）。 */
+export function isCustomRate(key) { return CUSTOM_KEYS.has(key) }
+
+/**
+ * 校验一份用户补充的价目。
+ *
+ * 用户写的文件是**手写 YAML/JSON**，出错的方式很多（少一个分档、把「元」写成
+ * 「角」、键名拼错）。这里逐条验证并**返回可读原因**，让界面能指出是哪一条
+ * 哪一项有问题——静默忽略一条写错的价，用户会以为插件没生效。
+ * @param {unknown} input - 待校验的原始对象（模型键 → 价目条目）。
+ * @returns {{rates:object,errors:string[]}} 通过的条目与错误清单。
+ */
+export function validateCustomRates(input) {
+  const rates = {}
+  const errors = []
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return { rates, errors: ['顶层需要是一个对象：模型键 → 价目条目'] }
+  }
+  const numberOrError = (value, label, where) => {
+    const amount = Number(value)
+    if (!Number.isFinite(amount) || amount < 0) {
+      errors.push(`${where} 的 ${label} 需要是一个非负数字，实际 ${JSON.stringify(value)}`)
+      return undefined
+    }
+    return amount
+  }
+  for (const [key, entry] of Object.entries(input)) {
+    const where = `模型「${key}」`
+    if (key.trim() === '') { errors.push('存在空的模型键'); continue }
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      errors.push(`${where} 需要是一个对象`)
+      continue
+    }
+    /**
+     * 读一个价字段。**两种写法都认**：
+     *   - 写一个数 → 不分时，高峰与空闲同价；
+     *   - 写 `{ peak, idle }` → 分时，两个值都**照写出来的读**。
+     *
+     * 注意不能按「条目里有没有 idle」去推断是否分时：那个判据会把只写 peak 的
+     * 分时条目静默压成同价（踩过——用户的 { idle: 20, peak: 40 } 被读成两个 40）。
+     * 是否不分时只能由**读出来的三个字段是否两两相等**在最后判定。
+     */
+    const pick = (field) => {
+      const value = entry[field]
+      if (value === null || typeof value !== 'object') {
+        const single = numberOrError(value, field, where)
+        return single === undefined ? undefined : { peak: single, idle: single }
+      }
+      const peak = numberOrError(value.peak ?? value.idle, `${field}.peak`, where)
+      const idle = numberOrError(value.idle ?? value.peak, `${field}.idle`, where)
+      if (peak === undefined || idle === undefined) return undefined
+      return { peak, idle }
+    }
+    const cacheHit = pick('cacheHit')
+    const cacheMiss = pick('cacheMiss')
+    const output = pick('output')
+    if (cacheHit === undefined || cacheMiss === undefined || output === undefined) continue
+    const isFlat = cacheHit.peak === cacheHit.idle
+      && cacheMiss.peak === cacheMiss.idle
+      && output.peak === output.idle
+    rates[key] = {
+      label: typeof entry.label === 'string' && entry.label !== '' ? entry.label : key,
+      vendor: typeof entry.vendor === 'string' ? entry.vendor : '自定义',
+      version: typeof entry.version === 'string' ? entry.version : '',
+      flat: isFlat,
+      ...(entry.tiered === true ? { tiered: true } : {}),
+      cacheHit,
+      cacheMiss,
+      output,
+    }
+  }
+  return { rates, errors }
+}
+
+/**
+ * 应用一份用户补充的价目（覆盖内置同名键，并参与归一）。
+ *
+ * 归一索引必须**重建**：用户新加的键要能被 normalizeModel 认出来，否则那份价
+ * 永远落不到任何一行上——界面上表现为「我明明配了价，金额还是估算」。
+ * @param {object} customRates - 已通过 {@link validateCustomRates} 的条目。
+ * @returns {void}
+ */
+export function setCustomRates(customRates) {
+  const entries = Object.entries(customRates ?? {})
+  if (entries.length === 0) {
+    RATES_VIEW = MODEL_RATES
+    ALIASES_VIEW = MODEL_ALIASES
+    INDEX_VIEW = BUILTIN_INDEX
+    CUSTOM_KEYS = new Set()
+    return
+  }
+  const merged = { ...MODEL_RATES, ...customRates }
+  RATES_VIEW = merged
+  ALIASES_VIEW = MODEL_ALIASES
+  CUSTOM_KEYS = new Set(entries.map(([key]) => key))
+  // 内置索引与用户条目一起重建：两者可能规范化后撞车（如自定义 'glm-53' 撞上
+  // 内置 'glm-5.3'），此时新索引会把这个形式删掉——归一认不出，而不是按错价。
+  INDEX_VIEW = buildIndex(merged, MODEL_ALIASES)
+}
 
 /**
  * 把模型名归一：旧名与带日期的版本名折叠到价目表里的键。
@@ -239,10 +358,10 @@ export function normalizeModel(model) {
 
   /** 精确 / 别名 / 规范化，三种查法依次尝试。 */
   const lookup = (candidate) => {
-    if (MODEL_RATES[candidate] !== undefined) return candidate
-    const alias = MODEL_ALIASES[candidate]
+    if (RATES_VIEW[candidate] !== undefined) return candidate
+    const alias = ALIASES_VIEW[candidate]
     if (alias !== undefined) return alias
-    return CANONICAL_INDEX.index.get(canonicalOf(candidate))
+    return INDEX_VIEW.index.get(canonicalOf(candidate))
   }
 
   const direct = lookup(lower)
@@ -282,7 +401,7 @@ export function normalizeModel(model) {
  * @returns {object} 价目表条目。
  */
 export function ratesOf(model) {
-  return MODEL_RATES[normalizeModel(model)] ?? FALLBACK_RATES
+  return RATES_VIEW[normalizeModel(model)] ?? FALLBACK_RATES
 }
 
 /**
@@ -296,7 +415,7 @@ export function ratesOf(model) {
  */
 export function pricingOf(model) {
   const key = normalizeModel(model)
-  const rates = MODEL_RATES[key]
+  const rates = RATES_VIEW[key]
   if (rates === undefined) {
     return {
       rates: FALLBACK_RATES,
@@ -311,6 +430,9 @@ export function pricingOf(model) {
     rates,
     known: true,
     tiered: rates.tiered === true,
+    // 这一份价来自用户补充的价目文件，而不是内置表：界面据此标注，
+    // 免得「自定义价」看起来像官方内置口径。
+    custom: CUSTOM_KEYS.has(key),
     key,
     label: rates.label,
     vendor: rates.vendor ?? '',

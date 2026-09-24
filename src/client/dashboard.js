@@ -30,7 +30,7 @@ import {
 } from './notify.js'
 import {
   fetchPlans,
-  formatReset,
+  formatResetLine,
   partitionProviders,
   providerChoices,
   providerStatus,
@@ -63,6 +63,7 @@ import {
   TONES,
   toneFill,
 } from './usage.js'
+import { composeRate, draftOf, fetchRates, saveRates } from './rates.js'
 
 const { createElement: h, useCallback, useEffect, useMemo, useRef, useState } = React
 
@@ -435,6 +436,9 @@ export function Dashboard() {
     plansError: plans.error,
     plansBusy: plans.busy,
     onTogglePlans: (enabled) => { toggle('plans', enabled, setPlans, loadPlans) },
+    // 价目改完之后**重新取一次看板**：金额是按价目算出来的，不重取的话
+    // 用户会看到「价改了但金额没变」——那正是最容易让人以为保存失败的现象。
+    onRatesSaved: () => { load(true) },
   })
 }
 
@@ -448,6 +452,7 @@ export function View(props) {
     data, now, refreshing, onRefresh,
     balance, balanceError, balanceBusy, onToggleBalance,
     plans, plansError, plansBusy, onTogglePlans,
+    onRatesSaved,
   } = props
   const [rangeId, setRangeId] = useState('30')
   /**
@@ -651,6 +656,8 @@ export function View(props) {
         selected: selectedPlan,
         onSelect: onSelectPlan,
         compact: true,
+        // 与看板其余时间同一口径（宿主给的站点时区），否则重置日期会与别处差几小时
+        timeZone: data.timezone,
       }))),
 
     // 两张趋势卡片**同行**（.px-trend-row）：它们回答同一段时间里的两个问题
@@ -712,6 +719,9 @@ export function View(props) {
           rangeCost,
           split,
           rangeLabel: range.label,
+          // 自定义价目的状态（路径、条数、错误）交给编辑器展示
+          ratesStatus: data.customRates,
+          onRatesSaved: onRatesSaved,
         }))),
 
     h(Panel, {
@@ -828,14 +838,17 @@ function BalancePanel(props) {
  * **百分比未知时不许显示成 0%**：官方只报了余额的窗口（Command Code 的月度就是
  * 这样）没有已用、没有总额，百分比是未知而不是零。这时数字显示 `—`、进度条不画，
  * 脚注照实说明原因（`window.note`，没有 note 时给一句通用的）。
- * @param {object} props - win / now。
+ *
+ * 重置时刻给**绝对日期 + 剩余时间**两句（见 `formatResetLine`）：月额度这种长周期，
+ * 用户常常要的是「到底哪天到期」，光有「还剩 9 天」还得自己算日子。
+ * @param {object} props - win / now / timeZone。
  * @returns {object} React 元素。
  */
 function QuotaWindow(props) {
-  const { win, now } = props
+  const { win, now, timeZone } = props
   const progress = windowProgress(win)
   const tone = quotaTone(progress.percent, progress.over)
-  const reset = formatReset(win?.resetAt, now)
+  const reset = formatResetLine(win?.resetAt, now, timeZone)
   const parts = []
   if (progress.remainingText !== '—') parts.push(`剩余 ${progress.remainingText}`)
   if (progress.totalText !== '—') parts.push(`总额 ${progress.totalText}`)
@@ -950,11 +963,11 @@ function hasSetupHelp(setup) {
 
 /**
  * 一家厂商的额度区块。
- * @param {object} props - provider / now / current / credentialFile。
+ * @param {object} props - provider / now / current / credentialFile / timeZone。
  * @returns {object} React 元素。
  */
 function ProviderQuota(props) {
-  const { provider, now, current = false, credentialFile } = props
+  const { provider, now, current = false, credentialFile, timeZone } = props
   const status = providerStatus(provider)
   const windows = WINDOW_ORDER
     .map((key) => (provider?.windows ?? []).find((win) => win.window === key))
@@ -996,7 +1009,8 @@ function ProviderQuota(props) {
     h(SetupHelp, { setup, credentialFile, open: needsKey }),
     windows.length === 0
       ? null
-      : h('div', { className: 'px-quota-list' }, windows.map((win) => h(QuotaWindow, { key: win.window, win, now }))),
+      : h('div', { className: 'px-quota-list' },
+        windows.map((win) => h(QuotaWindow, { key: win.window, win, now, timeZone }))),
     // 这一家的入口与这一家的数据源说明并排一行：两者都是「关于这一家」的补充信息，
     // 各占一行会让三家堆出六行来。
     h('p', { className: 'px-plan-foot' },
@@ -1057,7 +1071,7 @@ function PlanSwitcher(props) {
  * @returns {object} React 元素。
  */
 export function PlansPanel(props) {
-  const { payload, error, busy, now, onToggle, selected, onSelect, compact } = props
+  const { payload, error, busy, now, onToggle, selected, onSelect, compact, timeZone } = props
   const enabled = payload?.enabled !== false
   const locked = payload?.lockedByEnv === true
   const providers = Array.isArray(payload?.providers) ? payload.providers : []
@@ -1079,6 +1093,8 @@ export function PlansPanel(props) {
     current: isCurrentPlan(selected, providers, provider.id),
     // 「配到哪」的路径由宿主解析（浏览器拿不到 env），这里只往下传。
     credentialFile: payload?.credentialFile,
+    // 重置时刻要显示成**站点时区**下的日期：与看板其余时间口径一致。
+    timeZone,
   })
 
   return h('div', { className: compact === true ? 'px-account-col' : null },
@@ -1513,6 +1529,180 @@ function entryKeyOf(model) {
 }
 
 /**
+ * 自定义单价编辑器：让用户**不改源码**就能给任意模型补一个官方价。
+ *
+ * ## 为什么需要这个入口
+ *
+ * 新模型发布得很勤，而「我用的模型没有价」的表现是它被标成「估算价」并按 Flash
+ * 兜底折算——数字有、也不报错，只是错的。早先想改对，唯一的路是改源码再重新构建，
+ * 那对使用者不是一个可用的入口。
+ *
+ * ## 两种改法，各给各的
+ *
+ *   - **在界面上加一条**：给常用的一两个模型补价，改完立刻生效；
+ *   - **直接编辑文件**：一次补一批、或想放进版本管理，文件路径就显示在这里。
+ *
+ * 界面只做「整理输入 + 展示宿主回报的错误」，校验与落盘全在宿主那一侧——两处各写
+ * 一份校验，迟早会出现「界面说没问题、宿主却拒绝」这种最难解释的分歧。
+ * @param {object} props - pricing / ratesStatus / onSaved。
+ * @returns {object} React 元素。
+ */
+function PriceEditor(props) {
+  const { pricing, ratesStatus, onSaved } = props
+  const [open, setOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [ok, setOk] = useState('')
+  const [draft, setDraft] = useState(() => ({ model: '', ...draftOf(undefined) }))
+
+  const status = ratesStatus ?? {}
+  const count = Number(status.count ?? 0)
+  const customKeys = Object.keys(status.rates ?? {})
+  const known = Object.keys(pricing?.rates ?? {})
+
+  const update = useCallback((patch) => {
+    setDraft((prev) => ({ ...prev, ...patch }))
+    setError('')
+    setOk('')
+  }, [])
+
+  const save = useCallback(() => {
+    const model = String(draft.model ?? '').trim()
+    if (model === '') { setError('请填模型键（例如 gpt-6-alstra）'); return }
+    const entry = composeRate(draft)
+    if (entry === undefined) {
+      setError('至少填「未命中」或「输出」其中一个价，不然这条价没有意义')
+      return
+    }
+    setSaving(true)
+    setError('')
+    // 与前一份**合并**再整份提交：宿主按整份替换，直接提交一条会把别的价全删掉。
+    const next = { ...(status.rates ?? {}), [model]: entry }
+    saveRates(next)
+      .then((result) => {
+        setOk(`已保存 ${model}，金额会立刻按新价重算`)
+        setDraft({ model: '', ...draftOf(undefined) })
+        onSaved?.(result)
+      })
+      .catch((cause) => { setError(String(cause?.message ?? cause)) })
+      .finally(() => { setSaving(false) })
+  }, [draft, status.rates, onSaved])
+
+  const remove = useCallback((model) => {
+    const next = { ...(status.rates ?? {}) }
+    delete next[model]
+    setSaving(true)
+    setError('')
+    saveRates(next)
+      .then((result) => { setOk(`已移除 ${model}`); onSaved?.(result) })
+      .catch((cause) => { setError(String(cause?.message ?? cause)) })
+      .finally(() => { setSaving(false) })
+  }, [status.rates, onSaved])
+
+  const field = (key, label, hint) => h('label', { className: 'px-rate-field', title: hint },
+    h('span', { className: 'px-rate-field-label' }, label),
+    h('input', {
+      type: 'text',
+      inputMode: 'decimal',
+      className: 'px-input',
+      value: draft[key] ?? '',
+      disabled: saving,
+      onChange: (event) => { update({ [key]: event.target.value }) },
+    }))
+
+  return h('details', {
+    className: 'px-details px-price-editor',
+    open,
+    onToggle: (event) => { setOpen(event.target.open) },
+  },
+  h('summary', null, '自定义单价', count > 0 ? h('span', { className: 'px-badge' }, `已加 ${count} 条`) : null),
+
+  h('p', { className: 'px-muted px-note' },
+    '价目表里没有的模型会被标成「估算价」并暂按 Flash 折算。在这里补一个官方价，'
+    + '金额就会按它重算，也不必再改源码。',
+    status.path === null || status.path === undefined
+      ? '（本机的价目文件路径取不到，界面改动只在本进程内生效）'
+      : h('span', null, ' 价目文件：', h('code', { className: 'px-mono' }, status.path))),
+
+  status.error === undefined ? null : h('p', { className: 'px-balance-state px-error' }, `价目文件读取失败：${status.error}`),
+  Array.isArray(status.errors) && status.errors.length > 0
+    ? h('ul', { className: 'px-price-errors' }, status.errors.map((line) => h('li', { key: line }, line)))
+    : null,
+
+  count === 0 ? null : h('div', { className: 'px-rows' },
+    customKeys.map((key) => h(Row, {
+      key,
+      label: key,
+      value: h('span', { className: 'px-price-remove' },
+        typeof status.rates?.[key]?.label === 'string' ? `${status.rates[key].label} · ` : '',
+        h('button', {
+          type: 'button',
+          className: 'px-btn small',
+          disabled: saving,
+          onClick: () => { remove(key) },
+        }, '移除')),
+    }))),
+
+  // ── 新增一条：模型键 + 三个档位（每档可填空闲 / 高峰两个数）──────────
+  h('div', { className: 'px-price-form' },
+    h('label', { className: 'px-rate-field', title: '与 DSH 里显示的模型名一致即可，大小写与分隔符都能对上' },
+      h('span', { className: 'px-rate-field-label' }, '模型键'),
+      h('input', {
+        type: 'text',
+        className: 'px-input',
+        placeholder: '例如 gpt-6-alstra',
+        value: draft.model ?? '',
+        disabled: saving,
+        onChange: (event) => { update({ model: event.target.value }) },
+      })),
+    h('label', { className: 'px-rate-field', title: '给用户看的名字；留空就用模型键' },
+      h('span', { className: 'px-rate-field-label' }, '显示名'),
+      h('input', {
+        type: 'text',
+        className: 'px-input',
+        placeholder: '例如 GPT-6 Alstra',
+        value: draft.label ?? '',
+        disabled: saving,
+        onChange: (event) => { update({ label: event.target.value }) },
+      })),
+    h('label', { className: 'px-rate-field', title: '厂商名，只用于展示' },
+      h('span', { className: 'px-rate-field-label' }, '厂商'),
+      h('input', {
+        type: 'text',
+        className: 'px-input',
+        placeholder: '例如 OpenAI',
+        value: draft.vendor ?? '',
+        disabled: saving,
+        onChange: (event) => { update({ vendor: event.target.value }) },
+      })),
+    h('div', { className: 'px-rate-pairs' },
+      h('div', { className: 'px-rate-pair' },
+        h('b', null, '缓存命中'),
+        field('cacheHitIdle', '空闲', '缓存命中输入的单价'),
+        field('cacheHitPeak', '高峰', '缓存命中输入的单价；与空闲填一样的数就是不分时')),
+      h('div', { className: 'px-rate-pair' },
+        h('b', null, '未命中'),
+        field('cacheMissIdle', '空闲', '缓存未命中输入的单价'),
+        field('cacheMissPeak', '高峰', '缓存未命中输入的单价；与空闲填一样的数就是不分时')),
+      h('div', { className: 'px-rate-pair' },
+        h('b', null, '输出'),
+        field('outputIdle', '空闲', '输出 token 的单价'),
+        field('outputPeak', '高峰', '输出 token 的单价；与空闲填一样的数就是不分时'))),
+
+    error === '' ? null : h('p', { className: 'px-balance-state px-error' }, error),
+    ok === '' ? null : h('p', { className: 'px-balance-state px-ok' }, ok),
+
+    h('div', { className: 'px-price-actions' },
+      h('button', { type: 'button', className: 'px-btn small primary', disabled: saving, onClick: save },
+        saving ? '保存中…' : '保存这一条'),
+      h('button', {
+        type: 'button',
+        className: 'px-btn small',
+        disabled: saving,
+        onClick: () => { setDraft({ model: '', ...draftOf(undefined) }); setError(''); setOk('') },
+      }, '清空'))))
+}
+/**
  * 费用明细表：逐条目列出用量与金额，并在表下给出单价来源。
  *
  * 两种口径要分开表达，否则会误导：
@@ -1532,7 +1722,7 @@ function entryKeyOf(model) {
  * @returns {object} React 元素。
  */
 function CostTable(props) {
-  const { models, rangeByModel, pricing, rangeCost, split, rangeLabel } = props
+  const { models, rangeByModel, pricing, rangeCost, split, rangeLabel, ratesStatus, onRatesSaved } = props
   const rows = models
     .map((model, index) => {
       const key = entryKeyOf(model)
@@ -1702,6 +1892,8 @@ function CostTable(props) {
                 ? `¥${row.rates.output.peak}`
                 : `¥${row.rates.output.idle} / ¥${row.rates.output.peak}`))))
       })),
+    h(PriceEditor, { pricing, ratesStatus, onSaved: onRatesSaved }),
+
     h('p', { className: 'px-muted px-note' },
       // 口径必须写清楚，否则用户会把「按官方价估算」误读成「我的实际账单」。
       // 说「各模型的官方价」而不是「DeepSeek 官方价」：表里既有 DeepSeek 也有

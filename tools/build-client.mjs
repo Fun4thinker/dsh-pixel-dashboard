@@ -27,6 +27,7 @@ const outFile = join(outDir, 'client.js')
 const MODULES = [
   'format.js',
   'cost.js',
+  'rates.js',
   'balance.js',
   'plans.js',
   'provider.js',

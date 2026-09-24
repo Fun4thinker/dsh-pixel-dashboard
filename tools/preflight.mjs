@@ -83,7 +83,10 @@ const balanceRoute = routeOf('/dsh-pixel/balance')
 const plansRoute = routeOf('/dsh-pixel/plans')
 const toggleRoute = routeOf('/dsh-pixel/toggle')
 const notifyRoute = routeOf('/dsh-pixel/notify')
-assert.equal(routes.length, 7, `应注册恰好七条路由，实际 ${routes.length}`)
+const ratesRoute = routeOf('/dsh-pixel/rates')
+// 路由条数是**有意**钉死的：新增路由必须在这里显式加一行，并想清楚它是否需要
+// 同源闸门与写权限，而不是让新增悄悄溜过去（见 lib/host.js 的注册处）。
+assert.equal(routes.length, 8, `应注册恰好八条路由，实际 ${routes.length}`)
 
 /**
  * 最小 req/res 替身。
@@ -543,6 +546,63 @@ const configured = new BalanceService({
 })
 assert.equal(configured.endpoint().baseURL, 'https://proxy.internal', 'settings 显式配置应被采纳')
 assert.equal(configured.endpoint().apiKeyEnv, 'MY_KEY', 'settings 里的凭据引用应被采纳')
+assert.equal(configured.endpoint().settingsVia, 'legacy', '旧版 get(ns) 路径应被认出并标注为 legacy')
+
+// ── settings 的两代 API：0.1.7 删掉了 get(ns)，只剩 describe() ──────────────
+// 这是本次兼容性修复的核心。DSH 0.1.7 把 settings 换成「投影 profile 条目 Config 的
+// 表单服务」：get/register/installSection 全没了。旧代码的 `?.get?.()` 会把
+// 「API 没了」静默吞成 undefined，于是用户配的自定义端点被无声忽略——数字照常
+// 显示，只是答错了问题。以下三条钉住：新版能读到、读不到时降级可见、绝不静默。
+const { readSettingsSection } = await import(pathToFileURL(join(root, 'lib', 'balance.js')).href)
+const modern = new BalanceService({
+  credentials: () => undefined,
+  // 新版 settings：只有 describe()，没有 get()
+  settings: () => ({
+    describe: () => [
+      { ns: 'some-other-entry', value: { baseURL: 'https://ignore.example' } },
+      { ns: 'llm-deepseek', value: { baseURL: 'https://proxy.internal', apiKeyEnv: 'MY_KEY' } },
+    ],
+  }),
+  prefsPath: sandboxPrefs,
+  fetchImpl: async () => ({ ok: true, status: 200, text: async () => '{}' }),
+})
+assert.equal(modern.endpoint().settingsVia, 'entry', '0.1.7 的 describe() 路径必须被认出来')
+assert.equal(modern.endpoint().baseURL, 'https://proxy.internal', '新版 describe() 里的 baseURL 应被采纳')
+assert.equal(modern.endpoint().apiKeyEnv, 'MY_KEY', '新版 describe() 里的凭据引用应被采纳')
+// describe() 找不到该条目 = 该 profile 确实没配这一项，属于正常空状态，不该报警
+assert.equal(
+  readSettingsSection({ describe: () => [] }, 'llm-deepseek').via,
+  'entry',
+  'describe() 里没有这一条属于「确实没配」，不是读不懂',
+)
+// 两代 API 都没有 → **必须**报 unreadable，而不是伪造成「没配置」
+const unknownApi = readSettingsSection({ someOtherMethod: () => {} }, 'llm-deepseek')
+assert.equal(unknownApi.via, 'unreadable', '认不出的 settings API 必须回报 unreadable')
+assert.ok(
+  typeof unknownApi.error === 'string' && unknownApi.error !== '',
+  'unreadable 必须带一句可读的原因，界面靠它说明降级',
+)
+assert.equal(
+  readSettingsSection(undefined, 'llm-deepseek').via,
+  'absent',
+  '服务整体缺失属于 absent（用户本来也无处配置），不该报成 unreadable',
+)
+// describe() 抛错时必须回落旧 get，而不是直接判定失败
+const describeThrows = readSettingsSection({
+  describe: () => { throw new Error('descriptor boom') },
+  get: () => ({ baseURL: 'https://fallback.internal' }),
+}, 'llm-deepseek')
+assert.equal(describeThrows.via, 'legacy', 'describe() 抛错应回落旧 get() 路径')
+assert.equal(describeThrows.value.baseURL, 'https://fallback.internal', '回落路径要能真的取到值')
+// 端点事实必须把「这是猜的」带出去：界面据此把降级显示出来
+const unreadableService = new BalanceService({
+  credentials: () => undefined,
+  settings: () => ({ someOtherMethod: () => {} }),
+  prefsPath: sandboxPrefs,
+  fetchImpl: async () => ({ ok: true, status: 200, text: async () => '{}' }),
+})
+assert.equal(unreadableService.endpoint().settingsVia, 'unreadable', '端点推导应如实标注 unreadable')
+assert.equal(unreadableService.endpoint().baseURL, 'https://api.deepseek.com', '读不到 settings 时仍回落官方端点')
 assert.equal(configured.read !== undefined, true)
 const configuredRead = await configured.read({ refresh: true })
 assert.equal(configuredRead.official, false, '非官方端点应被标记出来')
@@ -812,6 +872,36 @@ assert.equal(ccLiveMonth.total, 69.98, '月度总额 = 已用 + 剩余（69.9803
 assert.equal(ccLiveMonth.remaining, 65.55, '月度剩余来自 credits 的裸数字')
 assert.equal(ccLiveMonth.usedPercent, 6.33, `月度真实已用约 6.33%，实际 ${ccLiveMonth.usedPercent}`)
 assert.notEqual(ccLiveMonth.usedPercent, 0, '月度百分比绝不能是 0（那是「未知被画成 0」的老毛病）')
+// 月度的**重置时刻**也必须到手。用户报过：「看不出月额度多久后重置」——
+// 5 小时与每周都带 resetAt，月度却只能靠 `subscriptions` 的 `currentPeriodEnd`，
+// 而那个字段是 **ISO 日期串**（`"2026-10-14T12:26:13.000Z"`），不是数字时间戳。
+// 早先 `normalizeEpoch` 只认数字，ISO 串被静默读成 undefined：不报错、不显示 0，
+// 只是月度那一栏永远少一句「多久后重置」——最容易被当成「本来就没有」的形态。
+assert.equal(ccLiveMonth.resetAt, Date.parse('2026-10-14T12:26:13.000Z'),
+  '月度重置时刻必须能从 ISO 串的 currentPeriodEnd 解析出来（这正是用户报的那个缺失）')
+assert.ok(Number.isFinite(ccLiveMonth.resetAt) && ccLiveMonth.resetAt > Date.now(),
+  '月度重置时刻应是未来的毫秒时间戳')
+// 数字形状**不能**因为新增 ISO 支持而回归：秒/毫秒都照旧
+const ccEpochShapes = parseCommandCodeCredits(
+  { credits: { monthlyCredits: { used: 1, cap: 10, resetAt: 1_790_000_000_000 } } },
+  { data: { planId: 'individual-goat', currentPeriodEnd: '2026-10-14T12:26:13.000Z' } },
+)
+const ccEpochMonth = ccEpochShapes.windows.find((win) => win.window === 'monthly')
+assert.equal(ccEpochMonth.resetAt, 1_790_000_000_000, '数字毫秒时间戳照旧优先于订阅周期')
+// 秒级数字仍按秒换算（而不是当成 1970 年的毫秒）
+const ccSeconds = parseCommandCodeCredits(
+  { credits: { monthlyCredits: { used: 1, cap: 10 } } },
+  { data: { planId: 'individual-goat', currentPeriodEnd: 1_781_000_000 } },
+)
+assert.equal(ccSeconds.windows.find((win) => win.window === 'monthly').resetAt, 1_781_000_000_000,
+  '秒级时间戳仍应 ×1000；ISO 支持不得改变这条既有口径')
+// 既不是数字也不是合法日期时不编造时刻（宁可没有倒计时，也不显示假的）
+const ccNoReset = parseCommandCodeCredits(
+  { credits: { monthlyCredits: { used: 1, cap: 10 } } },
+  { data: { planId: 'individual-goat', currentPeriodEnd: '不是日期' } },
+)
+assert.equal(ccNoReset.windows.find((win) => win.window === 'monthly').resetAt, undefined,
+  '认不出的时刻应留 undefined，而不是编一个出来')
 
 // 用量汇总接口取不到时：有套餐身份就按名义额度反推，并把「这是推算」说出来
 const ccNoUsage = parseCommandCodeCredits(
@@ -1412,10 +1502,76 @@ assert.equal(badWrite.statusCode, 400, '数组体应被拒绝')
 const putRoute = await call(notifyRoute, 'PUT', '/dsh-pixel/notify')
 assert.equal(putRoute.statusCode, 405, 'PUT 应返回 405')
 
+// ── 自定义单价：用户不必改源码就能补一个官方价 ──────────────────────
+//
+// 这是用户要求的入口：新模型发布得很勤，而「我用的模型没有价」的表现是它被标成
+// 「估算价」并按 Flash 兜底折算——数字有、不报错，只是错的。以下钉四件事：
+// 写进去能生效（含归一）、分时写法不被压平、写错要报出是哪一条、坏文件不清空。
+{
+  const { CustomRates } = await import(pathToFileURL(join(root, 'lib', 'custom-rates.js')).href)
+  const { pricingOf, normalizeModel, setCustomRates } = await import(pathToFileURL(join(root, 'lib', 'pricing.js')).href)
+  const ratesFile = join(tmpdir(), `dsh-pixel-preflight-rates-${process.pid}.json`)
+  rmSync(ratesFile, { force: true })
+
+  const store = new CustomRates({ path: ratesFile })
+  // 文件不存在是「还没配过」，不是错误
+  const empty = await store.load()
+  assert.equal(empty.loaded, false, '价目文件缺失应回报未加载，而不是报错')
+  assert.deepEqual(empty.errors, [], '文件缺失不该产生校验错误')
+
+  // 用户举的例子：给一个价目表里没有的模型补官方价
+  const saved = await store.save({
+    'gpt-6-alstra': { label: 'GPT-6 Alstra', vendor: 'OpenAI', cacheHit: 1, cacheMiss: 10, output: 40 },
+  })
+  assert.equal(saved.ok, true, `写入自定义价目应成功，实际 ${JSON.stringify(saved)}`)
+  assert.equal(saved.persisted, true, '写入应落盘')
+  const alstra = pricingOf('gpt-6-Alstra')
+  assert.equal(alstra.known, true, '自定义价应被当作已知价（否则仍会标估算价）')
+  assert.equal(alstra.custom, true, '自定义价应被标记为 custom，供界面区分')
+  assert.equal(alstra.rates.output.peak, 40, '自定义输出价应生效')
+  assert.equal(alstra.rates.output.idle, 40, '只写一个数应视为不分时（高峰空闲同价）')
+  assert.equal(normalizeModel('gpt-6-Alstra'), 'gpt-6-alstra', '自定义模型名也要能被归一命中')
+
+  // 分时写法：{ idle, peak } 必须照写出来的读，**不能**被压成同价
+  const tiered = await store.save({
+    'tiered-x': { cacheHit: { idle: 0.5, peak: 1 }, cacheMiss: { idle: 5, peak: 10 }, output: { idle: 20, peak: 40 } },
+  })
+  assert.equal(tiered.ok, true, '分时写法应被接受')
+  const tx = pricingOf('tiered-x')
+  assert.equal(tx.rates.output.peak, 40, '分时条目的高峰价应保留')
+  assert.equal(tx.rates.output.idle, 20, '分时条目的空闲价应保留（踩过：曾被压成与高峰同价）')
+  assert.notDeepEqual(tx.rates.output.peak, tx.rates.output.idle, '分时条目两个档必须不同')
+
+  // 写错要指出是**哪一条、哪一项**，并且一个字节都不落盘
+  const badFile = join(tmpdir(), `dsh-pixel-preflight-rates-bad-${process.pid}.json`)
+  rmSync(badFile, { force: true })
+  const badStore = new CustomRates({ path: badFile })
+  const bad = await badStore.save({ broken: { cacheHit: 'abc', cacheMiss: 1, output: 2 } })
+  assert.equal(bad.ok, false, '不合法的价目应被拒绝')
+  assert.ok(
+    bad.errors.some((line) => line.includes('broken') && line.includes('cacheHit')),
+    `校验错误应点名模型与字段，实际 ${JSON.stringify(bad.errors)}`,
+  )
+  assert.equal(existsSync(badFile), false, '校验失败不得落盘（否则下次启动跟着坏）')
+
+  // 非法 JSON：**同一个实例**在已经读到好价之后遇到坏文件，必须保留上一次生效的价。
+  // （真实场景：宿主启动时读到了好价，用户中途把文件改坏，下一次复查不该把价清空。）
+  // 新实例没有「上一次」可言，因此这里用同一个 store。
+  writeFileSync(ratesFile, '{ not json', 'utf8')
+  await store.load()
+  assert.ok(store.describe().error !== undefined, '非法 JSON 应报出可读原因')
+  assert.equal(pricingOf('tiered-x').known, true, '文件损坏时应保留上一次生效的价，而不是清空')
+
+  rmSync(ratesFile, { force: true })
+  rmSync(badFile, { force: true })
+  // 清掉进程内的自定义价，避免影响后续断言
+  setCustomRates({})
+}
+
 // 恢复：把开关文件清干净，避免影响后续断言
 rmSync(sandboxPrefs, { force: true })
 
-console.log(`预检通过：插件形状、7 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
-  + 'POST 拒绝、时段时钟、余额隐私与开关、套餐解析与凭据打码、多厂商价目、通知日志与预警阈值')
+console.log(`预检通过：插件形状、8 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
+  + 'POST 拒绝、时段时钟、余额隐私与开关、套餐解析与凭据打码、多厂商价目、自定义单价、通知日志与预警阈值')
 
 rmSync(sandboxPrefs, { force: true })

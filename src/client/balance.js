@@ -114,6 +114,15 @@ export function balanceStatus(payload) {
   if (!hasBalance(payload)) {
     return { level: 'warn', text: '官方接口没有返回余额条目' }
   }
+  // 端点是从哪推出来的：**猜出来的要说出来**。DSH 0.1.7 换掉了 settings 的取数
+  // API，若插件没能读到 `llm-deepseek` 段，就会退回官方默认端点——查到的数字
+  // 与用户真的配了代理时长得一模一样，不说出来用户没有任何办法发现。
+  if (payload.settingsVia === 'unreadable') {
+    return {
+      level: 'warn',
+      text: `读不到 llm-deepseek 设置（${payload.settingsError ?? '原因未知'}），当前按官方端点查询；若你配过自建端点，这个数字可能不对`,
+    }
+  }
   return { level: 'ok', text: '余额来自官方接口' }
 }
 
