@@ -1948,12 +1948,15 @@ const costTable = glmHtml.slice(
   // 这条只能靠真实排版验证：字符串断言看不出列宽，而 jsdom 不做布局。因此这里读
   // CSS，确认「列表定义轨道 + 行与价格区都用 subgrid」三件事同时成立——少任何一件，
   // 列宽就退回各行自算。（真实浏览器里的逐行对齐由 headless 测量另行验证。）
-  const rateListRule = css.match(/.px-rate-list\s*\{[^}]*\}/)?.[0] ?? ''
-  const rateRowRule = css.match(/.px-rate\s*\{[^}]*\}/)?.[0] ?? ''
-  const ratePricesRule = css.match(/.px-rate-prices\s*\{[^}]*\}/)?.[0] ?? ''
+  const rateListRule = css.match(/\.px-rate-list\s*\{[^}]*\}/)?.[0] ?? ''
+  const rateRowRule = css.match(/\.px-rate\s*\{[^}]*\}/)?.[0] ?? ''
+  const ratePricesRule = css.match(/\.px-rate-prices\s*\{[^}]*\}/)?.[0] ?? ''
+  // 五列：**色块**、模型名、三个价档。色块必须自成一列——早先它与模型名同在
+  // 一个 flex 里，行与行之间色块**个数不同**就把名称推到不同起点（实测 4 个色块
+  // → 名称起点 66px、1 个 → 33px），用户看到的就是「有的行前面突出一块空白」。
   must(
-    /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto\s+auto\s+auto/.test(rateListRule),
-    '单价列表必须自己定义四列轨道（否则每一行各算一份列宽，列就会在行间错开）',
+    /grid-template-columns:\s*auto\s+minmax\(0,\s*1fr\)\s+auto\s+auto\s+auto/.test(rateListRule),
+    '单价列表必须自己定义五列轨道（色块 / 模型 / 三个价档），否则列会在行间错开',
   )
   must(
     /grid-template-columns:\s*subgrid/.test(rateRowRule),
@@ -1962,6 +1965,29 @@ const costTable = glmHtml.slice(
   must(
     /grid-template-columns:\s*subgrid/.test(ratePricesRule),
     '价格区必须继续用 subgrid 往下继承，三个价格列才会与别的行对齐',
+  )
+  // 色块与模型名是两个**兄弟列**，不是「色块挤在名称前面」：
+  // 这一点由 grid-column 落位保证。少了它，两列都退化成「同一格里换行排列」，
+  // 名称又会随色块个数左右浮动。
+  const rateTonesRule = css.match(/\.px-rate-tones\s*\{[^}]*\}/)?.[0] ?? ''
+  const rateWhoRule = css.match(/\.px-rate-who\s*\{[^}]*\}/)?.[0] ?? ''
+  must(
+    /grid-column:\s*1/.test(rateTonesRule),
+    '色块必须落在第 1 列（与模型名分开），否则名称会随色块个数左右浮动',
+  )
+  must(
+    /grid-column:\s*2/.test(rateWhoRule),
+    '模型名必须落在第 2 列（色块之后），这样所有行的名称左边界才一致',
+  )
+  // 色块是 HTML 的 <i>，只能用**背景色**类上色；用 SVG 的 fill 类会让它全透明。
+  // 这一条是纯字符串能查的：比「渲染出来看不见」这种只能靠眼睛发现的问题好钉得多。
+  must(
+    !/px-rate-swatch[^`]*px-tone-fill-/.test(glmHtml) && !glmHtml.includes('px-tone-fill-pink"><i'),
+    '单价色块不得使用 SVG fill 类（px-tone-fill-*），那对 HTML 元素的背景无效，色块会变成透明',
+  )
+  must(
+    /px-rate-swatch px-tone-bg-/.test(glmHtml),
+    '单价色块必须使用背景色类（px-tone-bg-*），否则渲染出来是透明的、看不见',
   )
 }
 
