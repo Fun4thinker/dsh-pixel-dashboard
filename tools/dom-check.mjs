@@ -233,6 +233,8 @@ function phaseSnapshot(options = {}) {
       periodMs,
       nextPeak: !(options.peak ?? true),
       label: (options.peak ?? true) ? '高峰时段' : '空闲时段',
+      // 节假日里宿主会带上节日名（国庆节 / 春节…）；这里默认不给，与旧宿主一致。
+      holiday: options.holiday ?? '',
     },
   }
 }

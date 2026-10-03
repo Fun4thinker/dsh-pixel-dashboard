@@ -1351,6 +1351,8 @@ function periodSnapshot(options = {}) {
       periodMs,
       nextPeak: !(options.peak ?? true),
       label: (options.peak ?? true) ? '高峰时段' : '空闲时段',
+      // 落在法定节假日里时宿主会带上节日名；旧宿主没有这个字段，因此默认不给。
+      holiday: options.holiday ?? '',
     },
   }
 }
@@ -1436,6 +1438,27 @@ must(idleHtml.includes('px-period-tone-green'), '空闲应用绿色')
 must(!idleHtml.includes('px-period-tone-red'), '空闲不应带红色')
 must(idleHtml.includes('空闲期剩45分'), `空闲那一行应写出文案：${idleHtml}`)
 must(!peakHtml.includes('px-period-text'), '不再有两行文字块（已改为单行）')
+
+// 7b) 法定节假日：空闲时说明是哪个节（国庆那种「周中白天也便宜」的日子靠它解释），
+//     并且**不影响**颜色与倒计时——那两样只由 peak 决定，因此多一个字段不该改动它们。
+{
+  // 用与 idleQuarter 完全相同的时段长度，只多一个 holiday 字段，
+  // 这样「文案没被这个字段改动」才是被真的比出来的，而不是刻意的巧合。
+  const holidayPhase = periodPhase(periodSnapshot({
+    peak: false,
+    periodMs: 180 * 60_000,
+    nextChangeMs: 45 * 60_000,
+    holiday: '国庆节',
+  }), at)
+  must(holidayPhase.label.includes('国庆节'), `节假日应写出节日名：${holidayPhase.label}`)
+  must(holidayPhase.tone === 'green', '节假日仍是空闲，必须保持绿色')
+  must(holidayPhase.caption === idleQuarter.caption,
+    `节假日不该改变倒计时文案：${holidayPhase.caption} vs ${idleQuarter.caption}`)
+  // 旧宿主不带 holiday 字段：除少一句解释外行为完全不变
+  const legacyPhase = periodPhase(periodSnapshot({ peak: false }), at)
+  must(legacyPhase.holiday === '', '旧宿主没有 holiday 字段时应是空串')
+  must(legacyPhase.label === '空闲时段', `没有节日名时应退回「空闲时段」：${legacyPhase.label}`)
+}
 
 // 8) 悬停说明：状态 + 倒计时 + 时区；没有相位时退回原来的按钮文案。
 must(periodTitle(quarter).includes('高峰时段'), `title 应含状态：${periodTitle(quarter)}`)
@@ -2365,6 +2388,10 @@ const html = renderToStaticMarkup(React.createElement(View, {
 
 const required = [
   '用量看板', '累计 Token', '时段与计费', '高峰时段',
+  // 「法定节假日」这一行是这次口径改动的可见证据：节假日全天按空闲计费，
+  // 且写明日历收录到哪一年。少了它，用户在国庆那种日子只会看到「高峰时段」
+  // 一行写着周一至周五，却不知道这几天本该便宜。
+  '法定节假日', '全天按空闲计费 · 已收录 2026',
   '周一至周五', '活跃日历', '趋势', '模型分布', '费用明细', '会话清单',
   '官方定价页', '账户与套餐',
   'px-seg-thumb', 'px-period-clock', 'px-stat-value', 'px-panel-dot',
@@ -2506,6 +2533,25 @@ must(
   const idlePanel = periodPanelOf(false)
   must(idlePanel.includes('空闲时段计费中'),
     `空闲态应写着「空闲时段计费中」：${idlePanel.slice(0, 200)}`)
+  // 法定节假日里的空闲要写出节日名：那一刻按星期几看本该是高峰，
+  // 只说「空闲」解释不了它为什么便宜。
+  {
+    const holidayPanel = renderToStaticMarkup(React.createElement(View, {
+      data: {
+        ...withPeak(false),
+        period: { ...payload.period, peak: false, label: '空闲时段', holiday: '国庆节' },
+      },
+      now: payload.generatedAt,
+      refreshing: false,
+      onRefresh: () => {},
+      balance: { enabled: true, available: true, balances: [{ currency: 'CNY', total: 1 }] },
+      onToggleBalance: () => {},
+    }))
+    const holidayBadge = extractElement(holidayPanel, '<div class="px-pair">') ?? ''
+    must(holidayBadge.includes('国庆节 · 空闲计费'),
+      `节假日里的空闲徽标应写出节日名：${holidayBadge.slice(0, 300)}`)
+    must(holidayBadge.includes('px-badge ok'), '节假日仍是空闲态，徽标必须保持绿色')
+  }
   must(idlePanel.includes('px-badge ok'),
     '空闲那枚徽标应保持绿色（.px-badge.ok）')
   must(!idlePanel.includes('px-badge peak'), '空闲态不该带高峰那枚粉色徽标')
@@ -3372,7 +3418,14 @@ function buildPayload(options = {}) {
     peakRule: {
       windows: [{ startMinute: 540, endMinute: 720 }, { startMinute: 840, endMinute: 1080 }],
       weekdays: [1, 2, 3, 4, 5],
-      note: '高峰时段为北京时间周一至周五 9:00–12:00、14:00–18:00，其余（含全部周末）为空闲时段，空闲价为高峰价的一半。',
+      // 法定节假日表：客户端用它说明「哪几天按空闲计」与「收录到哪一年」。
+      holidays: {
+        years: [2026],
+        days: ['2026-01-01', '2026-02-15', '2026-10-01', '2026-10-02', '2026-10-07'],
+      },
+      note: '高峰时段为北京时间周一至周五（不含中国法定节假日）9:00–12:00、14:00–18:00；'
+        + '其余时段，包括全部周末与中国法定节假日全天，均为空闲时段，空闲价为高峰价的一半。'
+        + '调休上班的周末同样按空闲时段计费。',
     },
     pricing,
     overview: {

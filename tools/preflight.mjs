@@ -151,7 +151,11 @@ assert.equal(typeof payload.generatedAt, 'number', '响应应含 generatedAt')
 assert.equal(payload.version, info.version, '数据响应里的版本应与版本路由一致')// 能力声明是客户端判断兼容性的唯一依据，必须齐全——缺项会让对应界面降级。
 // 注意「齐全」是指**声明**要完整，而不是要求客户端按它拦截取数（设计约束见 AGENT.md）。
 const REQUIRED_CAPABILITIES = [
-  'period', 'periodClock', 'peakRule', 'sessionCost', 'calendarByDay', 'tieredRates', 'crossDeviceLedger',
+  'period', 'periodClock', 'peakRule',
+  // 时段口径的**例外**：法定节假日全天按空闲计费。缺这一项说明宿主还是旧口径，
+  // 国庆那类日子的白天会被算成高峰、金额偏高两倍。
+  'holidayCalendar',
+  'sessionCost', 'calendarByDay', 'tieredRates', 'crossDeviceLedger',
   'balance', 'balanceToggle', 'thirdPartyPlans', 'notifyJournal', 'notifyThresholds',
   // 会话清单里的预览标题（与 DSH 侧栏同源）。旧的 id 片段用户对不上侧栏任何一个会话。
   'sessionTitle',
@@ -167,6 +171,12 @@ assert.equal(payload.pricing.currency, 'CNY', '应带上计价币种')
 // 时段口径必须是官方的高峰窗口，而不是旧的「错峰窗口」
 assert.equal(payload.peakRule.windows.length, 2, '应有上午/下午两个高峰窗口')
 assert.deepEqual(payload.peakRule.weekdays, [1, 2, 3, 4, 5], '高峰只落在工作日')
+// 法定节假日表必须随规则一起下发：客户端要用它说明「哪几天按空闲计」与「收录到哪一年」。
+// 断言的是**形状与关键日期**，不是整份表——否则每年更新日历时这条闸门都会无意义地红。
+assert.ok(Array.isArray(payload.peakRule.holidays?.days), 'peakRule 应带上节假日表')
+assert.ok(payload.peakRule.holidays.days.includes('2026-10-01'), '国庆首日必须在节假日表里')
+assert.ok(Array.isArray(payload.peakRule.holidays?.years), '节假日表应说明收录了哪些年份')
+assert.ok(payload.peakRule.note.includes('法定节假日'), '口径说明里必须写明法定节假日这一条')
 assert.ok(payload.period !== undefined, '响应应含当前时段状态')
 assert.equal(payload.offPeak, undefined, '旧的 offPeak 字段不应再出现')
 assert.equal(typeof payload.ledger?.path, 'string', '响应应回报账本路径，便于确认跨设备同步是否生效')
@@ -195,11 +205,22 @@ assert.equal(typeof payload.ledger?.path, 'string', '响应应回报账本路径
     'periodMs 必须等于 prevChangeMs + nextChangeMs',
   )
   assert.ok(phase.prevChangeMs >= 0 && phase.nextChangeMs >= 0, '两个方向的时间差都不应为负')
-  // 本段总长必须落在真实窗口里：最短的段是午休（2 小时），最长的是周末（63 小时）。
-  assert.ok(
-    phase.periodMs >= 120 * 60_000 - 1000 && phase.periodMs <= 63 * 3600_000 + 1000,
-    `periodMs 应落在 2 小时 ~ 63 小时之间，实际 ${phase.periodMs / 60_000} 分钟`,
-  )
+  // 本段总长必须落在**真实可能**的区间里，而且高峰段与空闲段的界不一样：
+  //   高峰段：最短 1 分钟（刚跨过边界）、最长 4 小时（14:00–18:00）；
+  //   空闲段：最长是**长连休**，2026 年春节是 2/13（周五）18:00 → 2/24（周二）9:00，
+  //          连着 255 小时。旧口径里最长只有周末 63 小时，把上界钉在 63 小时会让
+  //          「跑在假期里的那一天」永远红——那是闸门本身错了，不是代码错了。
+  if (phase.peak) {
+    assert.ok(
+      phase.periodMs <= 4 * 3600_000 + 1000,
+      `高峰段最长 4 小时（14:00–18:00），实际 ${phase.periodMs / 60_000} 分钟`,
+    )
+  } else {
+    assert.ok(
+      phase.periodMs > 0 && phase.periodMs <= 255 * 3600_000 + 1000,
+      `空闲段应落在 (0, 255 小时]（最长的是春节长连休），实际 ${phase.periodMs / 60_000} 分钟`,
+    )
+  }
   // 非只读方法一律拒绝（与余额 / 套餐 / 通知同一口径）
   const periodPost = await call(periodRoute, 'POST', '/dsh-pixel/period')
   assert.equal(periodPost.statusCode, 405, 'POST /period 应返回 405')
@@ -259,6 +280,55 @@ const sampleCatalog = new UsageCatalog({
 })
 const sample = await sampleCatalog.read()
 rmSync(sandboxLedger, { force: true })
+
+// ── 节假日口径：同一时刻的用量必须因「是不是法定节假日」而分到不同档 ────
+// 这是这次改动的**行为契约**：国庆期间的周四白天原来算高峰、现在算空闲。
+// 只断言「函数返回 false」不够——这条要走完账本 → 聚合 → 分档的整条路，
+// 因为真正花钱的是聚合出来的 peak / idle 那两份 token。
+{
+  /** 造一份只有一条请求的假会话。 */
+  const oneRequestAt = (time) => ({
+    async list() {
+      return [{ header: { id: 'session-holiday-0000-0000-000000000000', createdAt: time, cwd: 'D:\\blog' }, revision: 'r1', eventCount: 2 }]
+    },
+    async open() {
+      const events = [
+        { type: 'turn/start', seq: 0, time },
+        {
+          type: 'assistant/message',
+          seq: 1,
+          time,
+          data: {
+            turn: 1,
+            step: 1,
+            message: { role: 'assistant', content: [], source: { kind: 'model', provider: 'deepseek-official', model: 'deepseek-flash' } },
+            usage: { inputTokens: 1000, outputTokens: 0, totalTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0 },
+          },
+        },
+      ]
+      return {
+        async read(offset = 0, length = 500) { return { events: events.slice(offset, offset + length) } },
+        async close() {},
+      }
+    },
+  })
+  /** 跑一次聚合，返回分档后的峰值 token。 */
+  const peakTokensAt = async (iso, tag) => {
+    const catalog = new UsageCatalog({
+      persistence: () => oneRequestAt(Date.parse(iso)),
+      sessions: () => undefined,
+      timezone: () => 'Asia/Shanghai',
+      ledgerPath: join(tmpdir(), `dsh-pixel-holiday-${process.pid}-${tag}.jsonl`),
+    })
+    const result = await catalog.read()
+    return result.overview.totals.peak.cacheMiss
+  }
+  // 国庆里的周四 10:00（北京）：应为空闲 → 高峰档 0
+  assert.equal(await peakTokensAt('2026-10-01T02:00:00Z', 'oct1'), 0, '国庆期间的白天不得计入高峰档')
+  // 节前周三 10:00（北京）：同样的墙钟时刻与星期几，只是不在假期里 → 全额计入高峰档
+  // （这条对照不能省：单看上面的 0，一个「永远返回 0」的实现也能通过。）
+  assert.equal(await peakTokensAt('2026-09-30T02:00:00Z', 'sep30'), 1000, '节前工作日的白天应计入高峰档')
+}
 
 // 手算：命中 600、未命中 1000-600-0=400、输出 200 → 计费量 1200
 assert.equal(sample.overview.totals.cacheHit, 600, `命中量应为 600，实际 ${sample.overview.totals.cacheHit}`)

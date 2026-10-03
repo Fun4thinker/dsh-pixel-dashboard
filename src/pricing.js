@@ -2,13 +2,24 @@
  * 时段窗口与费用口径。
  *
  * 官方口径（北京时间，见 https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ ）：
- *   高峰时段 = 周一至周五 9:00–12:00、14:00–18:00；
- *   其余时间（含全部周末）都是空闲时段，空闲价 = 高峰价的一半。
+ *   高峰时段 = **周一至周五（不含中国法定节假日）** 9:00–12:00、14:00–18:00；
+ *   其余时段——**包括全部周末与中国法定节假日全天**——都是空闲时段，
+ *   空闲价 = 高峰价的一半。
+ *
+ * 两个由 ./holidays.js 显式处理的例外，光看星期几都会判错：
+ *
+ *   1) **法定节假日全天按空闲计费**，哪怕它正落在周一至周五的正午前后。
+ *      2026-10-01（周四）与 10-02（周五）就是：只看星期几会把这两天的白天算成
+ *      高峰，而官方是按空闲计费的。
+ *   2) **调休上班的周末仍按空闲计费**（官方说明原文：「调休上班的周末、中国法定
+ *      节假日全天均按空闲时段计费」）。因此调休上班日**不**进工作时间表，
+ *      把它当工作日会与官方口径正好相反。
  *
  * 因此这里不是「一个折扣窗口」，而是「若干高峰窗口 + 空闲兜底」，
  * 费用也必须按每条请求发生时刻所属的时段分别计价，不能整段套一个折扣。
  * @module dsh-pixel-dashboard/lib/pricing
  */
+import { holidayNameOf, holidayYearCovered, isHoliday } from './holidays.js'
 
 /** 默认站点时区：北京时间。 */
 export const DEFAULT_TIMEZONE = 'Asia/Shanghai'
@@ -16,13 +27,21 @@ export const DEFAULT_TIMEZONE = 'Asia/Shanghai'
 /**
  * 高峰时段窗口（站点时区当天时刻，单位分钟；endMinute 不含）。
  * 周一至周五 9:00–12:00 与 14:00–18:00。
+ *
+ * 「这一天的窗口成不成立」还要看它是不是工作日——周末与法定节假日整天都没有窗口
+ * （见 {@link isPeak}）。这份数组只描述窗口的**形状**，不描述它对哪天生效。
  */
 export const PEAK_WINDOWS = [
   { startMinute: 9 * 60, endMinute: 12 * 60 },
   { startMinute: 14 * 60, endMinute: 18 * 60 },
 ]
 
-/** 高峰只落在工作日：0=周日 … 6=周六。 */
+/**
+ * 高峰只落在工作日：0=周日 … 6=周六。
+ *
+ * 「工作日」在这里是**排除法定节假日**之后的周一至周五；周末与法定节假日都不是
+ * 高峰日（判定见 {@link isPeak}）。调休上班的周末仍然是周末，仍按空闲计费。
+ */
 export const PEAK_WEEKDAYS = [1, 2, 3, 4, 5]
 
 /**
@@ -30,7 +49,7 @@ export const PEAK_WEEKDAYS = [1, 2, 3, 4, 5]
  *
  * 两类口径，别混：
  *
- *   1) **DeepSeek 分时定价**：高峰（周一至周五 9:00–12:00、14:00–18:00）与空闲
+ *   1) **DeepSeek 分时定价**：高峰（周一至周五、不含法定节假日 9:00–12:00、14:00–18:00）与空闲
  *      两档，空闲价恰为高峰价的一半，因此写成 `{ peak, idle }`。
  *   2) **其他厂商不分时**：只有一个价。为复用同一套聚合与计价逻辑，peak 与 idle
  *      写成同一个值，并用 `flat: true` 标明「这是无分时，不是打折」。
@@ -501,29 +520,69 @@ export function zonedParts(epochMs, timeZone = DEFAULT_TIMEZONE) {
   }
 }
 
+/**
+ * 已取好的墙钟字段 → `YYYY-MM-DD`。
+ *
+ * 与 {@link dateKey} 的区别是它**不再格式化一次**：`isPeak()` / `periodState()`
+ * 都已经拿到了 `zonedParts()` 的结果，再调一次会把 Intl 的开销翻倍——
+ * 这两条都在热路径上（导入账本时每条记录都要判一次时段）。
+ * @param {{year:number,month:number,day:number}} p - 墙钟字段。
+ * @returns {string} 形如 `2026-10-02`。
+ */
+function dateKeyOf(p) {
+  return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`
+}
+
 /** `YYYY-MM-DD` 日期键（站点时区）。 */
 export function dateKey(epochMs, timeZone = DEFAULT_TIMEZONE) {
-  const p = zonedParts(epochMs, timeZone)
-  return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`
+  return dateKeyOf(zonedParts(epochMs, timeZone))
 }
 
 /**
  * 判断某个时刻是否处于高峰时段。
+ *
+ * 三道闸门，顺序即是排除的顺序：**法定节假日 → 周末 → 高峰窗口**。
+ * 前两道任意一道不通过都直接判空闲，因此「国庆期间虽然是周四、白天却在 9:00–12:00
+ * 之间」这种情形按空闲计价，与官方一致。
+ *
+ * 「调休上班的周末」不需要单独一条规则：它本来就是周末，第一道（节假日）之后就被
+ * 第二道（星期）挡下了。也正因如此，日历里不需要记录调休上班日——那与官方口径
+ * 恰好相反（官方明确说了它们仍按空闲计费）。
  * @param {number} epochMs - 绝对时刻。
  * @param {string} timeZone - IANA 时区名。
  * @returns {boolean} 高峰为真。
  */
 export function isPeak(epochMs, timeZone = DEFAULT_TIMEZONE) {
   const p = zonedParts(epochMs, timeZone)
+  if (isHoliday(dateKeyOf(p))) return false
   if (!PEAK_WEEKDAYS.includes(p.weekday)) return false
   return PEAK_WINDOWS.some((w) => p.minuteOfDay >= w.startMinute && p.minuteOfDay < w.endMinute)
 }
 
-/** 分钟步长，用于扫描下一次时段翻转。 */
+/** 一分钟的毫秒数；也是时段翻转的最小粒度。 */
 const STEP_MS = 60_000
 
-/** 扫描上限：8 天足够越过一整个周末。 */
-const STEP_LIMIT = 8 * 24 * 60
+/** 一天多少分钟。 */
+const MINUTES_PER_DAY = 24 * 60
+
+/**
+ * 找翻转点时的前后搜索上限（天）。
+ *
+ * 这不是「够用就行」的估计：2026 年春节是从 2/13（周五）18:00 一路空闲到 2/24（周二）
+ * 9:00，**连续 10 天 15 小时**。旧实现是「8 天以内每分钟扫一遍」，遇到这种长连休会
+ * 直接扫不到翻转点、把 `nextChangeMs` 留成 0——界面于是显示「0秒后空闲期」，
+ * 而那段空闲其实还有好几天。现在边界按天算，长连休不再有截断风险，
+ * 这个上限只剩防御作用：排不出更长空档时返回 0，也就是「说不清就不编一个数字」。
+ */
+const BOUNDARY_HORIZON_DAYS = 400
+
+/**
+ * 某一天没有高峰窗口时的空结果。
+ *
+ * 复用同一个冻结数组，而不是每天现造一个 `[]`：前后各查几天、每次调用都要问一遍，
+ * 而这份倒计时每秒都在重画。
+ */
+const NO_SPANS = Object.freeze([])
 
 /**
  * 当前时段状态、下一次切换时间，以及**本段已走了多久**。
@@ -532,49 +591,99 @@ const STEP_LIMIT = 8 * 24 * 60
  * （侧栏按钮上那枚时段指示灯）：只有 `nextChangeMs` 时，界面知道还剩多久、却不知道
  * 这一段总长，画不出比例。
  *
- * 两次扫描都按**整分钟**推进，因为翻转点一定落在整分钟上（9:00 / 12:00 / 14:00 / 18:00）。
- * 站点时区的偏移都是整分钟的倍数，所以绝对时刻的分钟边界与墙钟分钟边界一致。
+ * ## 为什么按「天」推，而不是按分钟扫
+ *
+ * 翻转点只有两种：某天某个高峰窗口的**开始**或**结束**（9:00 / 12:00 / 14:00 / 18:00），
+ * 因此它们完全由「这一天有没有高峰窗口」决定。于是：
+ *
+ *   1) 先算出**今天及前后各天**的窗口表——周末与法定节假日为空（日历在 ./holidays.js）；
+ *   2) 再把这些天里所有窗口的起止分钟摊平成一条边界线，取当前时刻左右最近的各一条。
+ *
+ * 一天最多贡献 4 条边界，而不是每分钟一条；搜索按天推进，因此长连休也不会被任何
+ * 扫描上限截断。站点时区的偏移都是整分钟的倍数，所以绝对时刻的分钟边界与墙钟分钟
+ * 边界一致，当前分钟里的零头（`intoMinute`）单独补上即可。
+ *
  * 返回的 `nextChangeMs + prevChangeMs` 恰好等于本段总长：
  *   例 11:00:30（高峰 9:00–12:00）→ next = 59.5 分、prev = 120.5 分，合计 180 分。
  * 正好站在边界上时 `prevChangeMs` 为 0，于是 `periodMs === nextChangeMs`，仍然正确。
  * @param {number} epochMs - 绝对时刻。
  * @param {string} timeZone - IANA 时区名。
- * @returns {{peak:boolean,minuteOfDay:number,weekday:number,nextChangeMs:number,prevChangeMs:number,periodMs:number,nextPeak:boolean,label:string}}
+ * @returns {{peak:boolean,minuteOfDay:number,weekday:number,nextChangeMs:number,prevChangeMs:number,periodMs:number,nextPeak:boolean,label:string,holiday:string,holidayCovered:boolean}}
  */
 export function periodState(epochMs, timeZone = DEFAULT_TIMEZONE) {
   const p = zonedParts(epochMs, timeZone)
   const peak = isPeak(epochMs, timeZone)
-  // 当前时刻在本分钟里已走的毫秒数：扫描按整分钟对齐，把这段零头补上才是真实剩余。
+  const minuteOfDay = p.minuteOfDay
+  // 当前时刻在本分钟里已走的毫秒数：边界都落在整分钟上，补上这段零头才是真实剩余。
   const intoMinute = epochMs % STEP_MS
+  // 当天 00:00 的 UTC 序号：只做**纯日历**加减，不受运行机器时区影响。
+  const midnightUtc = Date.UTC(p.year, p.month - 1, p.day)
+  const todayKey = dateKeyOf(p)
 
-  // 向前找第一次翻转
-  let nextChangeMs = 0
-  for (let i = 1; i <= STEP_LIMIT; i += 1) {
-    if (isPeak(epochMs + i * STEP_MS, timeZone) !== peak) {
-      nextChangeMs = i * STEP_MS - intoMinute
-      break
+  /**
+   * 相对今天的第 `offset` 天有哪些高峰窗口（没有则给 NO_SPANS）。
+   *
+   * 星期几直接由当天推：日期在日轴上连续，因此 `(weekday + offset) mod 7` 就是那天的
+   * 星期。这样前后查几天都不必再走一次 Intl 格式化——那是这条热路径上最贵的一步。
+   * @param {number} offset - 与今天相差的天数（可负）。
+   * @returns {readonly {startMinute:number,endMinute:number}[]} 高峰窗口。
+   */
+  const spansAt = (offset) => {
+    const weekday = (((p.weekday + offset) % 7) + 7) % 7
+    if (!PEAK_WEEKDAYS.includes(weekday)) return NO_SPANS
+    // 今天的键已经算好；其余天用日轴加减得到，避免再格式化一次。
+    const key = offset === 0
+      ? todayKey
+      : new Date(midnightUtc + offset * MINUTES_PER_DAY * STEP_MS).toISOString().slice(0, 10)
+    if (isHoliday(key)) return NO_SPANS
+    return PEAK_WINDOWS
+  }
+
+  // 向前找第一条边界：从今天起逐天看，每天取「窗口 start / 窗口 end」里第一个晚于当前的。
+  let next
+  for (let offset = 0; offset <= BOUNDARY_HORIZON_DAYS && next === undefined; offset += 1) {
+    const spans = spansAt(offset)
+    const base = offset * MINUTES_PER_DAY
+    for (const w of spans) {
+      if (base + w.startMinute > minuteOfDay) { next = base + w.startMinute; break }
+      if (base + w.endMinute > minuteOfDay) { next = base + w.endMinute; break }
     }
   }
 
-  // 向后找最近一次翻转。扫描只告诉我们「翻转发生在上一个整分钟里」，
-  // 而翻转点本身在那一分钟的**上端**，因此是 (i - 1) 而不是 i：
-  // 从 11:00:30 往回扫到 8:59:30 才变，翻转点其实是 9:00:00，已走 2 小时 0 分 30 秒。
-  let prevChangeMs = 0
-  for (let i = 1; i <= STEP_LIMIT; i += 1) {
-    if (isPeak(epochMs - i * STEP_MS, timeZone) !== peak) {
-      prevChangeMs = (i - 1) * STEP_MS + intoMinute
-      break
+  // 向后找最近一条边界：逐天往回看，每天**从后一个窗口往前**取第一个不晚于当前的。
+  // 同一天内窗口按时间递增且互不重叠，因此「先看 end、再看 start」就是该窗口里离当前
+  // 最近的那条；一整天都没有就退到前一天。判据用「不晚于」而不是「早于」，是为了让
+  // 正好站在边界上的那一刻把 prev 取成当前分钟（已走 0 秒，见下面 prevMinute）。
+  let prev
+  for (let offset = 0; offset >= -BOUNDARY_HORIZON_DAYS && prev === undefined; offset -= 1) {
+    const spans = spansAt(offset)
+    const base = offset * MINUTES_PER_DAY
+    for (let i = spans.length - 1; i >= 0; i -= 1) {
+      if (base + spans[i].endMinute <= minuteOfDay) { prev = base + spans[i].endMinute; break }
+      if (base + spans[i].startMinute <= minuteOfDay) { prev = base + spans[i].startMinute; break }
     }
   }
+
+  // 边界查不到时才退回当前分钟：那是「说不清」，而不是「本段刚开始」。
+  const prevMinute = prev ?? minuteOfDay
+  const nextChangeMs = next === undefined ? 0 : (next - minuteOfDay) * STEP_MS - intoMinute
+  const prevChangeMs = (minuteOfDay - prevMinute) * STEP_MS + intoMinute
+  const holiday = holidayNameOf(todayKey)
 
   return {
     peak,
-    minuteOfDay: p.minuteOfDay,
+    minuteOfDay,
     weekday: p.weekday,
     nextChangeMs,
     prevChangeMs,
     periodMs: prevChangeMs + nextChangeMs,
     nextPeak: !peak,
+    // 为什么现在是空闲：落在法定节假日里时说清是哪个节（春节 / 国庆节…），否则为空串。
+    // 国庆那种「星期几本来是工作日」的假期，光看「空闲时段」四个字解释不了原因。
+    holiday,
+    // 这一年有没有被日历覆盖。表外年份退回「按周一至周五」判断，界面照实说明，
+    // 而不是假装知道——漏判一天只会把高峰按空闲计价，数字有、也不报错。
+    holidayCovered: holidayYearCovered(p.year),
     label: peak ? '高峰时段' : '空闲时段',
   }
 }

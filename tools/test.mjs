@@ -2,7 +2,8 @@
  * 自检脚本：不依赖 DSH 运行时，用假数据源验证时段判定、费用折算与日志聚合。
  *
  * 时段口径取自官方定价页：
- *   高峰 = 周一至周五 9:00–12:00、14:00–18:00（北京时间），其余为空闲。
+ *   高峰 = 周一至周五（**不含中国法定节假日**）9:00–12:00、14:00–18:00（北京时间）；
+ *   其余时段——包括全部周末与中国法定节假日全天——都是空闲，空闲价 = 高峰价的一半。
  * 用法: node tools/test.mjs
  */
 import { strict as assert } from 'node:assert'
@@ -24,6 +25,7 @@ import {
   zonedParts,
   CANONICAL_COLLISIONS,
 } from '../lib/pricing.js'
+import { HOLIDAY_PERIODS, HOLIDAY_YEARS, holidayNameOf, holidayYearCovered, isHoliday } from '../lib/holidays.js'
 import { UsageCatalog } from '../lib/host.js'
 import {
   UsageLedger,
@@ -60,7 +62,94 @@ async function check(name, fn) {
 /** 时间戳简写。2026-09-10 是周四。 */
 const T = (iso) => Date.parse(iso)
 
+console.log('pricing：法定节假日（官方：节假日全天按空闲计费）')
+
+// 这一组锁的是**2026 年官方口径里最容易漏掉的一条**：法定节假日全天都算空闲。
+// 只看星期几会把国庆期间的周四、周五白天算成高峰，金额偏高整整一倍，
+// 而且不会有任何报错——数字有、界面也对，只是错的。
+
+await check('国庆期间的周四、周五白天是空闲（只看星期几会算成高峰）', () => {
+  // 2026-10-01 是周四、10-02 是周五，都落在国庆假期里
+  for (const iso of ['2026-10-01T02:00:00Z', '2026-10-02T02:00:00Z']) {
+    assert.equal(isPeak(T(iso), DEFAULT_TIMEZONE), false, `${iso} 在国庆假期里，应为空闲`)
+  }
+  // 同一个时刻，放假前一天（9/30 周三）与放假后一天（10/8 周四）都应是高峰——
+  // 这两条是关键对照：不然「全都返回 false」也能让上面的断言通过。
+  assert.equal(isPeak(T('2026-09-30T02:00:00Z'), DEFAULT_TIMEZONE), true, '9/30 周三 10:00 应为高峰')
+  assert.equal(isPeak(T('2026-10-08T02:00:00Z'), DEFAULT_TIMEZONE), true, '10/8 周四 10:00 应为高峰')
+})
+
+await check('调休上班的周末仍然按空闲计费（官方明确说了这一条）', () => {
+  // 2026-09-20（周日）与 2026-10-10（周六）是《放假调休通知》里的上班日，
+  // 但官方口径是「调休上班的周末……均按空闲时段计费」，因此它们**不能**进工作日表。
+  for (const iso of ['2026-09-20T02:00:00Z', '2026-10-10T02:00:00Z']) {
+    assert.equal(isPeak(T(iso), DEFAULT_TIMEZONE), false, `${iso} 是调休上班的周末，仍应按空闲计费`)
+  }
+})
+
+await check('节假日表与官方通知逐段一致', () => {
+  // 段数与每段的长度都对得上《国务院办公厅关于 2026 年部分节假日安排的通知》：
+  // 元旦 3 天、春节 9 天、清明 3 天、劳动节 5 天、端午 3 天、中秋 3 天、国庆 7 天。
+  const expected = [
+    ['2026-01-01', '2026-01-03'],
+    ['2026-02-15', '2026-02-23'],
+    ['2026-04-04', '2026-04-06'],
+    ['2026-05-01', '2026-05-05'],
+    ['2026-06-19', '2026-06-21'],
+    ['2026-09-25', '2026-09-27'],
+    ['2026-10-01', '2026-10-07'],
+  ]
+  assert.equal(
+    HOLIDAY_PERIODS.reduce((sum, p) => sum + (Date.parse(`${p.end}T00:00:00Z`) - Date.parse(`${p.start}T00:00:00Z`)) / 86_400_000 + 1, 0),
+    33,
+    '2026 年应共 33 个节假日（含调休连休日）',
+  )
+  assert.deepEqual(HOLIDAY_YEARS, [2026], '目前只收录 2026')
+  for (const [start, end] of expected) {
+    assert.equal(isHoliday(start), true, `${start} 应在表里`)
+    assert.equal(isHoliday(end), true, `${end} 应在表里`)
+    assert.equal(holidayNameOf(start), holidayNameOf(end), `${start}–${end} 应是同一个节`)
+  }
+  // 假期首日的前一天与末日的后一天都不是节假日（除非那本身就是另一个假期）
+  assert.equal(isHoliday('2026-09-24'), false, '中秋前一天（9/24）不是节假日')
+  assert.equal(isHoliday('2026-09-28'), false, '中秋后一天（9/28 周一）不是节假日')
+})
+
+await check('假期里的空闲状态说明是哪个节，而不是只说「空闲时段」', () => {
+  const national = periodState(T('2026-10-02T02:00:00Z'), DEFAULT_TIMEZONE)
+  assert.equal(national.peak, false)
+  assert.equal(national.holiday, '国庆节', '国庆期间应报出节日名')
+  assert.equal(national.label, '空闲时段')
+  // 普通周末没有节日名：那时「空闲」的原因是周末，编一个节日反而是错的
+  assert.equal(periodState(T('2026-09-12T02:00:00Z'), DEFAULT_TIMEZONE).holiday, '', '周末不应报出节日名')
+  // 工作日高峰当然也没有
+  assert.equal(periodState(T('2026-09-10T03:00:00Z'), DEFAULT_TIMEZONE).holiday, '')
+  assert.equal(national.holidayCovered, true, '2026 已被日历覆盖')
+})
+
+await check('长连休不断链：春节 10 天不会把倒计时算成 0', () => {
+  // 旧实现用「8 天以内每分钟扫一遍」找翻转点，遇到春节这种连休会扫不到，
+  // 于是 nextChangeMs 留在 0——界面显示「0秒后空闲期」，而其实还有好几天。
+  // 2026 春节：2/13（周五）18:00 → 2/24（周二）9:00，共 255 小时。
+  const before = periodState(T('2026-02-13T10:30:00Z'), DEFAULT_TIMEZONE) // 周五 18:30
+  assert.equal(before.peak, false)
+  assert.equal(before.periodMs, 255 * 3600_000, '2/13 18:00 → 2/24 9:00 应是 255 小时')
+  const during = periodState(T('2026-02-20T02:00:00Z'), DEFAULT_TIMEZONE) // 假期中的周五 10:00
+  assert.equal(during.peak, false, '春节里的工作日白天应为空闲')
+  assert.equal(during.holiday, '春节')
+  assert.equal(during.nextChangeMs, (255 - 160) * 3600_000, '距下一次高峰应有 95 小时')
+  assert.ok(during.nextChangeMs > 0, '长连休里绝不能再出现 nextChangeMs = 0')
+})
+
+await check('节假日表跨年不缺席：表外年份如实说明未覆盖', () => {
+  // 表外年份退回「按周一至周五」判断，并且**必须**由 holidayCovered 说明，
+  // 否则界面会继续按旧口径展示却什么都不说。
+  assert.equal(holidayYearCovered(2025), false)
+  assert.equal(holidayYearCovered(2026), true)
+})
+
 console.log('pricing：高峰 / 空闲判定（北京时间）')
+
 
 await check('工作日 8:59 是空闲、9:00 起是高峰', () => {
   assert.equal(isPeak(T('2026-09-10T00:59:00Z'), DEFAULT_TIMEZONE), false, '8:59 应为空闲')

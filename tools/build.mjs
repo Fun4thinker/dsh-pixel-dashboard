@@ -8,6 +8,7 @@
  *                    哈希自动派生，不存在「忘了加版本号」这种失败模式。
  *   lib/host.js      宿主半边（入口 import 的实现）
  *   lib/pricing.js   时段与价目（纯函数）
+ *   lib/holidays.js  中国法定节假日表（高峰只在工作日，节假日全天按空闲）
  *   lib/ledger.js    本机用量账本
  *   lib/client.js    浏览器半边产物（window.__ModuleLoader__ 容器格式）
  *
@@ -35,7 +36,7 @@ const outDir = join(root, 'lib')
  * **新增宿主模块必须登记到这里**，否则它不会被复制进 lib/——而失败形态是运行时
  * `ERR_MODULE_NOT_FOUND`（构建本身成功，装到 profile 里才炸）。因此这里列全。
  */
-const HOST_SOURCES = ['host.js', 'pricing.js', 'ledger.js', 'balance.js', 'plans.js', 'volc-sign.js', 'prefs.js', 'notify.js', 'custom-rates.js']
+const HOST_SOURCES = ['host.js', 'pricing.js', 'holidays.js', 'ledger.js', 'balance.js', 'plans.js', 'volc-sign.js', 'prefs.js', 'notify.js', 'custom-rates.js']
 
 /**
  * 由宿主源码内容算出的短哈希，用作实现版本号。

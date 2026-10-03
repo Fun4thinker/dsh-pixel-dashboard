@@ -2,9 +2,10 @@
  * 用量看板主体：总览指标、时段状态与倒计时、活跃日历、Token 趋势、
  * 模型分布、费用估算与会话清单。只读投影，不修改任何会话状态。
  *
- * 计费口径与官方一致：高峰（周一至周五 9:00–12:00、14:00–18:00）与空闲
- * 时段分别按各自单价计价，空闲价为高峰价的一半；历史用量按每条请求
- * 实际发生的时段归档，因此费用不是用一个折扣近似出来的。
+ * 计费口径与官方一致：高峰（**周一至周五、不含中国法定节假日** 9:00–12:00、
+ * 14:00–18:00）与空闲时段分别按各自单价计价，空闲价为高峰价的一半；
+ * 全部周末与法定节假日全天都按空闲计费（含调休上班的周末）。
+ * 历史用量按每条请求实际发生的时段归档，因此费用不是用一个折扣近似出来的。
  * @module dsh-pixel-dashboard/client/dashboard
  */
 
@@ -104,6 +105,26 @@ const TREND_SERIES_LIMIT = 5
 
 /** 消费估计趋势的序列定义（单条：每日金额）。 */
 const COST_SERIES = [{ key: 'cost', label: '每日消费估计', tone: 'pink' }]
+
+/** 把高峰窗口数组渲染成 `9:00–12:00、14:00–18:00`。 */
+/**
+ * 「法定节假日」那一行的取值：说明节假日全天按空闲计费，以及日历收录到哪一年。
+ *
+ * 两件事都必须说：**口径**（节假日全天空闲，正是它让国庆期间的周四、周五便宜下来）
+ * 与**覆盖范围**（这份日历只收录到某一年）。少了后者，跨到表外年份时界面会继续按
+ * 「周一至周五」判断却不说明，用户看到的就是一个悄悄错了的时段——而这类错误不报错、
+ * 不崩溃，只是把高峰按空闲计价。
+ *
+ * 拿不到时返回「—」而不是编一句：旧宿主根本没有这条例外，写「已收录」就是在撒谎。
+ * @param {object} data - 看板数据。
+ * @returns {string} 形如 `全天按空闲计费 · 已收录 2026`。
+ */
+function holidayRuleText(data) {
+  const years = data?.peakRule?.holidays?.years
+  if (!Array.isArray(years) || years.length === 0) return '—'
+  const list = [...years].sort((a, b) => Number(a) - Number(b)).join('、')
+  return `全天按空闲计费 · 已收录 ${list}`
+}
 
 /** 把高峰窗口数组渲染成 `9:00–12:00、14:00–18:00`。 */
 function formatWindows(windows) {
@@ -313,6 +334,9 @@ function usePeriod(data, now) {
       peak: data.period.peak === true,
       remainMs: Math.max(0, Number(data.period.nextChangeMs ?? 0) - elapsed),
       minute: minuteOfDay(now, data.timezone),
+      // 落在法定节假日里时宿主给出的节日名（国庆节 / 春节…），否则空串。
+      // 只看 peak 无法解释「周中白天为什么便宜」，而那一刻用户最需要的就是这句解释。
+      holiday: typeof data.period.holiday === 'string' ? data.period.holiday : '',
     }
   }, [data, now])
 }
@@ -597,7 +621,10 @@ export function View(props) {
         // 只是换了色相：两态看起来才是同一种东西的两个状态，而不是两种控件。
         extra: h('span', { className: `px-badge${period.peak ? ' peak' : ' ok'}` },
           h('i', { className: 'px-pulse' }),
-          period.peak ? '高峰时段计费中' : '空闲时段计费中'),
+          // 节假日里把节日名写进徽标：那一刻「为什么是空闲」比「是空闲」更需要说明，
+          // 因为按星期几看它本该是高峰。没有节日时退回原来的四种字。
+          period.peak ? '高峰时段计费中'
+            : (period.holiday === '' ? '空闲时段计费中' : `${period.holiday} · 空闲计费`)),
       },
       h('div', { className: 'px-period' },
         h('div', { className: 'px-period-clock' },
@@ -607,7 +634,13 @@ export function View(props) {
           h('span', { className: 'px-period-clock-foot' },
             `${formatMinuteOfDay(period.minute)} · ${data.timezone}`)),
         h('div', { className: 'px-rows px-period-rows' },
-          h(Row, { label: '高峰时段', value: `周一至周五 ${formatWindows(data.peakRule?.windows)}` }),
+          // 「周一至周五」后面必须跟上「不含法定节假日」：否则国庆期间的周四、周五
+          // 明明按空闲计费，这一行却说着「高峰时段 = 周一至周五」，自相矛盾。
+          h(Row, {
+            label: '高峰时段',
+            value: `周一至周五（不含法定节假日）${formatWindows(data.peakRule?.windows)}`,
+          }),
+          h(Row, { label: '法定节假日', value: holidayRuleText(data) }),
           h(Row, {
             label: `${range.label}高峰 / 空闲`,
             value: `${formatCny(rangeCost.peak)} / ${formatCny(rangeCost.idle)}`,
