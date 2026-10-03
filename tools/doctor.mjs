@@ -90,14 +90,28 @@ if (existsSync(patchFile)) {
 }
 
 // ── 3. 旧的整机部署目录（早期方式）─────────────────────────────
+//
+// 这个目录**身兼两职**：早期安装方式把插件代码放在这里，而用量账本与开关
+// （lib/host.js 的 resolveLedgerPath、lib/prefs.js 的 resolvePrefsPath）也一直落在这里。
+// 因此这里要分清两种状态，不能一律劝人去「清掉」：
+//   - 还有旧代码：提示可以只清代码（uninstall.mjs 不会碰账本）；
+//   - 只剩数据：那是**正常且必须保留**的，什么都不用做——
+//     此时若还说「官方方式不需要它」，用户会去找办法把目录删掉，
+//     而那正是把全部用量历史删掉。
 let deployedVersion
 if (existsSync(pluginDir)) {
   const hostFile = join(pluginDir, 'lib', 'host.js')
   deployedVersion = existsSync(hostFile)
     ? /IMPL_VERSION = '([^']+)'/.exec(readFileSync(hostFile, 'utf8'))?.[1]
     : undefined
-  note('info', `检测到整机部署目录（早期安装方式，实现版本 ${deployedVersion ?? '未知'}）`,
-    `${pluginDir}\n      官方方式不需要它，可用 node tools/uninstall.mjs 清掉`)
+  if (deployedVersion === undefined) {
+    note('info', '整机部署目录只剩数据（旧代码已清）',
+      `${pluginDir}\n      账本与开关住在这里，官方方式也要用它，**不要删**`)
+  } else {
+    note('info', `检测到整机部署目录（早期安装方式，实现版本 ${deployedVersion}）`,
+      `${pluginDir}\n      官方方式不需要它的**代码**；node tools/uninstall.mjs 只清代码，`
+      + '账本与开关留在原处不会动')
+  }
   const stale = readdirSync(join(home, 'plugins')).filter((name) => name.startsWith('dsh-pixel-dashboard-'))
   if (stale.length > 0) note('warn', '存在历史版本目录（可删）', stale.join(', '))
 }

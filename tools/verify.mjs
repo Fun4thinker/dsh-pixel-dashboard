@@ -17,6 +17,9 @@ const STEPS = [
   ['构建可发布包（tools/build.mjs）', 'build.mjs'],
   ['时段 / 价目 / 账本逻辑（tools/test.mjs）', 'test.mjs'],
   ['补丁层清理与校验（tools/test-patch-layer.mjs）', 'test-patch-layer.mjs'],
+  // 卸载脚本只删代码、不删数据。这一关必须在：账本与开关就住在插件目录里，
+  // 而「清理旧目录」与「删掉全部用量历史」只差一个 rmSync——没有任何别的闸门看得见。
+  ['卸载的数据安全（tools/test-uninstall.mjs）', 'test-uninstall.mjs'],
   ['宿主预检 + 非空数据闸门（tools/preflight.mjs）', 'preflight.mjs'],
   ['客户端渲染闸门（tools/render-check.mjs）', 'render-check.mjs'],
   // 真实 DOM 闸门放在最后：它验的是「东西被放到哪里去了」。服务端渲染那一关拿不到
