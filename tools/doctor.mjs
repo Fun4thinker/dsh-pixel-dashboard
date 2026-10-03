@@ -142,10 +142,32 @@ try {
 }
 
 // ── 5. 用量账本（本机记录）─────────────────────────────────────
+//
+// 账本路径**不能只看 DSH_HOME**。宿主插件里那份解析（lib/host.js 的 resolveLedgerPath）是
+//   process.env.DSH_HOME ?? (process.env.USERPROFILE ?? homedir())
+//而桌面端**不设 DSH_HOME**：它把 home 通过启动参数交给宿主，环境变量里没有。于是同一台
+//机器上会出现两份账本——桌面端写 ~/plugins/...（USERPROFILE 分支），而带 DSH_HOME 的
+//CLI 会话写 ~/.dsh/plugins/...。早先这里只查 DSH_HOME 那一份，于是体检报告的是一个陈旧的
+//空账本（4 条记录），而用户真实的 1.7 万条历史在另一处，完全没被看见——
+//「账本看起来是空的」与「账本其实在别处」在报告上长得一模一样。
 const ledgerFromEnv = process.env.DSH_PIXEL_LEDGER
-const ledgerPath = livePayload?.ledger?.path
-  ?? ledgerFromEnv
-  ?? join(home, 'plugins', 'dsh-pixel-dashboard', 'usage-ledger.jsonl')
+const usageFallback = process.env.USERPROFILE ?? homedir()
+/** 两个候选路径 + 行数，用来判断哪一份才是这台机器真正在用的。 */
+const candidates = [...new Set([
+  join(home, 'plugins', 'dsh-pixel-dashboard', 'usage-ledger.jsonl'),
+  join(usageFallback, 'plugins', 'dsh-pixel-dashboard', 'usage-ledger.jsonl'),
+])].map((path) => ({
+  path,
+  lines: existsSync(path)
+    ? readFileSync(path, 'utf8').split('\n').filter((line) => line.trim() !== '').length
+    : 0,
+}))
+/** 在线时以宿主**自己报的**路径为准——那是唯一的权威（它在真正写这份文件）。 */
+const liveLedgerPath = livePayload?.ledger?.path
+const ledgerPath = liveLedgerPath ?? ledgerFromEnv ?? (candidates
+  .filter((item) => item.lines > 0)
+  // 两份都有内容时取记录多的那一份：那才是长期在用的账本。
+  .sort((a, b) => b.lines - a.lines)[0]?.path ?? candidates[0].path)
 /** 直接读文件数行：这是账本自身的真实内容。 */
 const fileLines = existsSync(ledgerPath)
   ? readFileSync(ledgerPath, 'utf8').split('\n').filter((line) => line.trim() !== '').length
@@ -154,6 +176,16 @@ if (fileLines > 0) {
   note('ok', `本机用量账本：${fileLines} 条记录、${(statSync(ledgerPath).size / 1024).toFixed(0)} KB`, ledgerPath)
 } else {
   note('info', '用量账本还是空的（第一次打开看板时会扫描历史会话并写入）', ledgerPath)
+}
+// 两份都非空时点名另一份：否则用户永远不知道自己的历史被劈成了两半，
+// 而只报「其中一份」会让人以为看板算少了。
+for (const item of candidates) {
+  if (item.lines > 0 && resolve(item.path) !== resolve(ledgerPath)) {
+    note('warn', `另有一份账本（${item.lines} 条记录）未被统计`, item.path)
+  }
+}
+if (liveLedgerPath === undefined && candidates.some((item) => item.lines > 0)) {
+  note('info', '账本路径按 DSH_HOME / USERPROFILE 推断；连上运行中的 dsh 后会以宿主上报的为准')
 }
 if (ledgerFromEnv !== undefined && ledgerFromEnv.trim() !== '') {
   note('info', '账本路径被 DSH_PIXEL_LEDGER 覆盖', ledgerFromEnv)

@@ -19,8 +19,11 @@ dsh-web.log
 *.tmp
 *.invalid
 # 提交时用的临时消息文件（`git commit -F`）。用文件而不是 -m 是为了写多行说明，
-# 忘了删就会跟着提交进去——踩过两次（.git-msg*.txt 与 commit-msg.txt 各一次），
-# 因此两种常见命名都按前缀忽略。
+# 忘了删就会跟着提交进去——已经踩过三次（.git-msg*.txt、commit-msg.txt、.msg-2103.txt
+# 各一次），每次都以为「这次记得删」。**前两条是教训，第三条是模式**：
+# 因此改成按通配忽略，而不是逐个补名字——补名字的失败方向是「又漏一个」。
+*.msg-*.txt
+.msg-*.txt
 .git-msg*.txt
 commit-msg*.txt
 
