@@ -52,15 +52,43 @@ assert.deepEqual(
 const routes = []
 /** 记录 ctx.on 注册的监听器，供下面驱动 `session/event` 用。 */
 const hostListeners = new Map()
+/**
+ * 记录 ctx.effect 的注销函数。
+ *
+ * 宿主把每条路由都注册在 `ctx.effect` 里（fiber 销毁时注销），因此替身必须有这个
+ * API——少了它，`apply` 会以 `ctx.effect is not a function` 直接失败。
+ * 收集起来也方便断言「路由确实能被注销」。
+ */
+const effectDisposers = []
 const ctx = {
   get(name) {
-    if (name === 'webServer') return { register: (route) => { routes.push(route); return () => {} } }
+    if (name === 'webServer') {
+      return {
+        register: (route) => {
+          // 与真实实现同一口径：重复路径必须抛错，否则漏注销的 bug 会溜过去。
+          if (routes.some((item) => item.path === route.path)) {
+            throw new Error(`webserver: duplicate ${route.kind} route "${route.path}"`)
+          }
+          routes.push(route)
+          return () => {
+            const at = routes.indexOf(route)
+            if (at >= 0) routes.splice(at, 1)
+          }
+        },
+      }
+    }
     return undefined
   },
   on(event, handler) {
     const list = hostListeners.get(event) ?? []
     list.push(handler)
     hostListeners.set(event, list)
+  },
+  // cordis 语义：回调的返回值是 disposer，fiber 销毁时由框架调用。
+  effect(fn) {
+    const dispose = fn()
+    if (typeof dispose === 'function') effectDisposers.push(dispose)
+    return () => {}
   },
 }
 // apply 通过 ctx.webServer 访问已声明注入的服务；替身提供同名属性。

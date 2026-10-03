@@ -20,6 +20,10 @@ const STEPS = [
   // 卸载脚本只删代码、不删数据。这一关必须在：账本与开关就住在插件目录里，
   // 而「清理旧目录」与「删掉全部用量历史」只差一个 rmSync——没有任何别的闸门看得见。
   ['卸载的数据安全（tools/test-uninstall.mjs）', 'test-uninstall.mjs'],
+  // 宿主路由的生命周期：插件必须能在同一进程里被重新挂载。
+  // 裸调 webServer.register 会把路由永久留下，第二次 apply 就抛 duplicate route，
+  // 而那只在「热重载 / 启用停用」时才发生——单跑一次 apply 的闸门看不出问题。
+  ['宿主路由生命周期（tools/test-lifecycle.mjs）', 'test-lifecycle.mjs'],
   ['宿主预检 + 非空数据闸门（tools/preflight.mjs）', 'preflight.mjs'],
   ['客户端渲染闸门（tools/render-check.mjs）', 'render-check.mjs'],
   // 真实 DOM 闸门放在最后：它验的是「东西被放到哪里去了」。服务端渲染那一关拿不到
