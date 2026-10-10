@@ -2958,6 +2958,123 @@ must(html.includes('user/balance'), '余额面板应标出数据来源端点')
   // 管理入口现在挂在各自那一家的区块里，而不是面板底部一排
   must(planHtml.includes('commandcode.ai/studio'), '套餐面板应给出 Command Code 管理入口')
   must(planHtml.includes('console.volcengine.com'), '套餐面板应给出火山控制台入口')
+
+  // ── 「移除套餐凭据」：勾选 + 二次确认，且不可移除的条目照实说清 ──────
+  // 这是插件唯一会删掉用户密钥的地方。闸门要钉住的不是「能点」，而是三件
+  // 容易被做错的事：
+  //   1. 默认**不勾选**任何一条（一点进来就勾好，等于把删除做成默认动作）；
+  //   2. 按下「移除」先进入二次确认，而不是立刻删；
+  //   3. 来自环境变量 / .env 的条目**不给**勾选框（unset 对它们无效或抛错），
+  //      并写明该去改哪里——画一个必然失败的勾选框比不画更糟。
+  const credPayload = {
+    writable: true,
+    credentialFile: 'C:\\Users\\me\\.dsh\\.credentials.yaml',
+    providers: [
+      {
+        id: 'volcengine',
+        name: '火山方舟 Coding Plan',
+        refs: [
+          {
+            name: 'VOLC_ACCESS_KEY_ID', purpose: 'AccessKey ID',
+            configured: true, source: 'file', sourceLabel: 'DSH 凭据文件',
+            hint: '…6789', writable: true, removable: true, blockedReason: '',
+          },
+          {
+            name: 'VOLC_SECRET_ACCESS_KEY', purpose: 'Secret Access Key',
+            configured: true, source: 'env', sourceLabel: '启动 dsh 时的环境变量（插件改不了）',
+            hint: '…abcd', writable: false, removable: false,
+            blockedReason: '这一条来自启动 dsh 时的环境变量，插件改不了：请在启动 dsh 的终端里取消它。',
+          },
+          {
+            name: 'VOLCENGINE_ACCESS_KEY_ID', purpose: 'AccessKey ID 的另一种写法',
+            configured: false, source: '', sourceLabel: '',
+            hint: '', writable: false, removable: false, blockedReason: '',
+          },
+        ],
+      },
+      {
+        id: 'commandcode',
+        name: 'Command Code',
+        refs: [{
+          name: 'COMMAND_CODE_API_KEY', purpose: '工作台里创建的 API Key',
+          configured: true, source: 'file', sourceLabel: 'DSH 凭据文件',
+          hint: '…wxyz', writable: true, removable: true, blockedReason: '',
+        }],
+        cliFile: {
+          path: 'C:\\Users\\me\\.commandcode\\auth.json',
+          present: true, hasKey: true,
+          note: '本插件只读不写，不会删除它；要彻底移除请自己编辑该文件。',
+        },
+      },
+    ],
+  }
+  const credHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: Date.now(),
+    payload: { enabled: true, providers: [{ id: 'volcengine', name: '火山方舟', ok: true, windows: [{ window: 'fiveHour', usedPercent: 10 }] }] },
+    credentials: credPayload,
+    selected: undefined,
+    onSelect: () => {},
+    onRemoved: () => {},
+  }))
+  must(credHtml.includes('移除套餐凭据'), '应给出「移除套餐凭据」入口')
+  must(credHtml.includes('VOLC_ACCESS_KEY_ID') && credHtml.includes('VOLC_SECRET_ACCESS_KEY'),
+    '可移除与不可移除的条目都要列出来')
+  // 默认不勾选：只看**凭据行**里的勾选框。整页还有一个「套餐」总开关，
+  // 它是勾上的，拿整页去扫会把那个一起命中。
+  const credSection = credHtml.slice(credHtml.indexOf('px-cred-details'))
+  must(credSection.includes('px-cred-row'), '移除区块里应有凭据行')
+  must(!/type="checkbox"[^>]*checked/.test(credSection),
+    '默认不得勾选任何一条——那等于把删除做成默认动作')
+  must(credHtml.includes('不可撤销'), '必须点明操作不可撤销')
+  // 不可移除的条目说明原因（env 层），而不是只给一个禁用的勾选框
+  must(credHtml.includes('插件改不了'), '来自环境变量的条目必须说明原因')
+  must(credHtml.includes('px-cred-blocked'), '不可移除的条目应有独立样式，与可勾选的行看得出区别')
+  must(!credHtml.includes('px-cred-confirm'), '未按「移除」前不得出现二次确认块')
+  // 打码：只给尾段，用于确认删的是哪一把
+  must(credHtml.includes('…6789'), '应显示打码后的凭据尾段')
+  must(!credHtml.includes('AKLT'), '不得出现凭据原值')
+  // CLI 凭据文件：要提示它存在，且明说插件不会删
+  must(credHtml.includes('commandcode') && credHtml.includes('只读不写'),
+    'Command Code 的 CLI 凭据文件必须提示，并说明插件不会删除它')
+
+  // 一条都没配过时整块不渲染：摊开一张全是「未配置」的表只是噪音
+  const noCredHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: Date.now(),
+    payload: { enabled: true, providers: [{ id: 'volcengine', name: '火山方舟', ok: false, reason: 'no-key', windows: [] }] },
+    credentials: {
+      writable: true,
+      providers: [{
+        id: 'volcengine', name: '火山方舟',
+        refs: [{ name: 'VOLC_ACCESS_KEY_ID', purpose: 'AK', configured: false, removable: false }],
+      }],
+    },
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(!noCredHtml.includes('移除套餐凭据'), '一家都没配过时不应出现移除入口（没有东西可移除）')
+
+  // 宿主没有可写的凭据服务：仍列出清单，但明说这台机器上改不了
+  const readOnlyCredHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: Date.now(),
+    payload: { enabled: true, providers: [{ id: 'volcengine', name: '火山方舟', ok: true, windows: [{ window: 'fiveHour', usedPercent: 10 }] }] },
+    credentials: { ...credPayload, writable: false },
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(readOnlyCredHtml.includes('无法移除'), '没有可写凭据服务时必须说清，而不是给一个必然失败的按钮')
+
+  // 套餐总开关关掉时，移除入口**仍然要在**：关掉监控只是不发请求，
+  // 而「我想把这家删掉」与「我要不要看它的额度」是两件事——用户正是在
+  // 准备不再用它的时候才会来删，那时开关多半已经关了。
+  const offCredHtml = renderToStaticMarkup(React.createElement(PlansPanelForGate, {
+    now: Date.now(),
+    payload: { enabled: false, providers: [] },
+    credentials: credPayload,
+    selected: undefined,
+    onSelect: () => {},
+  }))
+  must(offCredHtml.includes('移除套餐凭据'), '套餐监控关掉时移除入口仍应可用（用户正是这时才要删）')
+  must(offCredHtml.includes('VOLC_ACCESS_KEY_ID'), '关掉监控时凭据清单仍要列出来')
 }
 
 // ── 套餐监看选择：状态只能有一个家，且存储全程 fail-soft ────────────

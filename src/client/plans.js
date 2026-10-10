@@ -277,6 +277,117 @@ export function hasAnyQuota(payload) {
     && Array.isArray(provider.windows) && provider.windows.length > 0)
 }
 
+/** 「移除凭据」路由，与宿主注册路径一致。 */
+const CREDENTIALS_URL = '/dsh-pixel/plan-credentials'
+
+/**
+ * 取「移除凭据」清单（**只读**：只查现状，不动任何东西）。
+ *
+ * 404 有确定含义：宿主是还没有这条路由的旧版本。这时界面**不画移除入口**，
+ * 而不是画一个点了必然失败的按钮。
+ * @param {{signal?:AbortSignal}} [options] - 选项。
+ * @returns {Promise<object>} 清单负载。
+ */
+export async function fetchPlanCredentials(options = {}) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => { controller.abort() }, REQUEST_TIMEOUT_MS)
+  const onAbort = () => { controller.abort() }
+  options.signal?.addEventListener('abort', onAbort, { once: true })
+  try {
+    const response = await fetch(CREDENTIALS_URL, { signal: controller.signal, headers: { accept: 'application/json' } })
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error('宿主没有「移除凭据」路由（插件版本可能过旧，重启 dsh 试试）')
+      }
+      throw new Error(`HTTP ${response.status}`)
+    }
+    return await response.json()
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * 移除用户勾选的凭据引用。
+ *
+ * **不抛错**（除了网络层）：宿主的正常返回里逐条带着成功 / 失败与原因，
+ * 界面要的正是那份逐条结果。把「三条里失败了一条」整体抛成异常，
+ * 会让用户看不到另外两条到底成没成。
+ * @param {string[]} refs - 用户勾选的引用名。
+ * @returns {Promise<object>} `{ results, credentials }`。
+ * @throws {Error} 仅当请求本身失败（网络 / 非 2xx）。
+ */
+export async function removePlanCredentials(refs) {
+  const response = await fetch(CREDENTIALS_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ refs: Array.isArray(refs) ? refs : [] }),
+  })
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`
+    try {
+      const body = await response.json()
+      if (typeof body?.error === 'string') detail = body.error
+    } catch {
+      // 响应不是 JSON 时保留状态码说明
+    }
+    throw new Error(`移除失败：${detail}`)
+  }
+  return await response.json()
+}
+
+/**
+ * 把清单摊平成「可勾选的行」，供界面渲染。
+ *
+ * 两类行**不可勾选**，而且理由完全不同，必须分开表达：
+ *   - `removable === false`：来自启动环境变量或 `.env` 回落层，`unset` 动不了它
+ *     （前者抛错，后者是**静默空操作**）。画上勾选框就是骗人。
+ *   - 未配置：本来就没有，没什么可移除的。
+ * @param {object|undefined} payload - {@link fetchPlanCredentials} 的负载。
+ * @returns {Array<{vendor:string,vendorName:string,ref:object,selectable:boolean}>} 行。
+ */
+export function credentialRows(payload) {
+  const providers = Array.isArray(payload?.providers) ? payload.providers : []
+  const rows = []
+  for (const provider of providers) {
+    for (const ref of Array.isArray(provider?.refs) ? provider.refs : []) {
+      rows.push({
+        vendor: provider.id,
+        vendorName: provider.name ?? provider.id,
+        ref,
+        selectable: ref?.removable === true,
+      })
+    }
+  }
+  return rows
+}
+
+/**
+ * 统计清单：有几家配了、有几条可移除。
+ *
+ * 界面用「可移除条数」决定移除入口要不要出现在第一屏——一家都没配时
+ * 整块应当收起，而不是把几十行「未配置」摊在用户眼前。
+ * @param {object|undefined} payload - 清单负载。
+ * @returns {{configured:number,removable:number,vendors:number}} 统计。
+ */
+export function credentialSummary(payload) {
+  const providers = Array.isArray(payload?.providers) ? payload.providers : []
+  let configured = 0
+  let removable = 0
+  let vendors = 0
+  for (const provider of providers) {
+    let touched = false
+    for (const ref of Array.isArray(provider?.refs) ? provider.refs : []) {
+      if (ref?.configured === true) { configured += 1; touched = true }
+      if (ref?.removable === true) removable += 1
+    }
+    if (provider?.cliFile?.hasKey === true) { configured += 1; touched = true }
+    if (touched) vendors += 1
+  }
+  return { configured, removable, vendors }
+}
+
 /**
  * 取「最紧」的那个窗口，用于费用条这种一行位置显示。
  *

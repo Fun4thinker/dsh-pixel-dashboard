@@ -638,6 +638,118 @@ const results = []
   results.push('活跃日历悬停：缺金额显示「—」而不是 ¥0')
 }
 
+// ── 7c) 「移除凭据」的勾选与二次确认：只有跑起来才验得到 ────────────
+// 服务端渲染那一关只能验「画了什么」。而这里真正的行为是**交互**：
+//   1. 默认不勾选；
+//   2. 勾上之后按钮才可用；
+//   3. 点「移除」**不立刻发请求**，而是先进入确认态；
+//   4. 确认之后才带着**勾选的名字**发出去。
+// 第 3 条尤其重要：只按一次就删，误触的代价是用户的密钥没了。静态渲染永远
+// 看不到这个中间态（它由 state 驱动），所以只能在这一关挂真组件来验。
+{
+  const { PlansPanel } = await import(
+    pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
+
+  /** 记录 fetch 调用，供断言「什么时候发、带了什么」。 */
+  const sent = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), body: init?.body === undefined ? undefined : JSON.parse(String(init.body)) })
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ results: [{ name: 'VOLC_ACCESS_KEY_ID', ok: true, reason: 'removed', message: '已移除。' }] }),
+    }
+  }
+
+  const payload = {
+    writable: true,
+    credentialFile: 'C:\\Users\\me\\.dsh\\.credentials.yaml',
+    providers: [{
+      id: 'volcengine',
+      name: '火山方舟 Coding Plan',
+      refs: [
+        {
+          name: 'VOLC_ACCESS_KEY_ID', purpose: 'AccessKey ID',
+          configured: true, source: 'file', sourceLabel: 'DSH 凭据文件',
+          hint: '…6789', writable: true, removable: true, blockedReason: '',
+        },
+        {
+          name: 'VOLC_SECRET_ACCESS_KEY', purpose: 'Secret Access Key',
+          configured: true, source: 'env', sourceLabel: '启动 dsh 时的环境变量（插件改不了）',
+          hint: '…abcd', writable: false, removable: false,
+          blockedReason: '这一条来自启动 dsh 时的环境变量，插件改不了。',
+        },
+      ],
+    }],
+  }
+
+  const host = window.document.createElement('div')
+  window.document.body.appendChild(host)
+  await renderInto(host, React.createElement(PlansPanel, {
+    now: Date.now(),
+    payload: { enabled: true, providers: [] },
+    credentials: payload,
+    selected: undefined,
+    onSelect: () => {},
+    onRemoved: () => {},
+  }))
+
+  // 展开「移除套餐凭据」这块（<details> 默认收起）
+  const details = host.querySelector('.px-cred-details')
+  must(details !== null, '应渲染「移除套餐凭据」区块')
+  await React.act(async () => { details.open = true })
+  await settle()
+
+  const boxes = [...host.querySelectorAll('.px-cred-row input[type=checkbox]')]
+  must(boxes.length === 2, `应有两条凭据行，实际 ${boxes.length}`)
+  must(boxes.every((box) => box.checked === false), '默认不得勾选任何一条')
+  // 不可移除的那一条（env 层）必须是禁用的——画一个必然失败的勾选框比不画更糟
+  must(boxes[1].disabled === true, 'env 层的条目勾选框应禁用（unset 对它无效）')
+
+  const findButton = (text) => [...host.querySelectorAll('button')]
+    .find((node) => node.textContent.includes(text))
+  const removeButton = findButton('移除')
+  must(removeButton !== undefined, '应有「移除」按钮')
+  must(removeButton.disabled === true, '一条都没勾时按钮应禁用，而不是点了报错')
+
+  // 勾上可移除的那一条。
+  // 只派发 click，**不要**先手动置 checked：jsdom 的 click 自身会翻转 checked，
+  // 手动置真再点一下会翻回 false，React 读到的就是「取消勾选」。
+  await React.act(async () => {
+    boxes[0].dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+  })
+  await settle()
+  must(boxes[0].checked === true, '点击应勾上这一条')
+
+  const armed = findButton('移除选中的')
+  must(armed !== undefined && armed.disabled === false, '勾选后按钮应可用')
+  // 关键：点一下**不能**发请求
+  await React.act(async () => { armed.dispatchEvent(new window.MouseEvent('click', { bubbles: true })) })
+  await settle()
+  must(sent.length === 0, `第一次点击不得发请求（应先二次确认），实际发了 ${sent.length} 次`)
+  const confirmBlock = host.querySelector('.px-cred-confirm')
+  must(confirmBlock !== null, '点「移除」后应出现二次确认块')
+  must(confirmBlock.textContent.includes('VOLC_ACCESS_KEY_ID'), '确认块要列出将删的名字')
+  must(confirmBlock.textContent.includes('未配置'), '确认块要说清删完会怎样')
+
+  // 确认：这时才真的发请求，且只带勾选的那一条
+  const confirmButton = findButton('确认移除')
+  must(confirmButton !== undefined, '应有「确认移除」按钮')
+  await React.act(async () => { confirmButton.dispatchEvent(new window.MouseEvent('click', { bubbles: true })) })
+  await settle()
+  must(sent.length === 1, `确认后应恰好发一次请求，实际 ${sent.length} 次`)
+  must(sent[0].url.includes('/dsh-pixel/plan-credentials'), `请求应打到凭据路由，实际 ${sent[0].url}`)
+  must(sent[0].body?.refs?.length === 1 && sent[0].body.refs[0] === 'VOLC_ACCESS_KEY_ID',
+    `只应提交勾选的那一条，实际 ${JSON.stringify(sent[0].body)}`)
+  // 逐条结果要画出来（成功与失败都算）
+  must(host.textContent.includes('已移除'), '应显示逐条移除结果')
+  must(host.querySelector('.px-cred-results') !== null, '结果块应有独立样式')
+
+  globalThis.fetch = originalFetch
+  results.push('移除凭据：默认不勾选 + 二次确认才发请求 + 只提交勾选的条目')
+}
+
 // ── 8) 样式闸门：文字靠右、两色不同、没有残留的环样式 ─────────────
 {
   const { STYLES } = await import(pathToFileURL(join(root, 'lib', 'client', 'theme.js')).href)

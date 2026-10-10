@@ -61,11 +61,20 @@ function makeWebServer() {
 
 const { default: plugin } = await import(pathToFileURL(join(root, 'lib', 'host.js')).href)
 
+/**
+ * 本插件注册的路由条数。
+ *
+ * **新增路由必须同时改这里**（`tools/preflight.mjs` 那个 `routes.length` 断言同理）。
+ * 钉死条数是有意的：它逼你确认「新路由有没有走 `route()` 助手」——裸调
+ * `ctx.webServer.register` 会让这一关在第二轮 apply 时炸掉。
+ */
+const ROUTE_COUNT = 9
+
 check('插件声明了 inject: [webServer]（否则 apply 时机不确定）', () => {
   assert.deepEqual(plugin.inject, ['webServer'])
 })
 
-check('注册 8 条路由，且全部随 fiber 销毁一起注销', () => {
+check(`注册 ${ROUTE_COUNT} 条路由，且全部随 fiber 销毁一起注销`, () => {
   const webServer = makeWebServer()
   const disposers = []
   const ctx = {
@@ -77,8 +86,8 @@ check('注册 8 条路由，且全部随 fiber 销毁一起注销', () => {
     effect: (fn) => { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); return () => {} },
   }
   plugin.apply(ctx)
-  assert.equal(webServer.size(), 8, '应注册 8 条路由')
-  assert.ok(disposers.length >= 8, `每条路由都应注册 disposer，实际 ${disposers.length}`)
+  assert.equal(webServer.size(), ROUTE_COUNT, `应注册 ${ROUTE_COUNT} 条路由`)
+  assert.ok(disposers.length >= ROUTE_COUNT, `每条路由都应注册 disposer，实际 ${disposers.length}`)
   for (const dispose of disposers.splice(0)) dispose()
   assert.equal(webServer.size(), 0, 'fiber 销毁后路由必须清空——否则重新 apply 会撞重复路由')
 })
@@ -96,7 +105,7 @@ check('同一进程里可以反复重新挂载（热重载 / 启用停用）', (
   // 三轮：apply → 销毁。裸调 register 会在第二轮就抛 duplicate。
   for (let round = 1; round <= 3; round += 1) {
     assert.doesNotThrow(() => plugin.apply(ctx), `第 ${round} 轮 apply 不应抛错`)
-    assert.equal(webServer.size(), 8, `第 ${round} 轮应有 8 条路由`)
+    assert.equal(webServer.size(), ROUTE_COUNT, `第 ${round} 轮应有 ${ROUTE_COUNT} 条路由`)
     for (const dispose of disposers.splice(0)) dispose()
     assert.equal(webServer.size(), 0, `第 ${round} 轮销毁后应清空`)
   }

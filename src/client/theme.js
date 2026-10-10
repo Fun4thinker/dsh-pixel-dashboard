@@ -326,6 +326,16 @@ const DASHBOARD = `
   box-shadow: 0 2px 10px color-mix(in srgb, var(--px-pink-deep) 35%, transparent);
 }
 .px-btn.small { padding: 5px 11px; font-size: 12px; }
+/* 破坏性动作（移除凭据）。红底只给这一个按钮：插件里其余动作都不是不可撤销的，
+   把危险色摊开用会让真正的警告失去分量。 */
+.px-btn.danger {
+  color: #fff; border-color: transparent;
+  background: var(--px-tone-red);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--px-tone-red) 32%, transparent);
+}
+.px-btn.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--px-tone-red) 86%, #000);
+}
 .px-spin { display: inline-block; animation: px-rot 0.9s linear infinite; }
 
 .px-seg {
@@ -1200,6 +1210,107 @@ const DASHBOARD = `
   font-family: var(--px-num-font);
   font-size: 11px; color: var(--px-ink-2);
 }
+
+/* 「移除套餐凭据」：破坏性动作，因此整块折进 details 且默认收起。
+   危险色只用在「移除」按钮与确认态上——满屏红字会让真正的警告失效。 */
+.px-cred-details { margin-top: 10px; }
+.px-cred { margin-top: 10px; }
+.px-cred-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.px-cred-head > b { font-size: 13px; font-weight: 620; color: var(--px-ink); }
+.px-cred-head .px-muted { margin: 0; }
+.px-cred-intro { margin: 0 0 10px; font-size: 11.5px; line-height: 1.75; color: var(--px-muted); }
+.px-cred-intro code {
+  font-family: var(--px-num-font);
+  font-size: 11px; color: var(--px-ink-2);
+}
+.px-cred-note { margin: 0 0 10px; font-size: 11.5px; line-height: 1.7; }
+.px-cred-vendors { display: grid; gap: 10px; }
+.px-cred-vendor {
+  padding: 8px 11px;
+  border: 1px solid var(--px-line-2);
+  border-radius: var(--px-r-sm);
+  background: var(--px-surface-2);
+}
+.px-cred-vendor-name {
+  display: block; margin-bottom: 5px;
+  font-size: 12px; font-weight: 620; color: var(--px-ink);
+}
+.px-cred-list { margin: 0; padding: 0; list-style: none; }
+/* 一行一条引用名。用 grid 让「勾选框 + 名字」对齐，说明文字跟在后面，
+   窄屏时允许换行而不是把名字截断。 */
+.px-cred-row {
+  display: grid;
+  grid-template-columns: auto auto auto auto 1fr;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 3px 0;
+  font-size: 11.5px;
+}
+.px-cred-row.locked { opacity: 0.75; }
+.px-cred-pick { display: inline-flex; align-items: baseline; gap: 6px; }
+.px-cred-pick input { margin: 0; cursor: pointer; }
+.px-cred-pick input:disabled { cursor: not-allowed; }
+.px-cred-name {
+  font-family: var(--px-num-font);
+  font-size: 11px; color: var(--px-ink);
+  word-break: break-all;
+}
+.px-cred-hint { font-family: var(--px-num-font); font-size: 11px; color: var(--px-muted); }
+.px-cred-source { font-size: 11px; color: var(--px-muted); }
+.px-cred-purpose { font-size: 11px; color: var(--px-muted); }
+/* 「这一条插件改不了」的原因与出路：必须与可勾选的行**看得出区别**，
+   否则用户会反复去点那个禁用的勾选框。 */
+.px-cred-blocked {
+  grid-column: 1 / -1;
+  font-size: 11px; line-height: 1.7;
+  color: var(--px-tone-yellow);
+}
+.px-cred-cli {
+  margin: 7px 0 0; padding-top: 6px;
+  border-top: 1px dashed var(--px-line-2);
+  font-size: 11px; line-height: 1.7; color: var(--px-muted);
+}
+.px-cred-cli code {
+  font-family: var(--px-num-font);
+  font-size: 11px; color: var(--px-ink-2);
+  word-break: break-all;
+}
+.px-cred-results {
+  margin-top: 10px; padding: 8px 11px;
+  border: 1px solid var(--px-line-2);
+  border-radius: var(--px-r-sm);
+  background: var(--px-surface);
+  font-size: 11.5px;
+}
+.px-cred-results > b { display: block; margin-bottom: 5px; color: var(--px-ink); }
+.px-cred-results ul { margin: 0; padding-left: 16px; list-style: none; }
+.px-cred-results li { margin-bottom: 3px; line-height: 1.7; }
+.px-cred-results li.ok code { color: var(--px-tone-green); }
+.px-cred-results li.bad code { color: var(--px-tone-red); }
+.px-cred-results code {
+  font-family: var(--px-num-font);
+  font-size: 11px; margin-right: 6px;
+}
+.px-cred-results li.bad span { color: var(--px-tone-red); }
+/* 二次确认：与上面的清单**视觉上分开**（边框 + 底色），让「现在按下去就会删」
+   这件事一眼可辨，而不是和普通说明混在一起。 */
+.px-cred-confirm {
+  margin-top: 10px; padding: 9px 11px;
+  border: 1px solid var(--px-tone-red);
+  border-radius: var(--px-r-sm);
+  background: var(--px-surface);
+}
+.px-cred-confirm > p { margin: 0 0 6px; font-size: 11.5px; line-height: 1.7; color: var(--px-ink); }
+.px-cred-confirm ul { margin: 0; padding-left: 16px; list-style: none; }
+.px-cred-confirm li { margin-bottom: 3px; font-size: 11.5px; }
+.px-cred-confirm code {
+  font-family: var(--px-num-font);
+  font-size: 11px; color: var(--px-ink);
+}
+.px-cred-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 9px; }
 
 /* 「当前监看」切换器：一排小 chip。
    自动项永远存在（否则用户点过一次就再也回不到自动）。失败的厂商也列出来并

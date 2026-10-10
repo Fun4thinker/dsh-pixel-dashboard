@@ -12,11 +12,33 @@
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-/** 默认的源码检出位置。 */
-const DEFAULT_CHECKOUT = 'D:\\deepseek-harness'
+/** 默认的源码检出位置候选（按顺序探测，取第一个真的有 CLI 入口的）。 */
+const CHECKOUT_CANDIDATES = [
+  process.env.DSH_CHECKOUT,
+  'D:\\deepseek-harness',
+  'E:\\deepseek-harness',
+  'C:\\deepseek-harness',
+].filter((value) => typeof value === 'string' && value.trim() !== '')
+
+/**
+ * 找一个可用的源码检出。
+ *
+ * **不能写死一个路径。** 早先只认 `D:\deepseek-harness`，而那台机器上检出其实在
+ * `E:\deepseek-harness`：`dsh` 又不在 PATH 上，两条路同时落空，于是
+ * `install-official.mjs` 直接报「找不到可用的 dsh 命令」——恰好是用户最需要它
+ * 的那一刻。这里改成逐个探测**存在 CLI 入口**的目录。
+ * @returns {string|undefined} 检出根目录。
+ */
+function findCheckout() {
+  for (const candidate of CHECKOUT_CANDIDATES) {
+    const dir = resolve(candidate)
+    if (existsSync(join(dir, 'apps', 'cli', 'src', 'bin.ts'))) return dir
+  }
+  return undefined
+}
 
 /**
  * 解析 dsh 调用方式。
@@ -33,9 +55,9 @@ export function resolveDsh(extraArgs, fallbackCwd) {
     return { cmd: 'dsh', argv: extraArgs, cwd: fallbackCwd, via: 'PATH 上的 dsh' }
   }
 
-  const checkout = process.env.DSH_CHECKOUT ?? DEFAULT_CHECKOUT
+  const checkout = findCheckout()
+  if (checkout === undefined) return undefined
   const binTs = join(checkout, 'apps', 'cli', 'src', 'bin.ts')
-  if (!existsSync(binTs)) return undefined
 
   const store = join(checkout, 'node_modules', '.pnpm')
   const packageDir = existsSync(store)

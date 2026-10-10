@@ -59,14 +59,29 @@ if (profileManifest !== undefined) {
     const manifest = JSON.parse(readFileSync(profileManifest, 'utf8'))
     const bundles = manifest.dsh?.profile?.bundles ?? []
     const dependencies = Object.keys(manifest.dependencies ?? {})
-    if (bundles.includes('dsh-pixel-dashboard-bundle')) {
-      note('ok', '官方组合包已登记为该 profile 的配置层', `bundles: ${bundles.join(', ')}`)
+    // 判据是**包名本身**。早先这里找的是 `dsh-pixel-dashboard-bundle`——那是拆成
+    // 「插件包 + 组合包」两个包时代的名字，单包形态改造后就再也不会命中，
+    // 于是装得好好的 profile 也被报成「bundles 里没有本插件」（实测 desktop 就是
+    // 这样）。旧名字仍然认，免得老机器上的判断反而变差。
+    const BUNDLE_IDS = ['dsh-pixel-dashboard', 'dsh-pixel-dashboard-bundle']
+    const hit = bundles.find((name) => BUNDLE_IDS.includes(name))
+    if (hit !== undefined) {
+      note('ok', '本插件已登记为该 profile 的配置层', `bundles: ${bundles.join(', ')}`)
     } else {
       note('info', '该 profile 的 bundles 里没有本插件', `bundles: ${bundles.join(', ')}`)
     }
+    // 挂载方式决定「改了源码要不要重新安装」——这是用户最常踩的一脚，直接说明。
+    const spec = manifest.dependencies?.['dsh-pixel-dashboard']
     if (dependencies.includes('dsh-pixel-dashboard')) {
-      note('ok', '插件包已是该 profile 的依赖', dependencies.join(', '))
-    } else if (bundles.includes('dsh-pixel-dashboard-bundle')) {
+      if (typeof spec === 'string' && /^link:/.test(spec)) {
+        note('ok', '插件已链接到本地源码（改完构建即生效）', spec)
+      } else if (typeof spec === 'string') {
+        note('info', `插件挂的是一个远端快照，**不是**本地源码：${spec}`,
+          '本地改动必须先推到该远端（或改用 link: 本地目录）才会被装上')
+      } else {
+        note('ok', '插件包已是该 profile 的依赖', dependencies.join(', '))
+      }
+    } else if (hit !== undefined) {
       note('warn', '组合包在层列表里，但插件包不是 profile 依赖——patch 的行可能解析失败',
         '本地路径安装时 link: 不解析依赖，需要把插件包也装一次')
     }

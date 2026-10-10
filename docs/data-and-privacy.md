@@ -28,5 +28,6 @@ $DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl
 | 统计 | 只读本机会话日志与账本，不向任何第三方发送。 |
 | 通知 | 触发提醒**不发任何网络请求**；弹的是本机系统通知。 |
 | 落盘 | 只写两份本机文件：用量账本 `usage-ledger.jsonl` 与开关 `balance-prefs.json`。通知日志与「最近通知」**只在内存**。 |
+| 移除凭据 | **只有你在看板上勾选并二次确认之后**才会写：删掉的是 DSH 凭据文件里那几个引用名（走 DSH 自己的 `credentials.unset`，不手改 YAML）。不勾就一个字节都不动；插件**不保留被删凭据的副本**。 |
 
 无遥测、无自动上报、无外部依赖。

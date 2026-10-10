@@ -112,9 +112,10 @@ const plansRoute = routeOf('/dsh-pixel/plans')
 const toggleRoute = routeOf('/dsh-pixel/toggle')
 const notifyRoute = routeOf('/dsh-pixel/notify')
 const ratesRoute = routeOf('/dsh-pixel/rates')
+const credsRoute = routeOf('/dsh-pixel/plan-credentials')
 // 路由条数是**有意**钉死的：新增路由必须在这里显式加一行，并想清楚它是否需要
 // 同源闸门与写权限，而不是让新增悄悄溜过去（见 lib/host.js 的注册处）。
-assert.equal(routes.length, 8, `应注册恰好八条路由，实际 ${routes.length}`)
+assert.equal(routes.length, 9, `应注册恰好九条路由，实际 ${routes.length}`)
 
 /**
  * 最小 req/res 替身。
@@ -184,7 +185,11 @@ const REQUIRED_CAPABILITIES = [
   // 国庆那类日子的白天会被算成高峰、金额偏高两倍。
   'holidayCalendar',
   'sessionCost', 'calendarByDay', 'tieredRates', 'crossDeviceLedger',
-  'balance', 'balanceToggle', 'thirdPartyPlans', 'notifyJournal', 'notifyThresholds',
+  'balance', 'balanceToggle', 'thirdPartyPlans',
+  // 「移除凭据」：查各家凭据现状 + 按用户勾选逐条移除。缺这一项说明宿主还是
+  // 没有这条路由的旧版本，界面据此不画移除入口（而不是画一个必然失败的按钮）。
+  'planCredentials',
+  'notifyJournal', 'notifyThresholds',
   // 会话清单里的预览标题（与 DSH 侧栏同源）。旧的 id 片段用户对不上侧栏任何一个会话。
   'sessionTitle',
 ]
@@ -1387,6 +1392,170 @@ assert.ok(halfProvider.hint.includes('AccessKey'), '应说明这里要的是 Acc
   )
 }
 
+// ── 移除套餐凭据：清单、逐条勾选、以及三条「不能撒谎」的规则 ──────────
+// 这是本插件唯一会**删掉用户密钥**的功能，因此闸门要钉住的不只是「能删」，
+// 更是三种**删不掉**的情形必须被如实说清，而不是报成功。
+{
+  const plansForCreds = await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)
+  const {
+    planVendorInventory, removableOf, blockedReasonOf, credentialSourceLabel,
+    PlansService, ZHIPU_KEY_ENVS, COMMAND_CODE_KEY_ENVS, VOLC_AK_ENVS, VOLC_SK_ENVS,
+  } = plansForCreds
+
+  // 1) 清单必须**覆盖各家解析时真正会试的全部候选名**。
+  //    漏一个的后果最严重：用户点了移除，那家照样能解析到 Key，界面却显示已移除。
+  const inventory = planVendorInventory()
+  assert.deepEqual(
+    inventory.map((vendor) => vendor.id),
+    ['zhipu', 'commandcode', 'volcengine'],
+    '移除清单应覆盖三家',
+  )
+  const refsOfVendor = (id) => new Set(inventory.find((item) => item.id === id).refs.map((item) => item.name))
+  for (const name of ZHIPU_KEY_ENVS) {
+    assert.ok(refsOfVendor('zhipu').has(name), `移除清单漏了智谱的候选名 ${name}`)
+  }
+  for (const name of COMMAND_CODE_KEY_ENVS) {
+    assert.ok(refsOfVendor('commandcode').has(name), `移除清单漏了 Command Code 的候选名 ${name}`)
+  }
+  for (const name of [...VOLC_AK_ENVS, ...VOLC_SK_ENVS]) {
+    assert.ok(refsOfVendor('volcengine').has(name), `移除清单漏了火山的候选名 ${name}`)
+  }
+  // 反向：清单里也不该有各家解析时根本不会试的名字（删一个无关的键同样是越权）
+  const allCandidates = new Set([...ZHIPU_KEY_ENVS, ...COMMAND_CODE_KEY_ENVS, ...VOLC_AK_ENVS, ...VOLC_SK_ENVS])
+  for (const vendor of inventory) {
+    for (const item of vendor.refs) {
+      assert.ok(allCandidates.has(item.name), `移除清单里的 ${item.name} 并不是任何一家的候选名`)
+      assert.ok(item.purpose !== '', `${item.name} 应说明它是什么`)
+    }
+  }
+  // Command Code 的 CLI 密钥文件必须出现在清单里：不列出来，用户清完文件里那把
+  // 之后插件照样读得到 CLI 那把，界面上却是「未配」——自相矛盾。
+  assert.equal(
+    inventory.find((item) => item.id === 'commandcode').cliFile,
+    true,
+    'Command Code 必须带上 CLI 凭据文件那一条',
+  )
+
+  // 2) 「能不能删」必须按**来源层**判断，而不是「有凭据服务就能删」。
+  //    三种层的实际效果完全不同：
+  //      file        → 真正删掉那一行                     → 可移除
+  //      env         → 抛错（上游 assertUnshadowed）      → 不可移除
+  //      *-env(.env) → **静默空操作**，删完照样回落该文件 → 不可移除
+  assert.equal(removableOf('file'), true, '凭据文件层应可移除')
+  assert.equal(removableOf('credentials'), true, '凭据服务层应可移除')
+  assert.equal(removableOf('env'), false, '启动环境变量层不可移除（写入会被上游拒绝）')
+  assert.equal(removableOf('project-env'), false,
+    '项目 .env 层不可移除——unset 对它是静默空操作，报成功就是撒谎')
+  assert.equal(removableOf('user-env'), false, '<DSH_HOME>/.env 层不可移除，理由同上')
+  assert.ok(blockedReasonOf('env').includes('环境变量'), '不可移除时必须说清原因')
+  assert.ok(blockedReasonOf('project-env').includes('.env'), '不可移除时必须指出该去改哪个文件')
+  assert.equal(blockedReasonOf('file'), '', '可移除时不该有「改不了」的说明')
+  assert.equal(credentialSourceLabel('env').includes('改不了'), true,
+    '来源层的说明本身就要点明插件改不了这一层')
+
+  // 3) 路由行为：清单只读，且如实回报「这台机器上能不能写」
+  const emptyPayload = JSON.parse((await call(credsRoute)).body)
+  assert.equal(emptyPayload.writable, false,
+    '预检的 ctx 没有 credentials 服务，应如实回报不可写（而不是假装能删）')
+  assert.equal(emptyPayload.providers.length, 3, '清单应列出三家')
+  const emptyBody = JSON.stringify(emptyPayload)
+  for (const banned of ['Bearer ', 'sk-', 'eyJ']) {
+    assert.ok(!emptyBody.includes(banned), `凭据清单里出现了疑似凭据内容「${banned}」`)
+  }
+  for (const provider of emptyPayload.providers) {
+    for (const ref of provider.refs) {
+      assert.equal(ref.configured, false, `${ref.name} 在预检环境里应是未配置`)
+      assert.equal(ref.removable, false, `${ref.name} 未配置时不该是可移除的`)
+    }
+  }
+  // 白名单：拒绝清单之外的引用名（这条路由从浏览器可达，不能凭一个字符串删任意键）
+  const notAllowed = JSON.parse((await call(credsRoute, 'POST', credsRoute.path, { refs: ['PATH'] })).body)
+  assert.equal(notAllowed.results[0].ok, false, '不在白名单里的引用名必须被拒绝')
+  assert.equal(notAllowed.results[0].reason, 'not-allowed')
+  // 没有可写的凭据服务时说清楚，而不是静默当成功
+  const noService = JSON.parse((await call(credsRoute, 'POST', credsRoute.path, { refs: ['VOLC_ACCESS_KEY_ID'] })).body)
+  assert.equal(noService.results[0].ok, false, '没有凭据服务时不得报成功')
+  assert.equal(noService.results[0].reason, 'no-service')
+  // 请求体校验与同源闸门
+  assert.equal((await call(credsRoute, 'POST', credsRoute.path, { refs: 'VOLC_ACCESS_KEY_ID' })).statusCode, 400,
+    'refs 必须是数组')
+  assert.equal(
+    (await call(credsRoute, 'POST', credsRoute.path, { refs: ['VOLC_ACCESS_KEY_ID'] }, { 'sec-fetch-site': 'cross-site' })).statusCode,
+    403,
+    '跨站请求不得触发删除',
+  )
+
+  // 4) 真正的移除：用假凭据服务驱动，验「删对了哪一层」与「删不掉时怎么说」
+  const attempts = []
+  /** 造一个可控的凭据服务；`store` 决定每条引用名来自哪一层。 */
+  const fakeService = (store) => new PlansService({
+    credentials: () => ({
+      resolve: async (ref) => (store[ref] === undefined
+        ? undefined
+        : { value: store[ref].value, source: store[ref].source }),
+      describe: async (ref) => ({ configured: store[ref] !== undefined, writable: store[ref]?.source === 'file' }),
+      unset: async (ref) => {
+        attempts.push(ref)
+        if (store[ref] === undefined) return
+        // 照抄 DSH 的真实语义：env 层抛错、.env 层静默不动、file 层删掉
+        if (store[ref].source === 'env') {
+          throw new Error(`credentials-local: "${ref}" is supplied read-only by the launching environment`)
+        }
+        if (store[ref].source === 'file') delete store[ref]
+      },
+    }),
+    prefs: async () => ({ plansEnabled: true }),
+    env: {},
+    fetchImpl: async () => { throw new Error('不该发请求') },
+  })
+
+  // 4a) file 层：真删掉，并回报成功
+  const fileStore = { VOLC_ACCESS_KEY_ID: { value: 'AKLTaaaaaaaaaaaaaaaa', source: 'file' } }
+  const fileResult = await fakeService(fileStore).removeCredentials(['VOLC_ACCESS_KEY_ID'])
+  assert.equal(fileResult.results[0].ok, true, '凭据文件层应能真正移除')
+  assert.equal(fileStore.VOLC_ACCESS_KEY_ID, undefined, '凭据文件层应被真正删掉')
+  assert.equal(
+    fileResult.credentials.providers.find((p) => p.id === 'volcengine').refs
+      .find((r) => r.name === 'VOLC_ACCESS_KEY_ID').configured,
+    false,
+    '复核后应回报未配置',
+  )
+
+  // 4b) env 层：上游抛错 → 如实回报失败与原因，绝不报成功
+  const envStore = { VOLC_ACCESS_KEY_ID: { value: 'AKLTbbbbbbbbbbbbbbbb', source: 'env' } }
+  const envResult = await fakeService(envStore).removeCredentials(['VOLC_ACCESS_KEY_ID'])
+  assert.equal(envResult.results[0].ok, false, '启动环境变量层不得报成功')
+  assert.equal(envResult.results[0].reason, 'rejected')
+  assert.ok(envResult.results[0].message.includes('read-only'), '应把上游那句人话带出来')
+  assert.equal(envStore.VOLC_ACCESS_KEY_ID.value, 'AKLTbbbbbbbbbbbbbbbb', 'env 层的值不该被改动')
+
+  // 4c) .env 回落层：unset 是**静默空操作**。这是最阴的一种——不抛错、不改变任何
+  //     东西；不复核就会把「什么都没变」报成「已移除」。
+  const dotenvStore = { ZHIPU_CODING_API_KEY: { value: 'zhipu-cccccccccccc', source: 'project-env' } }
+  const dotenvResult = await fakeService(dotenvStore).removeCredentials(['ZHIPU_CODING_API_KEY'])
+  assert.equal(dotenvResult.results[0].ok, false,
+    '.env 回落层是静默空操作，必须靠复核抓出来——报成功就是撒谎')
+  assert.equal(dotenvResult.results[0].reason, 'still-configured')
+  assert.ok(dotenvResult.results[0].message.includes('.env'), '复核失败时应告诉用户去改哪里')
+
+  // 4d) 清单必须标出「哪一层、能不能删」——界面据此才画得出禁用的勾选框
+  const mixed = await fakeService({
+    VOLC_ACCESS_KEY_ID: { value: 'AKLTdddddddddddddddd', source: 'file' },
+    VOLC_SECRET_ACCESS_KEY: { value: 'eeeeeeeeeeeeeeeeeeee', source: 'env' },
+  }).credentialInventory()
+  const volcRefs = mixed.providers.find((p) => p.id === 'volcengine').refs
+  const akRow = volcRefs.find((r) => r.name === 'VOLC_ACCESS_KEY_ID')
+  const skRow = volcRefs.find((r) => r.name === 'VOLC_SECRET_ACCESS_KEY')
+  assert.equal(akRow.removable, true, 'file 层的 AK 应可移除')
+  assert.equal(skRow.removable, false, 'env 层的 SK 不可移除')
+  assert.ok(skRow.blockedReason !== '', '不可移除的条目必须带上原因')
+  // 打码：清单可以给尾段（用于确认删的是哪一把），但绝不能给完整值
+  assert.equal(akRow.hint, '…dddd', '应只回报打码尾段')
+  assert.ok(!JSON.stringify(mixed).includes('AKLTdddddddddddddddd'), '清单里不得出现凭据原值')
+  assert.ok(!JSON.stringify(mixed).includes('eeeeeeeeeeeeeeeeeeee'), '清单里不得出现凭据原值')
+  assert.ok(attempts.includes('VOLC_ACCESS_KEY_ID'), '移除应真的调用凭据服务的 unset')
+}
+
 // 鉴权被拒：必须给出「这里要 AK/SK 而不是推理 Key」这条唯一有用的提示
 const rejectedService = new (await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)).PlansService({
   credentials: () => ({
@@ -1669,7 +1838,7 @@ assert.equal(putRoute.statusCode, 405, 'PUT 应返回 405')
 // 恢复：把开关文件清干净，避免影响后续断言
 rmSync(sandboxPrefs, { force: true })
 
-console.log(`预检通过：插件形状、8 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
+console.log(`预检通过：插件形状、9 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
   + 'POST 拒绝、时段时钟、余额隐私与开关、套餐解析与凭据打码、多厂商价目、自定义单价、通知日志与预警阈值')
 
 rmSync(sandboxPrefs, { force: true })
