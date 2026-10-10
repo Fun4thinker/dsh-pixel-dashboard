@@ -258,6 +258,9 @@ const idlePhase = periodPhase(phaseSnapshot({ peak: false }), 1_000_000)
  * 于是「它到底把东西放哪了」才是真的被测到。
  * @returns {Promise<Function>} 面板入口组件。
  */
+/** 产物登记的全部槽位，供各段取用（费用条那一段要用 dock 槽位的组件）。 */
+const registrations = []
+
 async function loadPanelEntryComponent() {
   let factory
   // 产物的入口靠 window.__ModuleLoader__.load({ id, factory }) 注册，
@@ -275,7 +278,6 @@ async function loadPanelEntryComponent() {
     throw new Error(`dom-check 的替身平台不认识模块：${String(id)}`)
   }
   const platform = factory(platformRequire)
-  const registrations = []
   // 槽位服务的最小替身：产物用 slots.inject(name, fn) 声明「我要往哪个槽里放」，
   // 回调里再 slots.register(spec, component) 真正登记。两边都记下来。
   const slots = {
@@ -777,6 +779,198 @@ const results = []
     must(!asSelector.test(css), `样式里残留了已删除的 ${dead} 规则（环已移除）`)
   }
   results.push('样式：靠右 + 不折行 + 等宽数字 + 两色不同 + 无残留环样式')
+}
+
+// ── 9) 会话费用条落在哪：两代官方契约下都必须排在官方数据的**右边** ──
+//
+// 这块连续踩过两次「代码看着对、产出的位置是错的」，所以必须问真实 DOM：
+//   1. 早先误以为 dock 是纵向 flex，给自己 width:100%，于是与官方胶囊**抢宽度**，
+//      把「1 轮 · 38 步」「2.1M tok」挤成省略号（用户截图报上来过）；
+//   2. DSH 0.2.1-alpha.1 移除了 data-composer-stats（官方统计拆成 activity/usage
+//      两条登记），旧代码的 portal 锚点再也找不到，只好退回那个全宽行——于是
+//      「插件在左、官方被压缩」在 WSL 上稳定复现。
+//
+// 这一关把**两代契约**各搭一个仿真 dock，挂真组件，然后断言：
+//   - 我们的徽标确实在官方内容**之后**（不是之前）；
+//   - 我们那一项的宽度由内容决定，声明里没有 width:100%（不能抢官方宽度）。
+{
+  const { STYLES } = await import(pathToFileURL(join(root, 'lib', 'client', 'theme.js')).href)
+  const css = STYLES.map(([, text]) => text).join('\n')
+  const groupBlock = /\.px-pill-group\s*\{([^}]*)\}/.exec(css)
+  must(groupBlock !== null, '缺少 .px-pill-group 规则')
+  // 注意边界：`max-width: 100%` 里也含 "width: 100%" 这段子串，不能被它误判成
+  // 「占满整行」。真正要拦的是**裸的 `width: 100%`**（前面不是连字符或字母）。
+  must(!/(?:^|[^-\w])width\s*:\s*100%/.test(groupBlock[1]),
+    '费用条那一层不得写 width:100%——dock 是横向 flex 行，占满会与官方胶囊抢宽度，'
+    + '把官方数据挤成省略号。宽度必须由内容决定（inline-flex）。')
+  must(/display\s*:\s*inline-flex/.test(groupBlock[1]),
+    '.px-pill-group 必须是 inline-flex（按内容取宽），不能是块级占满整行')
+  // 旧那个全宽行的规则必须已经清干净：留着会让人以为还有一条渲染路径
+  must(!/\.px-cost-row\s*[,{]/.test(css),
+    '样式里残留了已删除的 .px-cost-row 规则（它就是「抢宽度」那个缺陷的来源）')
+
+  /** 拿会话费用条组件与其在 dock 里的 order（注册进 dock 槽位的那个）。 */
+  const dockRegistration = registrations.find((item) => item.spec?.name === 'conversation.composer.dock')
+  must(dockRegistration !== undefined, '经费条没有注册到 conversation.composer.dock')
+  const Cost = dockRegistration.component
+  const costOrder = Number(dockRegistration.spec.order ?? 0)
+  /**
+   * 两代官方契约里官方占用（或最大）的 order。
+   *
+   * 与 render-check 的 OFFICIAL_DOCK_MAX_ORDER 同源。官方 README 明说「dock 按 order
+   * 排列各行」，所以只要我们的 order 不大于它，就会被排到官方**左边**——那正是本闸门
+   * 要拦住的那个回归。
+   */
+  const OFFICIAL_MODERN_ORDERS = [0, 1]
+
+  /**
+   * 搭一个仿真 dock 并挂上费用条。
+   *
+   * 关键：**照实复刻 dock 的排序**。真实槽位按 `order` 升序渲染各行，因此这里也按
+   * 各条登记的 order 决定先后，而不是由调用方随手 append（那样无论 order 是多少
+   * 都会「通过」，闸门等于没测）。
+   * @param {object} options - contract 为 'legacy'（带 data-composer-stats 容器）或
+   *   'modern'（官方拆成两枚 data-composer-stat 胶囊）。
+   * @returns {Promise<object>} 关键节点与清理函数。
+   */
+  async function mountCostPill(options) {
+    const { contract } = options
+    // 仿真真实 dock：横向 flex 行（InputBar .dock）
+    const dock = window.document.createElement('div')
+    dock.className = 'dock'
+    window.document.body.appendChild(dock)
+
+    /** 参与排序的每一项：order + 承载它的元素。 */
+    const rows = []
+    if (contract === 'legacy') {
+      // 旧契约：官方统计是**一条**登记（order 0），根元素带 data-composer-stats
+      const official = window.document.createElement('div')
+      official.setAttribute('data-composer-stats', '')
+      official.textContent = '1 轮 38 步 · 缓存命中 92%'
+      rows.push({ order: 0, node: official, kind: 'official' })
+    } else {
+      // 新契约：官方拆成 activity(0) / usage(1) 两条登记。**照实复刻真实标记**——
+      // 每项是 `<span class="anchor" data-composer-stat="<id>"><span class="pill">…`
+      // （StatsPills.tsx 的 PlainPill / DialogPill）。照抄结构是有意义的：
+      // 本插件靠 `[data-composer-stat]` 判断「官方数据在不在场」，属性放错层级
+      // 就会让它判错——那样这一关等于自说自话。
+      OFFICIAL_MODERN_ORDERS.forEach((order, i) => {
+        const id = ['activity', 'usage'][i]
+        const anchor = window.document.createElement('span')
+        anchor.className = 'anchor'
+        anchor.setAttribute('data-composer-stat', id)
+        const pill = window.document.createElement('span')
+        pill.className = 'pill'
+        pill.textContent = `官方 ${id}`
+        anchor.appendChild(pill)
+        rows.push({ order, node: anchor, kind: 'official' })
+      })
+    }
+    // 我们那一项：order 取自真实登记值
+    const slot = window.document.createElement('div')
+    rows.push({ order: costOrder, node: slot, kind: 'cost' })
+    // 按 order 升序（稳定）落进 dock —— 这就是槽位渲染器做的事
+    rows.sort((a, b) => a.order - b.order)
+    for (const row of rows) dock.appendChild(row.node)
+    const firstOfficial = rows.find((row) => row.kind === 'official')?.node
+    const official = contract === 'legacy' ? firstOfficial : undefined
+
+    await renderInto(slot, React.createElement(Cost, {
+      sessionId: 'session-dock-position',
+      useProjection: () => ({
+        val: { totals: { uncachedInputTokens: 1000, outputTokens: 200, cacheReadTokens: 800, cacheWriteTokens: 0 } },
+      }),
+    }))
+    // 锚点是在 effect 里探到的 → 再渲染一轮才 portal 过去，必须多 settle
+    await settle()
+    await settle()
+    /**
+     * 清场。**必须把 dock 从 body 摘掉**：锚点探测用的是 `document.querySelector`，
+     * 上一轮的 dock 留在文档里会让下一轮探到**上一个**容器，断言因此指向旧节点
+     * （两代契约的用例会互相污染，闸门时绿时红）。
+     */
+    const cleanup = async () => {
+      await unmountAll()
+      dock.remove()
+    }
+    return { dock, cost: slot, official, firstOfficial, cleanup }
+  }
+
+  // 核心：两代契约下我们的内容都必须排在官方内容**之后**（= 右侧）。
+  for (const contract of ['legacy', 'modern']) {
+    const { dock, cost, official, firstOfficial, cleanup } = await mountCostPill({ contract })
+
+    // 落位形态随契约不同，但**都在官方右边、都按内容取宽**：
+    //   - legacy：portal 进官方容器内部，追加为末子节点；
+    //   - modern：作为 dock 里的独立一项，排在官方项之后（order 闸门保证）。
+    const group = contract === 'legacy'
+      ? official.querySelector('.px-pill-group')
+      : cost.querySelector('.px-pill-group')
+    must(group !== null,
+      `${contract}：费用条应渲染出 .px-pill-group（legacy 走 portal、modern 走槽位项）`)
+    must(dock.contains(group), `${contract}：费用条必须落在 dock 里`)
+    must(group.textContent.includes('本次会话'), `${contract}：费用条应说明这是本次会话`)
+
+    // 位置断言：官方内容与我们的徽标之间，我们的必须在**后面**
+    if (contract === 'legacy') {
+      // portal 是 appendChild：必须是官方容器的最后一个子节点
+      must(official.lastElementChild === group,
+        'legacy：portal 必须是官方容器的最后一个子节点，才排在官方内容右边')
+    } else {
+      // 排序后我们的 order 若不大于官方，这一项就会排到官方**前面**：断言因此有牙齿
+      must(costOrder > Math.max(...OFFICIAL_MODERN_ORDERS),
+        `modern：费用条的 order（${costOrder}）必须大于官方胶囊的最大 order`
+        + `（${Math.max(...OFFICIAL_MODERN_ORDERS)}）才能排在官方数据右边。`
+        + '官方 README 明说 dock 按 order 排列各行，负值会把我们排到左边——'
+        + '那正是用户报的「插件在左、官方数据被挤成省略号」')
+      const position = firstOfficial.compareDocumentPosition(group)
+      must((position & window.Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        'modern：按 order 排序后，费用条必须排在官方胶囊之后（右侧）')
+    }
+
+    // 官方已经在显示 token 时，我们不得再重复一枚（两代契约都成立）。
+    // 判据是「**usage** 那一枚在不在」而不是「有没有官方胶囊」：activity 只显示
+    // 轮次与速度，不显示 token 数。
+    must(!group.textContent.includes('tokens'),
+      `${contract}：官方 usage 在场时不应重复显示 token 数（同一事实两处口径）`)
+
+    await cleanup()
+  }
+
+  // modern 的一个**容易写错**的分支：只有 activity 在场（没有 usage）。
+  // 这时官方**没有**显示 token 总数，我们必须把它补上，否则界面上就没有 token 了。
+  // 如果实现里把判据写成「有官方胶囊即视为重复」，这一条会红。
+  {
+    const dock = window.document.createElement('div')
+    dock.className = 'dock'
+    window.document.body.appendChild(dock)
+    // 只有 activity（order 0），没有 usage
+    const activity = window.document.createElement('span')
+    activity.className = 'anchor'
+    activity.setAttribute('data-composer-stat', 'activity')
+    activity.textContent = '1 轮 · 38 步'
+    dock.appendChild(activity)
+    const slot = window.document.createElement('div')
+    dock.appendChild(slot)
+    await renderInto(slot, React.createElement(Cost, {
+      sessionId: 'session-activity-only',
+      useProjection: () => ({
+        val: { totals: { uncachedInputTokens: 1000, outputTokens: 200, cacheReadTokens: 800, cacheWriteTokens: 0 } },
+      }),
+    }))
+    await settle()
+    await settle()
+    const group = slot.querySelector('.px-pill-group')
+    must(group !== null, '只有 activity 时费用条仍应渲染')
+    must(group.textContent.includes('tokens'),
+      '官方 usage 不在场时，token 总数必须由我们补上——'
+      + '否则 activity 只显示轮次/速度，界面上就再也看不到 token 了')
+    await unmountAll()
+    dock.remove()
+  }
+
+  results.push('费用条：两代契约下都排在官方数据右侧，且不占满整行（不抢宽度）')
+  results.push('费用条：只有官方 activity 时仍补上 token 总数（不误判成「官方已在显示」）')
 }
 
 console.log('真实 DOM 闸门（jsdom）通过：')

@@ -882,25 +882,28 @@ const DASHBOARD = `
 .px-source a:hover { color: var(--px-pink-deep); }
 
 /* 输入框下方的会话费用徽标（费用 + 余额 + 套餐额度）。
-   默认这些徽标会 **portal 进产品统计行**（[data-composer-stats]），与「缓存命中」
-   并排同一行；锚点不在时才退回自渲染 .px-cost-row。
-   容器是纵向 flex + align-items: center 且**没有 gap**，所以兜底行必须自己撑满宽度
-   并自带上边距，否则会收缩居中并贴住输入框。 */
-.px-cost-row {
-  display: flex;
-  justify-content: center;
+   conversation.composer.dock 是**横向 flex 行**（.dock：display:flex +
+   justify-content:center + gap:12px），我们是这行里的**一项**，因此这一层只做
+   inline-flex、按内容取宽，绝不占满整行。
+   占满整行会与官方胶囊抢宽度，把「1 轮 · 38 步」「2.1M tok」挤成省略号——那正是
+   用户截图反馈的现象。旧版这里写作 width:100%（还带左右内边距），前提是「容器为
+   纵向 flex 且没有 gap」——那是 .root 的样式，不是 .dock 的，属于认错了容器。
+   两种落位共用这一层：
+     · 旧契约（DSH ≤ 0.2.0-rc.2）portal 进官方统计容器，追加为末子节点 → 官方右边；
+     · 新契约（DSH ≥ 0.2.1-alpha.1）作为槽位项，靠 order 排在官方胶囊之后 → 官方右边。 */
+.px-pill-group {
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
+  gap: 12px;
   flex-wrap: wrap;
-  gap: 8px;
-  width: 100%;
-  max-width: var(--dsh-chat-content-width, 100%);
-  margin: 0 auto;
-  box-sizing: border-box;
-  padding: 4px calc(var(--dsh-composer-side-clearance, 16px) + 16px) 0;
+  max-width: 100%;
+  min-width: 0;
+  /* 字号必须自己定：.px-pill 用 font: inherit，而 dock 那一行没有自己的字号。
+     旧版这一点由 .px-cost-row 提供，它被本层取代后要照旧带上，否则徽标会跟着
+     产品外壳的字号走，和官方胶囊并排时大小不一致。 */
   font-size: var(--dsh-content-font-size-secondary, 13px);
 }
-/* 并入产品统计行时，这一层只是 inline-flex，间距交给产品那行 */
-.px-pill-group { display: inline-flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 
 /* 一枚徽标：刻意对齐产品统计胶囊的观感（13px、tertiary 文字、24px 圆角、
    悬停微微加深），并排时不显得是外来的。 */

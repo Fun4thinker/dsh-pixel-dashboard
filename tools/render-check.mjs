@@ -285,6 +285,18 @@ const clientExports = factory((spec) => {
 must(typeof clientExports.apply === 'function', '浏览器半边没有导出 apply')
 
 const registrations = []
+/**
+ * 官方在 `conversation.composer.dock` 里占用的最大 `order`。
+ *
+ * 该槽位是横向 flex 行，`order` 决定左右。官方两代契约：
+ *   - 旧（DSH ≤ 0.2.0-rc.2）：`StatsPills` 单条，`id: 'stats', order: 0`；
+ *   - 新（DSH ≥ 0.2.1-alpha.1）：`activity` = 0、`usage` = 1（拆成两条登记，见
+ *     packages/client/ui-chat/src/client/apply.ts 与官方 ui-chat README）。
+ *
+ * 用户要的是「插件数据排在官方数据右边」，因此本插件的 order 必须大于这个值。
+ * 官方将来再加胶囊时这里要跟着抬——这正是把它写成具名常量、并由闸门盯着的原因。
+ */
+const OFFICIAL_DOCK_MAX_ORDER = 1
 const themes = []
 const paletteLayers = []
 /**
@@ -999,12 +1011,13 @@ must(
 const dock = registrations.find((item) => item.slot === 'conversation.composer.dock')
 must(dock !== undefined, '费用条没有注册到 conversation.composer.dock')
 must(dock.key === 'pixel-cost', `费用条的 id 应为 pixel-cost，实际 ${dock.key}`)
-// 排序闸门：该槽位**升序**渲染，产品自带的统计条（StatsPills）在 order 0。
-// 用正值会被排到产品统计条下面，离输入框更远；并且产品统计条在无 token 活动时
-// 整体不渲染，正值还会让本插件那一行上下跳动。必须是负值。
+// 排序闸门：该槽位是**横向 flex 行**，order 决定我们排在官方胶囊的左边还是右边。
+// 官方两代契约的 order 是：旧契约 StatsPills 一条 = 0；新契约 activity = 0、usage = 1。
+// 用户要的是「插件数据在官方数据右边」（桌面端的观感），因此 order 必须**大于**官方
+// 胶囊的最大值，不能用负值——负值会排到官方左边，并与官方抢宽度、把官方胶囊挤成省略号。
 must(
-  Number(dock.order) < 0,
-  `费用条的 order 应为负数才能紧贴输入框正下方（产品统计条占 order 0），实际 ${dock.order}`,
+  Number(dock.order) > OFFICIAL_DOCK_MAX_ORDER,
+  `费用条的 order 应大于官方胶囊的最大 order（${OFFICIAL_DOCK_MAX_ORDER}）才能排在官方数据右边，实际 ${dock.order}`,
 )
 
 /**
