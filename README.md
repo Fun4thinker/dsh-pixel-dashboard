@@ -22,7 +22,7 @@
 需要 Node ≥ 18。插件**没有第三方依赖**，也**不需要构建**——`lib/` 是随仓库提交的产物。
 
 ```bash
-dsh plugin --profile web add github:Fun4thinker/dsh-pixel-dashboard
+dsh plugin --profile web add dsh-pixel-dashboard
 ```
 
 装完**重启一次 `dsh`**，再刷新浏览器页面。到此就能看到新配色、侧栏那行倒计时和看板。
@@ -35,6 +35,16 @@ dsh plugin --profile web remove dsh-pixel-dashboard
 
 <details>
 <summary>其他安装方式</summary>
+
+**从 GitHub 安装**（与 npm 同一份代码，npm 不方便时可用）：
+
+```bash
+dsh plugin --profile web add github:Fun4thinker/dsh-pixel-dashboard
+```
+
+> 注意：`github:` 安装会把**当时 main 指向的 commit** 固化进 lockfile，
+> 之后远端更新了**也不会自动跟进**——更新需要先移除再重新添加。
+> npm 渠道则可以在插件管理器里看到版本并走标准的更新动作，**推荐优先用 npm**。
 
 **从本地源码安装**（改代码时用）：
 
@@ -51,6 +61,17 @@ node tools/install-official.mjs --profile web      # 建 link: 软链指向本�
 想把用量历史一起带走，额外复制 `usage-ledger.jsonl`（见[本机数据](#本机数据与隐私)）。
 
 </details>
+
+## 更新
+
+插件**不会自动更新**（DSH 按 lockfile 装配，这是设计行为）：
+
+- **npm 安装**：插件管理器 → 找到本插件 → 走更新动作（重新解析 `@latest`）；
+- **github: 安装**：先 remove 再 add 一次（重新解析到最新 commit）；
+- **link: 安装**：`node tools/build.mjs` 后重启 `dsh` 即生效。
+
+升级后**历史用量自动归位**：账本里的模型键在读取时按当前归一规则重算
+（只改这一个派生字段，token 数与金额分文不动），不需要重扫会话日志。
 
 ## 功能
 

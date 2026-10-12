@@ -50,6 +50,18 @@
   "engines": {
     "node": ">=18"
   },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.2-rc.1 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-host-webserver": {
+      "optional": true
+    }
+  },
   "scripts": {
     "build": "node tools/build.mjs",
     "verify": "node tools/verify.mjs",
@@ -58,6 +70,7 @@
     "render-check": "node tools/render-check.mjs",
     "install:official": "node tools/install-official.mjs",
     "doctor": "node tools/doctor.mjs",
-    "pack": "npm pack"
+    "pack": "npm pack",
+    "prepublishOnly": "node tools/build.mjs && node tools/test.mjs && node tools/preflight.mjs"
   }
 }
