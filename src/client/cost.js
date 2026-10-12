@@ -6,7 +6,19 @@
  * @module dsh-pixel-dashboard/client/cost
  */
 
-/** 兜底价目：与宿主 pricing.js 的 deepseek-flash 保持一致。 */
+/**
+ * 兜底价目：与宿主 `pricing.js` 的 `FALLBACK_RATES`（即 `deepseek-flash`）**必须一致**。
+ *
+ * 这里是**抄的一份**，不是共享的常量：客户端产物是独立打包的（`lib/client.js` 是
+ * 一个 `__ModuleLoader__` 容器，没有从宿主模块 import 的通道），而宿主已经通过
+ * `pricing.models` / `pricing.rates` 把真正该用的那份交下来了——走到这个兜底，
+ * 只可能是**旧宿主**或数据缺口。
+ *
+ * 抄一份的代价是「改了宿主忘了改这里」，而症状很隐蔽：只有旧宿主上的金额会偏，
+ * 新宿主上永远走不到这条路。因此宿主侧的闸门（`tools/preflight.mjs`）会把这两个
+ * 数字与 `MODEL_RATES['deepseek-flash']` 逐项对比，不一致就直接失败。
+ * @type {{label:string, cacheHit:object, cacheMiss:object, output:object}}
+ */
 const FALLBACK_RATES = {
   label: 'unknown',
   cacheHit: { peak: 0.04, idle: 0.02 },

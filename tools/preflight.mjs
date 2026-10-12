@@ -1601,6 +1601,32 @@ assert.deepEqual(MODEL_RATES['glm-5.3-flash'].cacheHit, { peak: 0.23, idle: 0.23
 // 智谱历史模型按官方说明折叠到现行模型
 assert.equal(normalizeModel('glm-5.1'), 'glm-5.3', 'GLM-5.1 应折到 GLM-5.3')
 assert.equal(normalizeModel('glm-4.7'), 'glm-5.3-flash', 'GLM-4.7 应折到 GLM-5.3-Flash')
+
+// 自建网关的部署标记（`-local` / 快照日 …）指的是同一个模型，必须折到同一行。
+// 实测本机 `glm-5.3-flash-local` 走 `company-local` 路由，早先一个都认不出
+// → 静默落 deepseek-flash 兜底价（¥0.70，按 GLM 应为 ¥1.57）。
+assert.equal(normalizeModel('glm-5.3-flash-local'), 'glm-5.3-flash', '带部署标记的路由名应折到 Flash 档')
+assert.equal(pricingOf('glm-5.3-flash-local').known, true, '带部署标记的路由名必须有官方价，不能落兜底')
+assert.equal(normalizeModel('glm-5.3-highspeed'), 'glm-5.3', '满血档的部署标记仍折到满血档')
+// 「提供商/」前缀与部署标记**同时**出现时，两段都要各自处理掉
+assert.equal(normalizeModel('z-ai/glm-5.3-flash-local'), 'glm-5.3-flash', '前缀 + 部署标记应一起处理')
+// 跨族不得被后缀带过去：`-local` 不足以把不存在的版本折进现行价目
+assert.equal(normalizeModel('deepseek-v5-local'), 'deepseek-v5-local', '跨族不许借后缀折进现行价目')
+assert.equal(pricingOf('deepseek-v5-local').known, false, '不存在的版本不能因为有 local 后缀就变成已知价')
+// 没见过的标记不得被猜：剥后缀只能认清单里那几个
+assert.equal(pricingOf('glm-5.3-flash-ultra').known, false, '没见过的标记应照旧认不出')
+
+// FlashX 是**独立定价的模型**，不是 Flash 的记号：官方价 2 / 7 / 0.57 对 0.8 / 2.8 / 0.23。
+// 当成部署后缀剥掉会低估 2.5 倍，而本机 `commandcode` 路由下确实挂着 `z-ai/glm-5.3-flashx`。
+assert.equal(normalizeModel('z-ai/glm-5.3-flashx'), 'glm-5.3-flashx', 'FlashX 应折到自己那一行，不是 Flash')
+assert.deepEqual(MODEL_RATES['glm-5.3-flashx'].cacheMiss, { peak: 2, idle: 2 }, 'FlashX 输入应为 2 元')
+assert.deepEqual(MODEL_RATES['glm-5.3-flashx'].output, { peak: 7, idle: 7 }, 'FlashX 输出应为 7 元')
+assert.deepEqual(MODEL_RATES['glm-5.3-flashx'].cacheHit, { peak: 0.57, idle: 0.57 }, 'FlashX 缓存命中应为 0.57 元')
+assert.notEqual(
+  MODEL_RATES['glm-5.3-flashx'], MODEL_RATES['glm-5.3-flash'],
+  'FlashX 与 Flash 必须是两份不同的价目条目',
+)
+
 // 不分时的模型 peak 必须等于 idle——这是「flat」判定的依据，界面靠它决定列数
 for (const [key, rates] of Object.entries(MODEL_RATES)) {
   if (rates.flat !== true) continue
@@ -1614,6 +1640,27 @@ assert.equal(unknownPricing.known, false, '未知模型必须标记为未知价'
 assert.equal(unknownPricing.rates, MODEL_RATES['deepseek-flash'], '未知模型应兜底到 Flash 单价')
 // 分档标注：GLM-4.6V 官方按输入长度分档，这里只取最低档并标出来
 assert.equal(pricingOf('glm-4.6v').tiered, true, 'GLM-4.6V 应标记为分档定价（这里只按最低档）')
+
+// 客户端 `cost.js` 里**抄了一份**兜底价目（独立打包，没有从宿主 import 的通道）。
+// 抄一份的失效模式是「改了宿主忘了改那里」，而症状只在旧宿主上出现，平时看不见。
+// 因此在这里把两边逐项钉死：数字不一致就直接失败，逼人同步。
+{
+  const clientCost = readFileSync(join(root, 'src', 'client', 'cost.js'), 'utf8')
+  const block = clientCost.match(/const FALLBACK_RATES = \{[\s\S]*?\n\}/)
+  assert.ok(block !== null, '客户端 cost.js 里应有一份 FALLBACK_RATES（找不到说明它被改名了，请同步这条闸门）')
+  const hostFallback = MODEL_RATES['deepseek-flash']
+  for (const field of ['cacheHit', 'cacheMiss', 'output']) {
+    for (const side of ['peak', 'idle']) {
+      const pattern = new RegExp(`${field}:\\s*\\{[^}]*${side}:\\s*([0-9.]+)`)
+      const found = block[0].match(pattern)
+      assert.ok(found !== null, `客户端兜底价里读不到 ${field}.${side}`)
+      assert.equal(
+        Number(found[1]), hostFallback[field][side],
+        `客户端兜底价的 ${field}.${side}（${found[1]}）与宿主 deepseek-flash（${hostFallback[field][side]}）不一致`,
+      )
+    }
+  }
+}
 
 // ── 通知与预警：宿主侧的结束事实 + 阈值配置读写 ──────────────────
 const notifyModule = await import(pathToFileURL(join(root, 'lib', 'notify.js')).href)

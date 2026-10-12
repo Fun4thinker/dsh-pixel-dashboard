@@ -31,6 +31,7 @@ import {
   UsageLedger,
   mergeRecords,
   modelKeyOf,
+  needsRollupRefresh,
   needsRouteEnrichment,
   parseLedger,
   recordOf,
@@ -705,6 +706,9 @@ await check('宽容归一不得把别的模型错认成价目表里的条目', (
     'glm-4.5-air', 'kimi-k2-thinking', 'minimax-m2.5',
     // 未来的版本号：价目表里没有就**不能**认
     'deepseek-v5', 'glm-6', 'deepseek-v4-pro-max',
+    // 本机实际在用的其它第三方模型（见 profile 的 provider 配置）：
+    // 它们都有自己的价目归属之外的身份，绝不能被折进 DeepSeek 或智谱任一行
+    'gpt-6.1-sol', 'gpt-6-luna', 'claude-sonnet-5-5', 'moonshotai/Kimi-K3',
   ]
   for (const name of mustMiss) {
     assert.equal(pricingOf(name).known, false, `${name} 不应被认成已知价`)
@@ -717,6 +721,79 @@ await check('宽容归一不得把别的模型错认成价目表里的条目', (
 await check('规范化索引没有冲突（有冲突必须显式加别名）', () => {
   assert.deepEqual(CANONICAL_COLLISIONS, [],
     `规范化后互相冲突：${CANONICAL_COLLISIONS.join('、')}；请加显式别名而不是让它自动挑一个`)
+})
+
+// 自建网关会在官方模型名后面接一段自己的标记（跑在哪、哪个通道）。这些名字指的是
+// **同一个模型**，因此必须折到同一行。
+//
+// 实测：本机 `glm-5.3-flash-local`（`company-local` 路由）早先一个都认不出，
+// 于是静默落到 `deepseek-flash` 兜底价——界面显示「DeepSeek Flash / 估算价」，
+// 金额 ¥0.70，而按 GLM-5.3-Flash 的官方价应当是 ¥1.57。**数字有、也不报错，只是错的。**
+//
+// 判据是「**官方有没有给它单独定价**」：`-local` / `-free` 在官方价目表里根本不存在，
+// 是真正的部署标记；而 `flashx` 官方**单独列了一行**（贵 2.5 倍），所以它不是标记，
+// 是另一个模型——见下面单独那条断言。把「长得像」当判据正是这里最容易犯的错。
+await check('部署标记折到同一个模型（否则按 Flash 兜底价静默算错）', () => {
+  const folded = [
+    // 用户实际在用的那个：内网自建部署
+    ['glm-5.3-flash-local', 'glm-5.3-flash'],
+    // 同族的其它部署标记
+    ['glm-5.3-flash-free', 'glm-5.3-flash'],
+    ['glm-5.3-flash-20260101', 'glm-5.3-flash'],
+    ['glm-5.3-flash-local-preview', 'glm-5.3-flash'],
+    ['glm-5.3-flash-20260101-local', 'glm-5.3-flash'],
+    // 带「提供商/」前缀与部署标记**同时**出现：两段前缀都要各自处理掉
+    ['z-ai/glm-5.3-flash-local', 'glm-5.3-flash'],
+    ['GLM-5.3-Flash-Local', 'glm-5.3-flash'],
+    // 满血档的部署标记仍折到满血档，不要掉进 Flash
+    ['glm-5.3-highspeed', 'glm-5.3'],
+    // DeepSeek 这边同理
+    ['deepseek-flash-local', 'deepseek-flash'],
+    ['deepseek-v4-pro-local', 'deepseek-v4-pro'],
+  ]
+  for (const [name, want] of folded) {
+    assert.equal(normalizeModel(name), want, `${name} 应折到 ${want}`)
+    // 关键不是「折对了」，而是**有金额估算**：走兜底时金额是错的，且界面看不出来
+    assert.equal(pricingOf(name).known, true, `${name} 应有官方价，不能落兜底`)
+  }
+})
+
+// FlashX 是**独立定价的模型**，不是「Flash 加个记号」。
+//
+// 官方 API 定价页的「最新模型」表把它与 Flash 并排列出，各有各的价：
+// Flash 0.8 / 2.8 / 0.23，FlashX 2 / 7 / 0.57（贵 2.5 倍）。
+// 因此把它当部署后缀剥掉会**低估 2.5 倍**——而本机 `commandcode` 路由下
+// 确实挂着 `z-ai/glm-5.3-flashx`，这条会实际影响金额。
+await check('FlashX 是独立模型，不能当部署标记折进 Flash（会低估 2.5 倍）', () => {
+  for (const name of ['glm-5.3-flashx', 'z-ai/glm-5.3-flashx', 'GLM-5.3-FlashX', 'glm-5.3-flashx-local']) {
+    assert.equal(normalizeModel(name), 'glm-5.3-flashx', `${name} 应折到 FlashX 自己那一行`)
+  }
+  const flashx = ratesOf('glm-5.3-flashx')
+  // 官方单价，元 / 百万 token（API 定价页「最新模型」表）
+  assert.equal(flashx.cacheMiss.peak, 2, 'FlashX 输入应为 2 元')
+  assert.equal(flashx.output.peak, 7, 'FlashX 输出应为 7 元')
+  assert.equal(flashx.cacheHit.peak, 0.57, 'FlashX 缓存命中应为 0.57 元')
+  assert.equal(flashx.flat, true, 'FlashX 同样不分时')
+  // 与 Flash 各是各的价，不能混
+  assert.notEqual(ratesOf('glm-5.3-flashx'), ratesOf('glm-5.3-flash'),
+    'FlashX 与 Flash 必须是两份不同的价目条目')
+})
+
+// 剥后缀会扩大命中面，因此必须与「不硬塞」这条不变量成对存在：
+// 未知的标记**不能**被猜成某个已知档位。
+await check('不认识的标记不得被猜成已知模型（剥后缀不能变成乱认）', () => {
+  const mustMiss = [
+    // 没见过的规格词：只能认已知的那几个，不许「去掉最后一个 -xxx 再试」蒙一个
+    'glm-5.3-flash-ultra', 'glm-5.3-flashx-ultra', 'glm-5.3-flash-local-xyz',
+    // 跨族：有 `-local` 后缀不足以把**不存在的版本**折进现行价目
+    'deepseek-v5-local',
+    // 对照：这些本来就该认不出
+    'glm-5.2-flash', 'glm-53-flash-local-abc', 'kimi-k3-1', 'gpt-6-astra',
+  ]
+  for (const name of mustMiss) {
+    assert.equal(pricingOf(name).known, false, `${name} 不应被认成已知价`)
+    assert.equal(normalizeModel(name), name, `${name} 认不出时应原样保留`)
+  }
 })
 
 await check('旧布局账本记录被就地升级，且幂等键不变', () => {
@@ -780,8 +857,39 @@ await check('重扫会话日志会把旧记录的模型与提供商补回来（�
   rmSync(path, { force: true })
 })
 
-await check('缓存未命中由 input 反推，不把命中算成未命中', () => {
-  const record = recordOf('s1', ledgerEvent(1, 1000, 'deepseek-flash', {
+// `r` 是**写入时**冻结的派生字段。归一规则一旦改进（例如新认出了 `-local` 这类
+// 部署后缀），旧记录不会自己变——同一个模型于是在界面上分成两行，一行按 GLM 计价、
+// 另一行仍标「估算价」，看起来像两个模型。这条锁住「就地重算，且不动计费数字」。
+await check('归一规则改进后，旧记录过期的 r 会被就地重算（不动任何计费数字）', async () => {
+  const path = join(tmpdir(), `dsh-pixel-refresh-${process.pid}.jsonl`)
+  rmSync(path, { force: true })
+  // 模拟「按旧规则冻结下来」的记录：n 是带部署后缀的原生名，r 却是旧结论
+  const stale = {
+    k: 'sr:1', s: 'sr', t: 1791793874699, n: 'glm-5.3-flash-local', p: 'company-local',
+    r: 'glm-5.3-flash-local', i: 7594, h: 0, w: 0, o: 346, g: 0, u: 7940,
+  }
+  assert.equal(needsRollupRefresh(stale), true, 'r 与当前归一口径不一致时应判定为过期')
+  const ledger = new UsageLedger(path)
+  await ledger.merge([stale])
+  const reopened = new UsageLedger(path)
+  await reopened.load()
+  const fixed = reopened.records.find((row) => row.k === 'sr:1')
+  assert.equal(fixed.r, 'glm-5.3-flash', 'r 应按当前规则重算')
+  // 关键：只动 r 这一个派生字段，token 与计费量一个字节都不能变
+  for (const field of ['i', 'h', 'w', 'o', 'g', 'u']) {
+    assert.equal(fixed[field], stale[field], `${field} 不许被重算改动`)
+  }
+  assert.equal(fixed.n, 'glm-5.3-flash-local', '原生名 n 必须原样保留（它才是事实）')
+  assert.equal(reopened.refreshed, 1, '应报告修了 1 条')
+  // 幂等：再读一次没有可修的，也就不该再写盘
+  const again = new UsageLedger(path)
+  await again.load()
+  assert.equal(again.refreshed, 0, '修完再读应无可修项（否则每次读账本都要重写整个文件）')
+  assert.equal(needsRollupRefresh(fixed), false)
+  rmSync(path, { force: true })
+})
+
+await check('缓存未命中由 input 反推，不把命中算成未命中', () => {  const record = recordOf('s1', ledgerEvent(1, 1000, 'deepseek-flash', {
     inputTokens: 1000,
     outputTokens: 100,
     cacheReadTokens: 800,

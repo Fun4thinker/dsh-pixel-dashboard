@@ -110,6 +110,24 @@ export const MODEL_RATES = {
     cacheMiss: { peak: 0.8, idle: 0.8 },
     output: { peak: 2.8, idle: 2.8 },
   },
+  // GLM-5.3-FlashX 是**独立定价的另一个模型**，不是 Flash 的别名：官方价 2 / 7 / 0.57
+  // 对 Flash 的 0.8 / 2.8 / 0.23，贵 2.5 倍。来源同 API 定价页的「最新模型」表。
+  //
+  // 早先它被当成「Flash 的加速标记」折进 `glm-5.3-flash`，那是错的：本机
+  // `commandcode` 路由下确实挂着 `z-ai/glm-5.3-flashx`，折过去会把金额低估 2.5 倍。
+  // 依据是官方把它与 Flash 并排列在同一张价目表里、各有各的单价——
+  // 而 `-local` / `-free` 这类之所以能折，是因为官方**没有**给它们单独定价。
+  'glm-5.3-flashx': {
+    label: 'GLM-5.3-FlashX',
+    vendor: '智谱',
+    version: 'GLM-5.3-FlashX',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    cacheHit: { peak: 0.57, idle: 0.57 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 7, idle: 7 },
+  },
   'glm-5.2': {
     label: 'GLM-5.2',
     vendor: '智谱',
@@ -174,6 +192,141 @@ export const MODEL_ALIASES = {
 }
 
 /**
+ * 部署 / 规格后缀 → 它们**不属于模型身份**的证据。
+ *
+ * 自建网关（vLLM、SGLang、Ollama、各家中转）习惯在官方模型名后面接一段自己的
+ * 标记，说明「这份权重跑在哪、是哪个规格」，而**模型本身仍是那一个**：
+ *
+ *   `glm-5.3-flash-local`   本机 / 内网自建部署
+ *   `glm-5.3-flash-free`    免费通道
+ *   `glm-5.3-flash-20260101` 快照日
+ *
+ * **判据是「官方有没有给它单独定价」，而不是「名字长得像不像」。** `glm-5.3-flashx`
+ * 看着也像 Flash 加个记号，但官方在价目表里**单独列了它**（2 / 7 / 0.57，贵 2.5 倍），
+ * 因此它是独立模型、有自己的一行，绝不能折进 Flash。反过来，`-local` / `-free`
+ * 这类官方价目表里根本没有，才是真正的部署标记。
+ *
+ * 这些都不该让它认不出模型——认不出的后果不是「少一个名字」，而是**按 DeepSeek
+ * Flash 的单价计价**（见 FALLBACK_RATES）：数字有、界面也不报错，只是错的。
+ * 实测本机 `glm-5.3-flash-local` 被按 `deepseek-flash` 算成了 ¥0.70，而按 GLM-5.3-Flash
+ * 的官方价应当是 ¥1.57。
+ *
+ * ## 为什么必须是「清单 + 族内绑定」，而不是随便剥
+ *
+ * 剥后缀会**扩大**归一命中面，而这里最危险的失败模式恰好是「宽容变成乱认」
+ * ——把别家模型按 DeepSeek 计价。因此两条约束一起上：
+ *
+ *   1) **只剥清单里列出的那一段**（外加纯数字快照日），不做「去掉最后一个 `-xxx`
+ *      再试一次」这种通用回退：那会把 `gpt-6.1-sol` 里的 `sol` 当成后缀，一路剥到
+ *      `gpt-6.1`，再撞不上就保留原名——看似无害，但 `kimi-k2-thinking` 会剥成
+ *      `kimi-k2`，将来价目表一旦收录 `kimi-k2`，「思考版」就会按「基础版」计价。
+ *   2) **只能折进同一族**（见 {@link familyOf}）：`glm-5.3-free` 认得，但
+ *      `deepseek-v5-local` 不会因为有个 `local` 后缀就被折进 DeepSeek 的某一行。
+ *
+ * 认不出仍然是**默认结果**，这条路只是把「明显是同一个模型的部署标记」捡回来。
+ */
+const DEPLOYMENT_SUFFIXES = [
+  'local', 'highspeed', 'turbo', 'free', 'online', 'server',
+  'preview', 'exp', 'beta', 'stable', 'release', 'ga',
+]
+
+/** 全部可剥后缀，长的排前面免得被更短的规则先吃掉。 */
+const DEPLOYMENT_SUFFIX_PATTERN = [...DEPLOYMENT_SUFFIXES]
+  .sort((a, b) => b.length - a.length)
+  .join('|')
+
+/**
+ * 取一个模型名的**族**（系列）：去掉结尾的规格档位、只留系列本身。
+ *
+ * 用来给「剥后缀」划一条不可逾越的边界。没有它，`deepseek-v5-local` 会被剥成
+ * `deepseek-v5`——虽然仍认不出，但只要将来价目表收录了 `deepseek-v5`，一个**还不存在
+ * 的版本**就会以「它有 local 后缀」为理由被折进现行价目。族内绑定让这种跨界折叠
+ * 在构造上不可能发生：`glm-5.3-flash-local` 的族是 `glm-5.3`，候选行必须同族。
+ *
+ * 比较一律走 {@link canonicalOf}（只留小写字母与数字），因此
+ * `glm-5.3-flash` 与 `glm53flash` 是同一个族、`的 GLM-5.3-Flash` 也一样。
+ * **不要在这里按 `.` / `_` 做「统一成连字符」的替换**：那会把版本号
+ * `5.3` 拆成 `5-3`，于是候选（还带点号）与价目表键（已换成连字符）算出的族
+ * 永远不相等，整条路静默失效——踩过，症状是「新后缀一个都不认」。
+ *
+ * 档位只认价目表里真实出现过的 `flash`：族是不带档位的系列名。
+ * @param {string} name - 模型名（可含 `提供商/` 前缀）。
+ * @returns {string} 族名（规范化形式）；去不掉档位时返回规范化后的原名。
+ */
+function familyOf(name) {
+  const text = String(name ?? '').toLowerCase().trim()
+  const slash = text.lastIndexOf('/')
+  let bare = slash >= 0 ? text.slice(slash + 1).trim() : text
+  if (bare === '') return ''
+  // **把所有**末尾标记都去掉，而不是只去一段。
+  //
+  // 只去一段的话，`glm-5.3-flash-local-preview` 算出来是 `glm53flashlocal`——里面还
+  // 留着 `local`，而目标行 `glm-5.3-flash` 算出来是 `glm53flash`，两者永不相等，
+  // 于是「多段标记」的名字整类静默失效（实测就是这么漏的）。系列名理应不含任何
+  // 部署/规格标记，所以这里循环剥到不动为止。
+  const marker = new RegExp(`-(?:${DEPLOYMENT_SUFFIX_PATTERN}|\\d{4,8})$`)
+  for (let i = 0; i < 6; i += 1) {
+    const next = bare.replace(marker, '')
+    if (next === bare) break
+    bare = next
+  }
+  // 再剥档位：族是不带档位的系列名（`glm-5.3-flash-local` 与 `glm-5.3` 同族）。
+  const stripped = bare.replace(/-flash$/, '')
+  return canonicalOf(stripped === '' ? bare : stripped)
+}
+
+/** 预计算的「族 → 该族下最长的价目表键」，只在自定义价目变更时重建。 */
+let FAMILY_VIEW = new Map()
+
+/**
+ * 重建族索引。
+ *
+ * 同一个族有多条时取**最长的键**：`glm-5.3` 与 `glm-5.3-flash` 同族
+ * （族都是 `glm-5.3`），而 `glm-5.3-flash-local` 显然更该是 Flash 那一行。
+ * 取最短会把它按「完整的 GLM-5.3」计价——贵 10 倍，且看不出来。
+ * @param {object} rates - 生效中的价目表。
+ * @returns {void}
+ */
+function buildFamilyIndex(rates) {
+  const index = new Map()
+  for (const key of Object.keys(rates)) {
+    const family = familyOf(key)
+    const existing = index.get(family)
+    if (existing === undefined || key.length > existing.length) index.set(family, key)
+  }
+  FAMILY_VIEW = index
+}
+
+/**
+ * 受控地剥掉部署 / 规格后缀，并**只折进同一族**的价目表键。
+ *
+ * 逐层剥（`glm-5.3-flash-20260101-local` 要剥两段），每剥一层都回头查一次
+ * ——与发售日那条路同一个套路，只是这里还多一道「同族」闸门。
+ * @param {string} lower - 已小写的模型名。
+ * @param {(candidate:string)=>string|undefined} lookup - 三种查法（价目表 / 别名 / 规范化）。
+ * @returns {string|undefined} 价目表键；认不出返回 undefined。
+ */
+function stripDeploymentSuffix(lower, lookup) {
+  const slash = lower.lastIndexOf('/')
+  const head = slash >= 0 ? lower.slice(0, slash + 1) : ''
+  let candidate = slash >= 0 ? lower.slice(slash + 1).trim() : lower
+  if (candidate === '') return undefined
+  const family = familyOf(candidate)
+
+  for (let i = 0; i < 4; i += 1) {
+    // 变体标记与发售日（四到八位数字快照日）可以交替出现，因此循环而不是一次替换。
+    const match = candidate.match(new RegExp(`-(${DEPLOYMENT_SUFFIX_PATTERN}|\\d{4,8})$`))
+    if (match === null) break
+    candidate = candidate.slice(0, candidate.length - match[0].length)
+    const resolved = lookup(`${head}${candidate}`)
+    // 同族才收：`glm-5.3-flash-local` 折进 `glm-5.3-flash` 可以，
+    // 折进 `deepseek-flash` 或别的系列都不行。
+    if (resolved !== undefined && familyOf(resolved) === family) return resolved
+  }
+  return undefined
+}
+
+/**
  * 规范化形式：只保留小写字母与数字。
  *
  * 用来吸收各家网关对同一个模型的各种写法——大小写、连字符 / 下划线 / 点号的
@@ -223,6 +376,12 @@ function buildIndex(rates, aliases) {
 }
 
 const BUILTIN_INDEX = buildIndex(MODEL_RATES, MODEL_ALIASES)
+
+/**
+ * 生效中的族索引：只在价目表变化时重建，`normalizeModel` 每命中一次都要查它，
+ * 因此不能每次现算（它落在导入账本的热路径上：每条记录一次归一）。
+ */
+buildFamilyIndex(MODEL_RATES)
 
 /** 规范化后互相冲突的**内置**模型名（应为空；非空时闸门会失败）。 */
 export const CANONICAL_COLLISIONS = Object.freeze([...BUILTIN_INDEX.collisions])
@@ -332,6 +491,7 @@ export function setCustomRates(customRates) {
     RATES_VIEW = MODEL_RATES
     ALIASES_VIEW = MODEL_ALIASES
     INDEX_VIEW = BUILTIN_INDEX
+    buildFamilyIndex(MODEL_RATES)
     CUSTOM_KEYS = new Set()
     return
   }
@@ -342,6 +502,9 @@ export function setCustomRates(customRates) {
   // 内置索引与用户条目一起重建：两者可能规范化后撞车（如自定义 'glm-53' 撞上
   // 内置 'glm-5.3'），此时新索引会把这个形式删掉——归一认不出，而不是按错价。
   INDEX_VIEW = buildIndex(merged, MODEL_ALIASES)
+  // 族索引同理：用户补的价要能接住带部署后缀的路由名，
+  // 否则「我明明配了 glm-5.3-flash，`...-local` 却还是估算价」。
+  buildFamilyIndex(merged)
 }
 
 /**
@@ -375,12 +538,32 @@ export function normalizeModel(model) {
   // 大小写不敏感：价目表键与别名表都是小写，先把输入也压成小写。
   const lower = name.toLowerCase()
 
-  /** 精确 / 别名 / 规范化，三种查法依次尝试。 */
+  /**
+   * 精确 / 别名 / 规范化，三种查法依次尝试。
+   *
+   * 带 `提供商/` 前缀时**连末段一起试**：调用方（包括部署后缀那条路）会拿
+   * `z-ai/glm-5.3-flash` 这种还带着前缀的候选来查，而价目表里只有末段。
+   * 早先这一步只做整体查，于是「带前缀 + 带部署后缀」的名字（实测
+   * `z-ai/glm-5.3-flashx`）在最后一步凭空落空——前缀在别处剥掉了，
+   * 这里却以为它已经被处理过。
+   * @param {string} candidate - 候选模型名。
+   * @returns {string|undefined} 价目表键。
+   */
   const lookup = (candidate) => {
-    if (RATES_VIEW[candidate] !== undefined) return candidate
-    const alias = ALIASES_VIEW[candidate]
-    if (alias !== undefined) return alias
-    return INDEX_VIEW.index.get(canonicalOf(candidate))
+    const bare = (text) => {
+      if (RATES_VIEW[text] !== undefined) return text
+      const alias = ALIASES_VIEW[text]
+      if (alias !== undefined) return alias
+      return INDEX_VIEW.index.get(canonicalOf(text))
+    }
+    const direct = bare(candidate)
+    if (direct !== undefined) return direct
+    const slash = candidate.lastIndexOf('/')
+    if (slash >= 0) {
+      const tail = candidate.slice(slash + 1).trim()
+      if (tail !== '') return bare(tail)
+    }
+    return undefined
   }
 
   const direct = lookup(lower)
@@ -408,6 +591,12 @@ export function normalizeModel(model) {
     const resolved = lookup(candidate)
     if (resolved !== undefined) return resolved
   }
+
+  // 第四步：部署 / 规格后缀（`-local` / `-flashx` / 快照日 …），**限定同族**。
+  // 放在最后是为了不动上面那条久经考验的路径——它是绝大多数命中的来源，
+  // 而这一步只负责把「明显是同一个模型、只是标注了跑在哪」的名字捡回来。
+  const deployment = stripDeploymentSuffix(lower, lookup)
+  if (deployment !== undefined) return deployment
 
   // 认不出来：**原样返回**。保留用户自己的路由名有两个用处——费用明细里照实
   // 展示（而不是编一个价目表里的名字），以及在「只有调用量」的监看里能认出它。

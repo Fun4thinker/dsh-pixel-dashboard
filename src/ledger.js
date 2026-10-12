@@ -222,6 +222,54 @@ export function needsRouteEnrichment(record) {
 }
 
 /**
+ * 这条记录的 `r`（价目表键）是否**过期**了——即按现在的归一口径重算会得到别的值。
+ *
+ * ## 为什么必须有这一步（而不是等重扫）
+ *
+ * `r` 是**写入时**算好并冻结的（见 {@link recordOf} 的注释：历史记录一旦落盘就固定了）。
+ * 那样做对「同一份归一口径」是快的，但意味着**归一规则一旦改进，历史永远享受不到**
+ * ——除非会话日志还在、还能重扫一遍。
+ *
+ * 实测踩过：给 `normalizeModel` 加了对 `-local` 这类部署后缀的识别之后，
+ * 新记录都折到了 `glm-5.3-flash`，而账本里那 103 条旧记录仍写着
+ * `glm-5.3-flash-local`——**同一个模型在界面上分成两行**，一行按 GLM 计价、
+ * 另一行还带着「估算价」，看起来像两个模型。这与当初修坏归一规则时的症状一模一样。
+ *
+ * ## 为什么可以就地修，而不必重扫
+ *
+ * 判据只看**记录自己**：它存着原生模型名 `n`（那是路由上的原始 id，不会变），
+ * 拿它走一遍**当前**的 `rollupOf` 就能算出「现在应该是什么键」。因此：
+ *
+ *   - **不需要会话日志**：`n` 就在记录里，重算不需要任何外部信息，所以早已删除的
+ *     会话也能被修好（靠重扫就永远修不到——日志没了）。
+ *   - **不动任何计费数字**：只改 `r` 这一个字段，`i/h/w/o/g/u` 一个字节都不碰。
+ *     归一是**派生字段**，它不是「那时的事实」，而是「按当时规则算出来的结论」；
+ *     规则变了，结论就该跟着变（对比 {@link enrichRoute}：那里同样是覆盖派生字段、
+ *     保留计数）。
+ *   - **幂等**：修完再算一次就相等，于是不会反复写盘。
+ *
+ * 认不出来时 `r` 就是 `n` 本身，因此这条对「未知模型」天然无操作。
+ * @param {object} record - 已升级布局的记录。
+ * @returns {boolean} `r` 与当前归一结果不一致时为真。
+ */
+export function needsRollupRefresh(record) {
+  if (record === null || typeof record !== 'object') return false
+  if (typeof record.n !== 'string' || record.n === '') return false
+  const current = rollupOf(record.n)
+  return String(record.r ?? '') !== current
+}
+
+/**
+ * 按当前归一口径重算 `r`。**只动这一个字段。**
+ * @param {object} record - 已升级布局的记录。
+ * @returns {object} 修好 `r` 的记录（无需修改时原样返回同一个对象）。
+ */
+export function refreshRollup(record) {
+  if (!needsRollupRefresh(record)) return record
+  return { ...record, r: rollupOf(record.n) }
+}
+
+/**
  * 用扫描出来的权威记录覆盖旧账本的元信息，同时**保留旧记录的计费口径**。
  *
  * 为什么计数要保留旧的：账本里可能还有这台机器上早已删掉的会话，而会话日志会被
@@ -341,6 +389,11 @@ export class UsageLedger {
     this.lastError = undefined
     /** 本次读取时从旧布局升级过来的条数（0 表示无需迁移）。 */
     this.upgraded = 0
+    /**
+     * 本次读取时按当前归一口径**重算过 `r`** 的条数。
+     * 与 `upgraded` 分开计数：两者是不同的原因，混在一起会让诊断看不出到底修了什么。
+     */
+    this.refreshed = 0
     /** 无法升级、已丢弃的坏记录条数。 */
     this.dropped = 0
   }
@@ -379,11 +432,25 @@ export class UsageLedger {
       this.upgraded = upgraded
       this.dropped = dropped
       this.loaded = true
+      // 归一规则可能比账本新（见 needsRollupRefresh）：把过期的 `r` 按**当前**规则
+      // 就地重算，只动这一个派生字段。放在 load 里是因为它**不需要重扫会话日志**
+      // ——`n` 就在记录里，早已删掉的会话也能被修好。
+      const stale = []
+      let refreshed = 0
+      for (const record of upgradedRecords) {
+        const fixed = refreshRollup(record)
+        if (fixed !== record) refreshed += 1
+        stale.push(fixed)
+      }
+      this.records = stale
+      this.keySet = new Set(stale.map((record) => record.k))
+      this.refreshed = refreshed
       // 只要还有记录留着旧字段 `m`（迁移未完成）就写回一次：写回会把 `m` 删掉，
       // 于是这次迁移只发生一次，而不是每次读账本都重写整个文件。
-      const pending = upgradedRecords.some((record) => Object.hasOwn(record, 'm'))
-      if (upgraded > 0 || pending) await this.#writeAtomic(upgradedRecords)
-      return { records: upgradedRecords.length, badLines }
+      // 刷新过期的 `r` 同理——刷完再算就相等，不会反复写盘。
+      const pending = stale.some((record) => Object.hasOwn(record, 'm'))
+      if (upgraded > 0 || pending || refreshed > 0) await this.#writeAtomic(stale)
+      return { records: stale.length, badLines }
     } catch (error) {
       // 读不到就当空账本继续跑，看板退化为只统计本机会话
       this.lastError = error instanceof Error ? error.message : String(error)
@@ -417,11 +484,14 @@ export class UsageLedger {
 
     let enriched = 0
     const next = this.records.map((record) => {
-      if (!needsRouteEnrichment(record)) return record
-      const authoritative = byKey.get(record.k)
-      if (authoritative === undefined) return record
+      // 先按当前归一规则修派生字段 `r`（不需要会话日志，见 needsRollupRefresh），
+      // 再补只有重扫才能拿到的 `n`/`p`。两步都只动派生字段，绝不动计费数字。
+      const current = refreshRollup(record)
+      if (!needsRouteEnrichment(current)) return current
+      const authoritative = byKey.get(current.k)
+      if (authoritative === undefined) return current
       enriched += 1
-      return enrichRoute(record, authoritative)
+      return enrichRoute(current, authoritative)
     })
     if (fresh.length === 0 && enriched === 0) {
       return { added: 0, total: this.records.length, enriched: 0 }
