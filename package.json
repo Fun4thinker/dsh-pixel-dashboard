@@ -28,6 +28,9 @@
     "docs",
     "LICENSE"
   ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Fun4thinker/dsh-pixel-dashboard.git"
