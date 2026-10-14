@@ -22,6 +22,7 @@ import {
   periodState,
   pricingOf,
   ratesOf,
+  zonedFacts,
   zonedParts,
   CANONICAL_COLLISIONS,
 } from '../lib/pricing.js'
@@ -351,6 +352,29 @@ await check('站点时区日期键与 UTC 不同（跨日边界）', () => {
   assert.equal(zonedParts(T('2026-09-10T17:00:00Z'), DEFAULT_TIMEZONE).hour, 1)
 })
 
+// `zonedFacts()` 是给逐条记录的热路径用的：一次 Intl 格式化同时给出日期键、
+// 高峰判定和墙钟字段。它必须与分别调用三个函数**逐点一致**，否则省下的时间
+// 会以金额或分档漂移为代价——那种错误在界面上完全看不出来。
+await check('zonedFacts 一次格式化与分别调用三个函数逐点一致', () => {
+  const zones = [DEFAULT_TIMEZONE, 'UTC', 'America/New_York', 'Asia/Tokyo']
+  let checked = 0
+  for (const tz of zones) {
+    // 扫过一整年（含所有周末、节假日、调休与两个长假），每 7 分钟一点
+    const start = Date.parse('2026-01-01T00:00:00Z')
+    for (let t = start; t < Date.parse('2027-01-01T00:00:00Z'); t += 7 * 60_000) {
+      const facts = zonedFacts(t, tz)
+      assert.equal(facts.key, dateKey(t, tz), `日期键不一致 @${t} ${tz}`)
+      assert.equal(facts.peak, isPeak(t, tz), `高峰判定不一致 @${t} ${tz}`)
+      const parts = zonedParts(t, tz)
+      assert.equal(facts.parts.hour, parts.hour)
+      assert.equal(facts.parts.minuteOfDay, parts.minuteOfDay)
+      assert.equal(facts.parts.weekday, parts.weekday)
+      checked += 1
+    }
+  }
+  assert.ok(checked > 200_000, `应覆盖足够多的时刻，实际 ${checked}`)
+})
+
 console.log('aggregation：会话日志聚合')
 
 /** 造一条带用量的 assistant/message。 */
@@ -623,6 +647,105 @@ await check('缺失 persistence 时退化为空数据而不抛错', async () => 
   const result = await empty.read()
   assert.equal(result.overview.sessions, 0)
   assert.equal(result.days.length, 0)
+})
+
+// 会话日志里九成以上的字节是 assistant 正文与工具结果，宿主只用得到其中的用量
+// 数字、轮次数与最新标题。早先 `cache` 存的是**原始事件**，于是常驻内存随历史
+// 线性增长：实测一台机器 103 个会话（解压后 513 MB）留下 1.1 GB 事件对象，只为
+// 产出 0.12 MB 的响应；看板刷新会在那一刻再叠一次扫描峰值，宿主被内存压力杀掉，
+// 桌面端表现成「突然重启」。因此这里钉住**缓存里不得出现原始事件**这条契约。
+await check('会话缓存只留派生结果，不留原始事件（否则常驻内存随历史线性增长）', async () => {
+  // 造一条带大块正文的事件：正文越大，新旧行为的常驻内存差越明显
+  const bulky = 'x'.repeat(20_000)
+  const heavyLog = [
+    { type: 'turn/start', seq: 0, time: T('2026-09-10T04:30:00Z') },
+    {
+      type: 'tool/result',
+      seq: 1,
+      time: T('2026-09-10T04:30:00Z'),
+      data: { output: bulky },
+    },
+    message(2, T('2026-09-10T04:30:00Z'), 'deepseek-flash', { input: 10, output: 1 }),
+  ]
+  const catalog = new UsageCatalog({
+    persistence: () => fakePersistence({ heavy: heavyLog }),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('cache-shape'),
+  })
+  await catalog.read()
+
+  const entry = catalog.cache.get('heavy')
+  assert.ok(entry !== undefined, '派生结果应被缓存，供下一次扫描复用')
+  assert.equal(entry.events, undefined, '缓存里不得留原始事件数组')
+  // 派生结果的形状：指纹 + 记录 + 轮次数 + 标题 + 归日
+  assert.equal(typeof entry.fingerprint, 'string')
+  assert.equal(entry.records.length, 1, '只保留带用量的那一条')
+  assert.equal(entry.turns, 1, '轮次数要在派生结果里算好')
+  assert.equal(entry.title, '', '没有 session/title 时标题为空串，由 displayTitleOf 回落')
+  // 归日也属于「与实时模型目录无关」的派生量，缓存在这里可以省掉一整轮 Intl 格式化
+  assert.deepEqual(entry.days, ['2026-09-10'], '该会话有请求的自然日应一并缓存')
+  // 原始事件的正文不得被任何字段间接引用住
+  assert.equal(
+    JSON.stringify(entry).includes(bulky),
+    false,
+    '缓存里不得间接留住大块正文——那正是 1.1 GB 的来源',
+  )
+})
+
+// `days` 是按站点时区把时间戳归日算出来的，因此时区必须进指纹：
+// 否则换了时区仍复用旧派生结果，会话清单里的日期会与看板的日行对不上。
+await check('时区变了要让派生缓存失效（days 是按站点时区归日的）', async () => {
+  let zone = DEFAULT_TIMEZONE
+  // 周四 16:30 UTC = 北京周五 00:30 → 两个时区归到不同的日子
+  const lateLog = [message(1, T('2026-09-10T16:30:00Z'), 'deepseek-flash', { input: 100, output: 10 })]
+  const catalog = new UsageCatalog({
+    persistence: () => fakePersistence({ late: lateLog }),
+    sessions: () => undefined,
+    timezone: () => zone,
+    ledgerPath: ledgerFor('tz-fingerprint'),
+  })
+  const beijing = await catalog.read()
+  assert.deepEqual(beijing.sessions[0].days, ['2026-09-11'], '北京时间下应归到次日')
+
+  zone = 'UTC'
+  // 必须绕开那个 20 秒快照缓存：`read()` 在 TTL 内直接返回上一份快照，
+  // 不走 collect()，那样这条用例根本测不到指纹（第一版就踩了这个坑）。
+  catalog.invalidate()
+  const utc = await catalog.read()
+  assert.deepEqual(utc.sessions[0].days, ['2026-09-10'], '换时区后必须重新归日，不得复用旧缓存')
+})
+
+await check('缓存命中时不重读日志，且派生结果与重扫一致', async () => {
+  let opens = 0
+  const persistence = {
+    async list() {
+      return [{ header: { id: 's1', createdAt: now, cwd: 'D:\\blog' }, revision: 'r1', eventCount: logA.length }]
+    },
+    async open() {
+      opens += 1
+      return {
+        async read(offset = 0, length = 500) { return { events: logA.slice(offset, offset + length) } },
+        async close() {},
+      }
+    },
+  }
+  const catalog = new UsageCatalog({
+    persistence: () => persistence,
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('cache-hit'),
+  })
+  const first = await catalog.read()
+  assert.equal(opens, 1, '首次扫描应读一次会话')
+  // 指纹没变 → 复用派生结果，不得重读日志
+  catalog.invalidate()
+  const second = await catalog.read()
+  assert.equal(opens, 1, '指纹未变时刷新不得重读会话日志')
+  // 复用缓存得到的数字必须与首次完全一致（派生结果没丢信息）
+  assert.deepEqual(second.overview.totals, first.overview.totals, '复用缓存的聚合结果不得漂移')
+  assert.deepEqual(second.sessions, first.sessions, '会话元信息不得漂移')
+  assert.deepEqual(second.models, first.models, '模型条目不得漂移')
 })
 
 console.log('ledger：本机用量账本')
