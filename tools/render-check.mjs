@@ -1913,6 +1913,103 @@ must(
   + '请改用插件自己的 --px-* 令牌',
 )
 
+// ── 三层表面的明度阶梯闸门 ──────────────────────────────────────
+//
+// ## 这条闸门要防的是「用户报的那句话」
+//
+// 原话是：「浅色模式下用量看板中的色块不均衡，奶油色和白色的色块混在一起，
+// 有些按钮是奶油色，有些按钮又是白色，有些奇怪。」
+//
+// 根因不是渲染，是**三个表面令牌的明度没拉开**：早先 bg #fbf4e8 与
+// surface-2 #f7efe2 只差对比度 **1.044**，几乎同色。于是同一个 `.px-btn`：
+//   - 放在页面底（bg）上 → 是「比底亮的白块」（1.076）；
+//   - 放在卡片（surface）里 → 是「比底暗的奶油块」（1.123，方向反了）。
+// 两种观感交替出现，用户当然说不出规律。
+//
+// **光断言「明暗两套取值不同」是不够的**（那几条上面已经有了）——它只验了
+// 「深色和浅色不是同一套」，完全没验「同一套内部的三层彼此分得开」。
+//
+// 因此这里钉住两条：
+//   1. 浅色下三层的**亮度顺序**必须是 surface-2 < bg < surface（凹陷 → 页面 → 浮起）；
+//   2. 任意相邻两层、以及任意两层之间的对比度都要 ≥ 1.10，否则就是「看着一样」。
+// 深色那套天然满足（底最暗、卡片最亮），同样断言一遍以防改成扁平色板。
+{
+  /** 相对亮度（WCAG 定义）。 */
+  const luminanceOf = (hex) => {
+    const rgb = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16))
+    const channel = rgb.map((v) => {
+      const x = v / 255
+      return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4
+    })
+    return 0.2126 * channel[0] + 0.7152 * channel[1] + 0.0722 * channel[2]
+  }
+  /** 对比度（1=完全同色，21=黑白）。 */
+  const contrastOf = (a, b) => {
+    const [hi, lo] = [luminanceOf(a), luminanceOf(b)].sort((x, y) => y - x)
+    return (hi + 0.05) / (lo + 0.05)
+  }
+  /** 从某个令牌块里取一个十六进制颜色。 */
+  const colorOf = (block, name) => {
+    const raw = valueOf(block, name)
+    return typeof raw === 'string' && /^#[0-9a-f]{6}$/i.test(raw) ? raw : undefined
+  }
+  const SURFACE_TOKENS = ['--px-bg', '--px-surface', '--px-surface-2']
+  /** 每条用例检查的顺序与最小对比度。 */
+  for (const [label, block, deepest] of [
+    ['浅色', lightBlock[1], '--px-surface-2'],
+    ['深色', darkBlock[1], '--px-bg'],
+  ]) {
+    const colors = {}
+    for (const token of SURFACE_TOKENS) {
+      const value = colorOf(block, token)
+      must(value !== undefined, `${label}模式下 ${token} 必须是十六进制颜色（实际「${valueOf(block, token)}」）`)
+      colors[token] = value
+    }
+    // 1) 亮度顺序：最深的那一档必须真的是最深的，卡片必须是最亮的
+    for (const token of SURFACE_TOKENS) {
+      if (token === deepest || token === '--px-surface') continue
+      must(
+        luminanceOf(colors[token]) > luminanceOf(colors[deepest]),
+        `${label}模式下 ${token} 应比 ${deepest} 更亮——否则「凹陷层」和「页面层」分不开`,
+      )
+    }
+    must(
+      luminanceOf(colors['--px-surface']) >= luminanceOf(colors['--px-bg']),
+      `${label}模式下卡片（--px-surface）不该比页面底（--px-bg）更暗，`
+      + '否则「浮起的卡片」看起来像一块凹陷',
+    )
+    // 2) 任意两层都要分得开。这一条才是用户报的那个问题的直接防线。
+    for (let i = 0; i < SURFACE_TOKENS.length; i += 1) {
+      for (let j = i + 1; j < SURFACE_TOKENS.length; j += 1) {
+        const a = SURFACE_TOKENS[i]
+        const b = SURFACE_TOKENS[j]
+        const ratio = contrastOf(colors[a], colors[b])
+        must(
+          ratio >= 1.10,
+          `${label}模式下 ${a} 与 ${b} 的对比度只有 ${ratio.toFixed(3)}（要求 ≥ 1.10）——`
+          + '两层几乎同色，界面会表现为「色块混在一起、有的按钮白有的按钮奶油」，'
+          + '而不会报任何错。改这三个值时请把明度拉开。',
+        )
+      }
+    }
+  }
+}
+// 徽标必须透明底 + 描边：它会被放进各种深浅的容器里，实色底一旦与父级同色就消失。
+// 实测踩过：.px-badge（原 surface-2）落在 .px-notify-permission（同样 surface-2）上，
+// 对比度 1.000，整个徽标只剩文字浮着。
+{
+  const badge = /(?:^|\n)\.px-badge\s*\{([^}]*)\}/.exec(css)
+  must(badge !== null, '无法解析 .px-badge 规则')
+  must(
+    /background\s*:\s*transparent/.test(badge[1]),
+    '.px-badge 必须是透明底（它会被放进同色容器里，实色底会整块消失）',
+  )
+  must(
+    /border\s*:\s*1px\s+solid/.test(badge[1]),
+    '.px-badge 必须有描边（透明底之后，轮廓是它唯一的边界）',
+  )
+}
+
 // ── 每一档颜色都要有成套的 CSS（踩过一次）─────────────────────────
 // 折线的 tone 取自 `TONES`，而 `.px-line/.px-dot/.px-legend-swatch` 各自需要一条
 // 规则。早先只有 blue / purple / pink 三套，于是「按模型 / 提供商分组」能画出
