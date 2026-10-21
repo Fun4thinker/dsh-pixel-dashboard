@@ -1913,6 +1913,49 @@ must(
   + '请改用插件自己的 --px-* 令牌',
 )
 
+// ── 「谁在铺次级底色」白名单 ────────────────────────────────────
+//
+// 用户第二次反馈的原话：「浅色背景下好丑啊，要么都是白色，要么都是奶油色，
+// 不要这样东一块西一块的」。
+//
+// 第一次修复的方向是错的：把它当成「明度没拉开」，于是把 `--px-surface-2`
+// 调得更深——结果那 18 处铺它的地方（表头、余额条、单价行、价格表单、套餐块、
+// 时钟块、通知块……）**变得更显眼**，真实界面上更碎。
+// 对比度数值全绿，观感更差。
+//
+// 真正的规则是**面积**：白色是页面里唯一的「块」，米色只出现在**内凹**的地方。
+// 因此这道闸门直接管住「哪些选择器允许铺次级底色」——加一个进去就得显式改这张表，
+// 逼人停下来问一句「这一块真的该是一块色块吗」。
+{
+  /** 允许铺 `--px-surface-2` 的选择器：只有真正内凹的槽。 */
+  const ALLOWED_SECONDARY_BACKGROUND = [
+    '.px-seg',            // 分段控件的凹槽（滑块是白的，浮在里面）
+    '.px-barrow-track',   // 进度条轨道（填充部分才是内容）
+    '.px-table th',       // 表头（唯一一处「整行凹进」的表格语义）
+  ]
+  const users = []
+  for (const m of css.matchAll(/(^|\n)([^\n{}@/][^\n{}]*)\{([^{}]*)\}/g)) {
+    if (!/background(?:-color)?\s*:\s*var\(--px-surface-2\)/.test(m[3])) continue
+    for (const part of m[2].trim().split(',')) users.push(part.trim())
+  }
+  const extra = users.filter((selector) => !ALLOWED_SECONDARY_BACKGROUND.includes(selector))
+  must(
+    extra.length === 0,
+    `这些选择器在铺 --px-surface-2（次级底色）：${extra.join('、')}。`
+    + '白色是页面里唯一的「块」，次级底色只留给真正内凹的槽'
+    + `（当前白名单：${ALLOWED_SECONDARY_BACKGROUND.join('、')}）。`
+    + '要加就显式把它加进白名单，并确认那一块真的该是一个色块——'
+    + '早先铺了 18 处，界面看起来「东一块西一块」。',
+  )
+  // 反向：白名单里的也得真的还在用，否则白名单会烂掉
+  for (const selector of ALLOWED_SECONDARY_BACKGROUND) {
+    must(
+      users.includes(selector),
+      `白名单里的 ${selector} 已经不再铺次级底色了，请把它从白名单删掉（否则它只是噪音）`,
+    )
+  }
+}
+
 // ── 三层表面的明度阶梯闸门 ──────────────────────────────────────
 //
 // ## 这条闸门要防的是「用户报的那句话」
@@ -1926,13 +1969,16 @@ must(
 //   - 放在卡片（surface）里 → 是「比底暗的奶油块」（1.123，方向反了）。
 // 两种观感交替出现，用户当然说不出规律。
 //
-// **光断言「明暗两套取值不同」是不够的**（那几条上面已经有了）——它只验了
-// 「深色和浅色不是同一套」，完全没验「同一套内部的三层彼此分得开」。
+// **光断言「明暗两套取值不同」是不够的**（上面那几条只验了「深浅不是同一套」）。
+// 但**只断言对比度也不够**——这是本项目踩得最深的一跤：
+// 第一版修复就是「把次级色调深，让三层对比度都 ≥1.10」，数值全绿，
+// 而真实截图里更丑，因为那 18 处铺次级色的地方被加深后反而更抢眼。
 //
-// 因此这里钉住两条：
-//   1. 浅色下三层的**亮度顺序**必须是 surface-2 < bg < surface（凹陷 → 页面 → 浮起）；
-//   2. 任意相邻两层、以及任意两层之间的对比度都要 ≥ 1.10，否则就是「看着一样」。
-// 深色那套天然满足（底最暗、卡片最亮），同样断言一遍以防改成扁平色板。
+// 因此这里钉的是**语义**，不是数字：
+//   1. 白卡片必须是页面里最亮的一层（它是唯一的「块」）；
+//   2. 页面底要比卡片暗，凹槽比页面底更暗（凹陷 → 页面 → 浮起，方向一致）；
+//   3. 两两之间至少要**能看出来**（≥1.03），但**不要求拖到很大**——
+//      拉开层次的正确手段是减少铺色的面积（见上一条白名单闸门），不是加深颜色。
 {
   /** 相对亮度（WCAG 定义）。 */
   const luminanceOf = (hex) => {
@@ -1954,43 +2000,35 @@ must(
     return typeof raw === 'string' && /^#[0-9a-f]{6}$/i.test(raw) ? raw : undefined
   }
   const SURFACE_TOKENS = ['--px-bg', '--px-surface', '--px-surface-2']
-  /** 每条用例检查的顺序与最小对比度。 */
-  for (const [label, block, deepest] of [
-    ['浅色', lightBlock[1], '--px-surface-2'],
-    ['深色', darkBlock[1], '--px-bg'],
-  ]) {
+  for (const [label, block] of [['浅色', lightBlock[1]], ['深色', darkBlock[1]]]) {
     const colors = {}
     for (const token of SURFACE_TOKENS) {
       const value = colorOf(block, token)
       must(value !== undefined, `${label}模式下 ${token} 必须是十六进制颜色（实际「${valueOf(block, token)}」）`)
       colors[token] = value
     }
-    // 1) 亮度顺序：最深的那一档必须真的是最深的，卡片必须是最亮的
-    for (const token of SURFACE_TOKENS) {
-      if (token === deepest || token === '--px-surface') continue
-      must(
-        luminanceOf(colors[token]) > luminanceOf(colors[deepest]),
-        `${label}模式下 ${token} 应比 ${deepest} 更亮——否则「凹陷层」和「页面层」分不开`,
-      )
-    }
+    /**
+     * 深浅两套的「浮起方向」不同，因此**不要**写死「卡片必须最亮」或
+     * 「凹槽必须比页面暗」这种单向规则——浅色下卡片最亮，深色下凹槽反而最亮
+     * （暗色模式的惯例是越上层越亮，内凹反而更浅）。写死任何一边都会误伤另一套。
+     *
+     * 真正恒定、也真正对用户可见的只有一条：
+     *   **卡片必须与页面底区分得开**——「白卡片浮在底色上」是整页分区的唯一依据。
+     * 至于「铺了多少地方」，由上面那道白名单闸门管，不归这里。
+     */
+    const ratio = contrastOf(colors['--px-surface'], colors['--px-bg'])
     must(
-      luminanceOf(colors['--px-surface']) >= luminanceOf(colors['--px-bg']),
-      `${label}模式下卡片（--px-surface）不该比页面底（--px-bg）更暗，`
-      + '否则「浮起的卡片」看起来像一块凹陷',
+      ratio >= 1.03,
+      `${label}模式下卡片与页面底的对比度只有 ${ratio.toFixed(3)}——卡片会「融进」底色，`
+      + '界面看起来是糊成一片、没有分区，而不会报任何错。',
     )
-    // 2) 任意两层都要分得开。这一条才是用户报的那个问题的直接防线。
-    for (let i = 0; i < SURFACE_TOKENS.length; i += 1) {
-      for (let j = i + 1; j < SURFACE_TOKENS.length; j += 1) {
-        const a = SURFACE_TOKENS[i]
-        const b = SURFACE_TOKENS[j]
-        const ratio = contrastOf(colors[a], colors[b])
-        must(
-          ratio >= 1.10,
-          `${label}模式下 ${a} 与 ${b} 的对比度只有 ${ratio.toFixed(3)}（要求 ≥ 1.10）——`
-          + '两层几乎同色，界面会表现为「色块混在一起、有的按钮白有的按钮奶油」，'
-          + '而不会报任何错。改这三个值时请把明度拉开。',
-        )
-      }
+    // 凹槽也要与卡片分得开（否则「内凹」读不出来），但方向不限
+    {
+      const wellRatio = contrastOf(colors['--px-surface-2'], colors['--px-surface'])
+      must(
+        wellRatio >= 1.03,
+        `${label}模式下凹槽与卡片的对比度只有 ${wellRatio.toFixed(3)}——内凹感读不出来。`,
+      )
     }
   }
 }

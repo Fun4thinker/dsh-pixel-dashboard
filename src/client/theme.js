@@ -42,26 +42,26 @@ const TOKENS = `
   --px-ink: #3f3129;
   --px-ink-2: #6b5a4c;
   --px-muted: #8a7969;
-  /* ── 浅色模式的三层表面必须**拉开明度**，否则整页看起来是「白块和奶油块混在一起」──
-     三层各有一个明确含义，相邻两层之间至少差一档（对比度 ≥ 1.11）：
+  /* ── 浅色：白卡片 + 淡暖底 + 极少数内凹槽 ─────────────────────────────
+     **这一页的观感规则只有一条：白色是唯一的「块」，米色只在「凹进去」的地方出现。**
 
-       深  --px-surface-2  凹陷 / 次级（表头、轨道、分段控件底、次级卡）
-                 ↓ 1.111
-           --px-bg         页面底（看板整页）
-                 ↓ 1.132
-       浅  --px-surface    浮起的卡片与按钮（面板、统计卡、主按钮）
+     早先这里错在**面积**，不在明度：--px-surface-2 被拿去铺了 18 处
+     （表头、余额说明条、单价行、价格表单、套餐块、时钟块、通知块……），
+     于是白色卡片里嵌着一块块米色，看起来「东一块西一块」。
+     第一版修复还把它调暗去「拉开层次」，等于把那些碎块**做得更显眼**，
+     在真实界面上更丑——数值全绿，观感更差。
 
-     早先的取值是 bg #fbf4e8 / surface-2 #f7efe2，两者只差 **1.044**——几乎同色。
-     后果不是「难看一点」，而是**层次语义崩了**：同一个 .px-btn 放在页面底上时
-     是「比底亮的白块」，放在卡片里（surface）时又成了「比底暗的奶油块」；
-     用户看到的就是「有些按钮白、有些按钮奶油」，说不出规律。
-     --px-surface-2 同时也被用作按钮 hover 与 badge 底，所以它必须稳定地
-     比 bg 深、比 surface 也深，不能夹在中间。
-     改这三个值时请保持这个顺序，tools/render-check.mjs 里有一条闸门盯着它。
-     注意本文件整段都是模板字符串：注释里**不能出现反引号**（踩过两次）。 */
-  --px-bg: #f7eee0;
-  --px-surface: #fffdf9;
-  --px-surface-2: #efe2cd;
+     现在的分工：
+       --px-surface   #ffffff   所有卡片、面板、按钮（页面里唯一的「块」）
+       --px-bg        #f6f2ea   页面底（卡片浮在它上面）
+       --px-surface-2 #ece6da   只用于**内凹**：进度条轨道、分段控件底、
+                                表头、输入框。四个地方，不再扩散。
+
+     改这三个值时请保持「白 = 块、米 = 凹」，而不是靠对比度数字自我安慰。
+     tools/render-check.mjs 里有一道闸门盯着「谁在铺 surface-2」的白名单。 */
+  --px-bg: #f6f2ea;
+  --px-surface: #ffffff;
+  --px-surface-2: #ece6da;
   --px-line: rgba(87, 68, 58, 0.10);
   --px-line-2: rgba(87, 68, 58, 0.18);
 
@@ -249,7 +249,12 @@ const DASHBOARD = `
     box-shadow var(--px-dur) var(--px-ease),
     transform var(--px-dur-fast) var(--px-ease);
 }
-.px-btn:hover:not(:disabled) { background: var(--px-surface-2); box-shadow: var(--px-elev-2); transform: translateY(-1px); }
+.px-btn:hover:not(:disabled) {
+  /* 按钮 hover：极淡着色，而不是换成米色块——否则一悬停就「变脸」。 */
+  background: color-mix(in srgb, var(--px-ink) 6%, transparent);
+  box-shadow: var(--px-elev-2);
+  transform: translateY(-1px);
+}
 .px-btn:active:not(:disabled) { transform: translateY(0) scale(0.98); box-shadow: var(--px-elev-1); }
 .px-btn:disabled { opacity: 0.55; cursor: default; }
 /* 焦点环：全局 :focus-visible 规则随 SKIN 一起删了，看板自己的控件要自己给一条，
@@ -353,7 +358,8 @@ const DASHBOARD = `
   font-size: 11px; color: var(--px-muted);
   padding: 2px 8px;
   border-radius: var(--px-r-pill);
-  background: var(--px-surface-2);
+  /* 小提示：透明 + 描边。铺米色会在标题行末尾多出一枚色块。 */
+  background: transparent;
   border: 1px solid var(--px-line);
 }
 .px-panel-toggle:hover .px-panel-toggle-hint { color: var(--px-ink-2); }
@@ -637,7 +643,7 @@ const DASHBOARD = `
   font-size: 11px; color: var(--px-muted);
   padding: 1px 7px;
   border-radius: var(--px-r-pill);
-  background: var(--px-surface-2);
+  background: transparent;
   border: 1px solid var(--px-line);
   white-space: nowrap;
 }
@@ -728,9 +734,13 @@ const DASHBOARD = `
   row-gap: 6px;
   padding: 7px 10px;
   border-radius: var(--px-r-sm);
-  background: var(--px-surface-2);
+  /* 单价行是**卡片里的列表行**，不是独立的块：不铺底色，只靠行间距分隔。
+     早先铺 surface-2，一张卡片里会因此出现一排米色横条——正是「东一块西一块」。 */
+  background: transparent;
   font-size: 11.5px; color: var(--px-muted);
 }
+/* 隔行轻微着色用来跟读；它必须极淡，否则又变成「色块」 */
+.px-rate:nth-child(even) { background: color-mix(in srgb, var(--px-ink) 3%, transparent); }
 /* 第 2 列：模型名 + 归一后的键 + 来源数。允许收缩，不把右列挤走 */
 .px-rate-who {
   grid-column: 2; grid-row: 1;
@@ -770,7 +780,10 @@ const DASHBOARD = `
 .px-price-form {
   display: grid; gap: 8px;
   margin-top: 10px; padding: 10px;
-  border-radius: var(--px-r-sm); background: var(--px-surface-2);
+  border-radius: var(--px-r-sm);
+  /* 内嵌的编辑区：描边 + 极淡底，读作「卡片里的一块编辑区」而不是第二个色块。 */
+  background: color-mix(in srgb, var(--px-ink) 4%, transparent);
+  border: 1px solid var(--px-line);
 }
 /* 通用文本输入框：与上面通知阈值那几个输入框**同一套外观**。
    本来想直接复用 .px-notify-input input，但那个选择器绑在通知面板的类名上，
@@ -967,7 +980,9 @@ const DASHBOARD = `
   flex-wrap: wrap;
   padding: 8px 12px;
   border-radius: var(--px-r-md);
-  background: var(--px-surface-2);
+  /* 卡片里的一行「倒计时」，不该是一块米色：改成极淡的着色底，
+     只为把这一行与上面的标题分开，仍读作「同一张卡片里的内容」。 */
+  background: color-mix(in srgb, var(--px-ink) 4%, transparent);
 }
 .px-period-clock-label { font-size: 11.5px; color: var(--px-muted); }
 .px-period-clock-value {
@@ -1052,18 +1067,29 @@ const DASHBOARD = `
   margin: 0 0 10px;
   padding: 7px 11px;
   border-radius: var(--px-r-sm);
-  background: var(--px-surface-2);
+  /* 一行状态说明，不是一块卡片：描边 + 透明底，放在白卡片里不抢眼。 */
+  background: transparent;
+  border: 1px solid var(--px-line);
   font-size: 11.5px; line-height: 1.6; color: var(--px-muted);
 }
-.px-balance-state.px-warn { background: color-mix(in srgb, var(--px-yellow) 22%, var(--px-surface-2)); color: var(--px-ink-2); }
-.px-balance-state.px-error { background: color-mix(in srgb, var(--px-red) 18%, var(--px-surface-2)); color: var(--px-ink-2); }
+/* 两个异常态才上色：正常态保持安静，异常才需要被看见。 */
+.px-balance-state.px-warn {
+  background: color-mix(in srgb, var(--px-yellow) 20%, transparent);
+  border-color: color-mix(in srgb, var(--px-yellow) 40%, var(--px-line));
+  color: var(--px-ink-2);
+}
+.px-balance-state.px-error {
+  background: color-mix(in srgb, var(--px-red) 16%, transparent);
+  border-color: color-mix(in srgb, var(--px-red) 38%, var(--px-line));
+  color: var(--px-ink-2);
+}
 .px-balance-privacy {
   margin: 12px 0 0;
   padding-top: 10px;
   border-top: 1px dashed var(--px-line-2);
   font-size: 11px; line-height: 1.7; color: var(--px-muted);
 }
-.px-balance-state.px-off { background: var(--px-surface-2); color: var(--px-muted); }
+.px-balance-state.px-off { background: transparent; color: var(--px-muted); }
 
 /* 订阅套餐额度：一家一块，每块里按窗口（5 小时 / 每周 / 每月）逐条画进度 */
 .px-plan-list { display: grid; gap: 16px; }
@@ -1077,7 +1103,9 @@ const DASHBOARD = `
   padding: 9px 11px 10px;
   border: 1px solid var(--px-line);
   border-radius: var(--px-r-md);
-  background: var(--px-surface-2);
+  /* 一家一块：靠**描边**分块，不铺底色。卡片里再套一片米色块，
+     是最典型的「东一块西一块」来源——白卡片里浮着一排米色方块。 */
+  background: transparent;
 }
 /* 「当前监看」那一家：左侧一道粉色标记 + 略深底色。
    这道标记是切换器的**可见结果**——点完必须一眼看出点中了谁，
@@ -1123,7 +1151,8 @@ const DASHBOARD = `
   padding: 8px 11px;
   border: 1px solid var(--px-line-2);
   border-radius: var(--px-r-sm);
-  background: var(--px-surface-2);
+  /* 折叠的「怎么配」说明：描边即可，不铺底色（它已在一个有描边的块里）。 */
+  background: transparent;
 }
 .px-plan-setup > summary { font-size: 11.5px; }
 .px-plan-steps {
@@ -1198,7 +1227,7 @@ const DASHBOARD = `
   padding: 8px 11px;
   border: 1px solid var(--px-line-2);
   border-radius: var(--px-r-sm);
-  background: var(--px-surface-2);
+  background: transparent;
 }
 .px-cred-vendor-name {
   display: block; margin-bottom: 5px;
@@ -1300,7 +1329,7 @@ const DASHBOARD = `
   border-radius: var(--px-r-pill);
   cursor: pointer;
 }
-.px-plan-chip:hover { background: var(--px-surface-2); }
+.px-plan-chip:hover { background: color-mix(in srgb, var(--px-ink) 7%, transparent); }
 .px-plan-chip.active {
   color: #fff; border-color: transparent;
   background: linear-gradient(145deg, var(--px-pink), var(--px-pink-deep));
@@ -1344,7 +1373,7 @@ const DASHBOARD = `
   margin-bottom: 12px;
   border: 1px solid var(--px-line);
   border-radius: var(--px-r-md);
-  background: var(--px-surface-2);
+  background: transparent;
 }
 .px-notify-permission-text { margin: 0; flex: 1 1 240px; }
 
@@ -1375,7 +1404,7 @@ const DASHBOARD = `
   margin-bottom: 12px;
   border: 1px solid var(--px-line);
   border-radius: var(--px-r-md);
-  background: var(--px-surface-2);
+  background: transparent;
 }
 /* 两项阈值并排：各自正文只有「一个标签 + 一个数字框」，各占整行会白吃两倍高度。
    两栏等宽（1fr 1fr）而不是 auto-fit：它们的信息量相当，等宽读起来才整齐。
@@ -1458,7 +1487,7 @@ const DASHBOARD = `
   cursor: pointer;
   transition: background-color var(--px-dur-fast) var(--px-ease);
 }
-.px-toast-clickable:hover { background: var(--px-surface-2); }
+.px-toast-clickable:hover { background: color-mix(in srgb, var(--px-ink) 7%, transparent); }
 /* 可点时补一句动作提示，让「能点」这件事自己说出来 */
 .px-toast-clickable .px-toast-body::after {
   content: ' · 点击前往';
