@@ -297,13 +297,23 @@ const registrations = []
  * 官方将来再加胶囊时这里要跟着抬——这正是把它写成具名常量、并由闸门盯着的原因。
  */
 const OFFICIAL_DOCK_MAX_ORDER = 1
+/** 被登记过的可选主题 id（必须为空，见下面 themeStub 的说明）。 */
 const themes = []
+/** 被调用过的 overrideTokens 层（必须为空，同上）。 */
 const paletteLayers = []
 /**
- * 主题服务替身：必须复刻真实契约，否则这一关会放过正是踩过的两类坑——
+ * 主题服务替身**保留**，但现在的用途反过来了：它是一枚**诱捕器**。
+ *
+ * 皮肤功能已按需求移除（不再注册可选主题、也不再覆盖产品令牌），因此这两个数组
+ * 在下面被断言**必须为空**。刻意不删掉替身：
+ *   - 删掉它，`ctx.get('theme')` 就返回 undefined，代码里残留的 `theme.register(...)`
+ *     会被 `if (theme !== undefined)` 之类的判空安静跳过——闸门全绿，回归却进去了；
+ *   - 留着它，任何一次「又把主题注册回来 / 又去 overrideTokens」都会在这里被抓到。
+ *
+ * 替身仍然复刻真实契约（那就意味着：一旦有人真的调了它，行为与真服务一致，
+ * 不会把一次真实的调用变成一次无声的 no-op）：
  *   1) overrideTokens 只收 `{ light, dark }` 成对取值，裸字符串会被服务抛错；
  *   2) overrideTokens 会同步 emit theme/change，监听器里再调用它就无限递归。
- * 之前的替身两者都不管，于是“改了改又失效”能一路走到浏览器。
  */
 const themeListeners = []
 let themeEmits = 0
@@ -395,20 +405,23 @@ const sessionOpens = []
 clientExports.apply(ctx)
 
 must(registrations.length === 3, `apply 应注册 3 个槽位（主区 + 侧栏 + 费用条），实际 ${registrations.length}`)
-must(mountedStyles.length === 3, `应挂 3 张样式表，实际 ${mountedStyles.length}`)
-must(themes.length === 2, `应注册 2 套可选主题，实际 ${themes.length}`)
-// 关键回归点：配色必须默认生效，否则用户看到的就是没换色的黑白界面
-must(paletteLayers.length >= 1, '默认必须叠一层配色覆盖，否则马卡龙配色不会生效')
-must(
-  paletteLayers.at(-1).count > 10,
-  `配色覆盖层的令牌太少（${paletteLayers.at(-1).count} 个），改不动界面`,
-)
-// 明暗两套必须都在这一层里：主题服务按当前方案挑一值，切换时才不用插件插手
-const paletteSample = paletteLayers.at(-1).tokens['--dsw-alias-bg-base']
-must(
-  paletteSample.light !== paletteSample.dark,
-  '同一令牌的明暗取值相同，说明只有一套配色被下发，切到另一方案会不可读',
-)
+// 两张：tokens（--px-* 变量，深浅两套）+ dashboard（全部 .px-* 实样式）。
+// 早先是三张，第三张 skin 是**全局元素选择器**（body 网格底纹、全局 button/input
+// 圆角与 transition、滚动条、选中色），等于替用户重绘整个产品界面。皮肤已按需求
+// 移除，因此这里从 3 改成 2——改回 3 就说明有人把那张表加回来了。
+must(mountedStyles.length === 2,
+  `应挂 2 张样式表（tokens + dashboard），实际 ${mountedStyles.length}`)
+// 反向断言：这两样**都不许再出现**。皮肤功能（可选主题 + 令牌覆盖）已按需求移除——
+// 它会改掉**产品自己**的配色与背景，而用户打开的不止这个看板，还有整个窗口、
+// 侧栏与会话区。上面那个 themeStub 刻意留着当诱捕器：任何一次“把主题注册回来”
+// 或“再去 overrideTokens”都会落进 themes / paletteLayers 而被这两条抓住。
+//
+// 删掉它们之后，看板**仍然有配色**，靠的是另一条完全独立的路径：
+// theme.js 的 TOKENS（--px-* 变量）+ DASHBOARD（全部 .px-* 选择器），
+// 深浅色由 body[data-ds-dark-theme] 触发——下面「深色模式闸门」那一段会验。
+must(themes.length === 0, '不得再注册可选主题——皮肤功能已按需求移除')
+must(paletteLayers.length === 0,
+  '不得再调用 overrideTokens——那会改掉产品自己的背景色，而不是只给看板配色')
 must(
   registrations.some((item) => item.slot === 'main' && item.key === 'pixel-usage'),
   '主区面板没有注册到 pixel-usage',
@@ -1078,6 +1091,48 @@ must(
   '金额与 token 都缺时费用条应不渲染',
 )
 
+// ── 团队模式：这一枚**取代**「本次会话」那一枚 ─────────────────────
+// 用户的要求是「开启团队后当前会话计费改成团队总」。因此两件事同时要成立：
+//   - 显示的是**团队合计**（¥12.50），而不是本次会话那一份（¥3.00）；
+//   - 本次会话的金额不能丢，它进了悬停说明的第一行。
+{
+  const teamOnly = renderToStaticMarkup(React.createElement(SessionCostView, {
+    cost: { standard: 3, peak: 2, idle: 1 },
+    tokens: 100,
+    team: {
+      cost: 12.5,
+      tokens: 3_000_000,
+      memberCount: 2,
+      title: 'dsh-pixel-dashboard',
+      lines: [
+        { id: 'lead-1', name: 'lead', role: 'lead', detail: 'lead（lead） · ¥10.00' },
+        { id: 'mate-1', name: 'researcher', role: '成员', detail: 'researcher（成员） · ¥2.50' },
+      ],
+    },
+  }))
+  must(teamOnly.includes('团队合计'), `团队模式下标签必须是「团队合计」：${teamOnly.slice(0, 500)}`)
+  must(teamOnly.includes('¥12.50'), `团队模式下显示的必须是团队合计 ¥12.50：${teamOnly}`)
+  must(!teamOnly.includes('本次会话'), '团队模式下不该再并排一枚「本次会话」（dock 是横向 flex，宽度要省）')
+  must(teamOnly.includes('团队'), '角标应点明这是团队口径')
+  must(teamOnly.includes('researcher'), '悬停说明必须带上成员明细（title 里也要有）')
+  // 本次会话金额不丢：它进了 title 的第一行
+  must(teamOnly.includes('高峰') || teamOnly.includes('空闲'),
+    `本次会话的分档说明应保留在 title 里，不因切换成团队口径而丢失：${teamOnly}`)
+
+  // 团队模式下 token 那一枚也换成团队总量
+  must(teamOnly.includes('3.00M'), `应显示团队 token 总量（3.00M）：${teamOnly}`)
+}
+// 没有团队（单人 / 旧宿主）时，行为必须与改动前逐字节一致
+{
+  const noTeam = renderToStaticMarkup(React.createElement(SessionCostView, {
+    cost: { standard: 3, peak: 2, idle: 1 },
+    tokens: 100,
+    team: undefined,
+  }))
+  must(noTeam.includes('本次会话'), '单会话口径必须保持「本次会话」这一枚')
+  must(!noTeam.includes('团队合计'), '没有团队时不得出现团队口径')
+}
+
 // 没有会话时必须不渲染
 must(renderDock({ sessionId: undefined, useProjection: () => undefined }) === '', '没有会话时费用条应不渲染')
 
@@ -1688,6 +1743,88 @@ must(
 )
 must(css.includes('tabular-nums'), '数字应保留 tabular-nums，保证并排数字不跳动')
 
+// ── 皮肤移除闸门：插件样式里不得再出现**全局元素选择器** ─────────────
+//
+// 这是「皮肤已移除」在 CSS 侧的结构性判据，比上面那两条反向数组断言更根本：
+// 只要有人把 body 底纹、全局 button/input 圆角与 transition、滚动条改色或
+// ::selection 写回来——无论他把那张表叫 SKIN 还是别的名字——这里都会失败。
+//
+// 允许的只有四类，其余一律视为外溢到产品界面：
+//   1) :root                       —— 定义 --px-* 变量用
+//   2) body[data-ds-dark-theme]    —— 深色**取值**（读属性可以，写 --dsw-* 不行）
+//   3) 含 .px- 的类选择器           —— 看板自己的界面
+//   4) @keyframes / @media 及其内部的关键帧选择器（from / to / 百分比）
+//
+// 换句话说：这里**不许**出现裸的 body / button / input / a / ::selection /
+// ::-webkit-scrollbar。它们看着只是「一点点观感」，实际改的是用户整个产品界面，
+// 而且改坏时不会抛错——只是别人的界面忽然变了样。
+{
+  const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, '')
+  /** 一条选择器串是否可以接受（逗号分隔的每一支都要各自成立）。 */
+  const selectorAllowed = (selector) => {
+    if (selector.startsWith('@')) return true
+    // keyframes 里的关键帧：from / to / 0% / 50%, 100%
+    if (/^(from|to|[\d.%\s,]+)$/.test(selector)) return true
+    return selector.split(',').every((one) => {
+      const part = one.trim()
+      if (part === '') return false
+      return part === ':root'
+        || part === 'body[data-ds-dark-theme]'
+        || part.includes('.px-')
+    })
+  }
+  const selectors = [...cssNoComments.matchAll(/([^{}]+)\{/g)]
+    .map((match) => match[1].trim())
+    .filter((selector) => !/^(?:@media|@keyframes)\b/.test(selector))
+  const leaked = [...new Set(selectors.filter((selector) => !selectorAllowed(selector)))]
+  must(
+    leaked.length === 0,
+    `插件样式里出现了全局元素选择器：${JSON.stringify(leaked.slice(0, 6))}。`
+    + '皮肤功能已按需求移除——产品的背景、控件圆角/过渡、滚动条与选中色都不该由插件改。'
+    + '看板自己的控件请写 .px-* 选择器（缺圆角/过渡就在那里补，用 --px-r-sm / --px-dur）',
+  )
+  // 反向再钉一次那条最常见的「重造皮肤」写法：body 上铺底纹。
+  // 只查选择器块里的 background，不查整个字符串——注释里解释这件事是允许的。
+  must(
+    !/(?:^|[},])\s*body\s*\{[^}]*background(?:-image)?\s*:/.test(cssNoComments),
+    '不得再给 body 铺底纹——那正是被移除的皮肤（看板整页的底色由 .px-root 自己给）',
+  )
+}
+
+// ── 看板控件必须自己兜住圆角与过渡（删掉 SKIN 的直接后果）──────────────
+//
+// 删掉皮肤最容易被忽略的连带伤害：`.px-btn` / `.px-input` / `.px-seg-btn` 这几颗
+// 控件的圆角与 transition **原本由那条全局规则统一给**。全局规则一没，它们不会报错，
+// 只是变成直角、hover 从缓动变成硬切——而底下的 `.px-seg-thumb` 仍是圆角，
+// 一枚圆角滑块在直角按钮上滑动，看起来就像错位。
+//
+// 判据写死「必须用 --px-* 令牌 / 自带宽度的过渡属性」，而不是「值恰好是多少」：
+// 令牌取值属于设计系统，改它不该让闸门红；但**缺这条声明**必须红。
+for (const [selector, tokenName] of [
+  ['.px-btn', '--px-r-sm'],
+  ['.px-input', '--px-r-sm'],
+  ['.px-seg-btn', 'border-radius: 6px'],
+]) {
+  const rule = new RegExp(`${selector.replace(/\./g, '\\.')}\\s*\\{([^}]*)\\}`).exec(css)
+  must(rule !== null, `缺少 ${selector} 规则`)
+  must(
+    /border-radius\s*:/.test(rule[1]),
+    `${selector} 必须自己写 border-radius——它早先由被移除的全局 button/input 规则提供，`
+    + '不补就变成直角',
+  )
+  if (tokenName.startsWith('--')) {
+    must(
+      rule[1].includes(`var(${tokenName})`),
+      `${selector} 的圆角应走 ${tokenName}（看板自己的令牌），而不是硬编码一个数`,
+    )
+  }
+  must(
+    /transition\s*:/.test(rule[1]),
+    `${selector} 必须自己写 transition——全局那条随皮肤删掉后，`
+    + '交互就变成硬切（状态变化看起来像卡了一下）',
+  )
+}
+
 // ── 倒计时文字的样式闸门 ────────────────────────────────────────
 // 一行文字、两种颜色、推到行尾。这几条写错了不会有任何报错，
 // 只是文字挤在图标上、或者两个时期同色、或者不靠右。
@@ -1829,10 +1966,107 @@ for (const level of ['ok', 'warn', 'error']) {
   must(css.includes(`.px-toast-${level}`), `提示条缺少 ${level} 等级样式`)
 }
 
+// ── 智能体团队：费用条的团队口径 ─────────────────────────────────
+//
+// 用户的要求是「开启团队后，当前会话计费改成**团队总**计费，悬停按成员分别显示」。
+// 这个功能的两个失败模式都不会报错：
+//   1. 该显示团队时仍显示单会话 → 用户以为整队只花了这么点；
+//   2. 悬停里没有成员列表 → 「按成员分别显示」这条需求等于没做。
+// 而 `title` 只是属性、静态渲染里看不见，所以这里**直接断言字符串**。
+{
+  const { findTeamOf, memberNameOf, teamDetailText, teamSummaryOf } =
+    await import(pathToFileURL(join(root, 'lib', 'client', 'team.js')).href)
+  const { teamPillOf } = await import(pathToFileURL(join(root, 'lib', 'client', 'SessionCost.js')).href)
+  const { formatCny, formatTokens } = await import(pathToFileURL(join(root, 'lib', 'client', 'format.js')).href)
+  const format = { formatCny, formatTokens }
+
+  /** 一份两成员的团队行（形状与宿主 `teams[]` 一致）。 */
+  const teamRow = {
+    id: 'lead-1',
+    title: 'dsh-pixel-dashboard',
+    leadId: 'lead-1',
+    memberCount: 2,
+    totals: { local: 3_000_000 },
+    cost: { standard: 12.5, peak: 10, idle: 2.5 },
+    members: [
+      { id: 'lead-1', role: 'lead', name: 'lead', cost: { standard: 10 }, tokens: 2_000_000, depth: 0 },
+      { id: 'mate-1', role: 'teammate', name: 'researcher', cost: { standard: 2.5 }, tokens: 1_000_000, depth: 1 },
+    ],
+  }
+  const teamData = { teams: [teamRow] }
+
+  // 1) 归属：lead 与 teammate 各自的会话界面都要认出同一个团队
+  must(findTeamOf(teamData, 'lead-1') === teamRow, 'lead 会话应认出自己的团队')
+  must(findTeamOf(teamData, 'mate-1') === teamRow, 'teammate 会话也应认出同一个团队')
+  must(findTeamOf(teamData, 'stranger') === undefined, '不属于任何团队的会话不得被归进团队')
+
+  // 2) 单人团队不算团队：那只是普通会话，换口径只会让人困惑
+  must(
+    findTeamOf({ teams: [{ ...teamRow, members: [teamRow.members[0]], memberCount: 1 }] }, 'lead-1') === undefined,
+    '单人团队必须按普通会话处理（否则每一行会话都会变成「团队合计」）',
+  )
+  // 3) 旧宿主：没有 teams 字段时完全退回单会话口径
+  must(findTeamOf({}, 'lead-1') === undefined, '旧宿主（无 teams）必须退回单会话口径')
+
+  const summary = teamSummaryOf(teamRow, format)
+  must(summary !== undefined, '两成员团队应能折成一份汇总')
+  must(summary.memberCount === 2)
+  // 金额取宿主算好的那份，**不在客户端重算**（否则会出现第二种取整方式）
+  must(summary.cost === 12.5, `团队合计应直接取宿主的值，实际 ${summary.cost}`)
+  must(summary.tokens === 3_000_000)
+
+  // 4) 悬停内容必须真的按成员分列
+  const detail = teamDetailText(summary)
+  must(detail.includes('团队合计'), `悬停说明里应写明这是团队合计：${detail}`)
+  must(detail.includes('2 位成员'), `悬停说明应写出人数：${detail}`)
+  must(detail.includes('researcher'), `悬停说明必须按成员分列，缺少成员名：${detail}`)
+  must(detail.includes('lead'), `lead 自己也要列出来，否则「其他成员」无从对照：${detail}`)
+  must(detail.includes('¥2.50') && detail.includes('¥10.00'),
+    `每位成员的金额都要出现（¥10.00 与 ¥2.50）：${detail}`)
+  must(detail.split('\n').length >= 3, `成员应逐行列出（标题行 + 每人一行）：${detail}`)
+
+  // 5) 徽标文案：标签是「团队合计」、角标是「团队」——不标的话两个 ¥ 并排没人分得清
+  const pill = teamPillOf(summary)
+  must(pill !== undefined, '团队口径应产出徽标文案')
+  must(pill.tag === '团队', `角标必须写明这是团队口径，实际「${pill.tag}」`)
+  must(pill.value === '¥12.50', `徽标数值应是团队合计，实际「${pill.value}」`)
+  must(pill.title.includes('researcher'), '悬停说明要一起进 title（静态渲染里读不到 tooltip）')
+
+  // 6) 缺成员 / 缺金额时不得渲染成 ¥0——「不知道」与「真的是 0」是两件事
+  must(teamSummaryOf({ members: [] }, format) === undefined, '空成员列表不得产出团队口径')
+  must(
+    teamSummaryOf({ ...teamRow, cost: undefined }, format) === undefined,
+    '团队金额不可读时不得当成 ¥0 显示',
+  )
+  // 成员名三层回落：name → title → id 片段，绝不留空
+  must(memberNameOf({ name: 'writer' }) === 'writer')
+  must(memberNameOf({ title: '某个会话' }) === '某个会话')
+  must(memberNameOf({ id: 'abcdef1234567890' }).startsWith('abcdef12'), '最后应回落到 id 片段')
+  must(memberNameOf(undefined) === '(未知成员)', '什么线索都没有时也不能渲染空白')
+}
+// 会话清单里的团队徽标：`role` 只有新宿主才给，但两者都必须可见——
+// 否则同一件事被拆成三行独立会话，用户看不出它们是一起的。
+{
+  const { SessionTable } = await import(pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
+  const tablePayload = buildPayload()
+  const teamHtml = renderToStaticMarkup(React.createElement(SessionTable, {
+    sessions: [
+      { ...tablePayload.sessions[0], id: 'lead-1', role: 'lead', teamId: 'lead-1', title: '团队 lead' },
+      {
+        ...tablePayload.sessions[0], id: 'mate-1', role: 'teammate', teamId: 'lead-1',
+        title: '团队成员', memberName: 'researcher',
+      },
+    ],
+    timezone: tablePayload.timezone,
+  }))
+  must(teamHtml.includes('团队'), `lead 会话应标出「团队」，实际：${teamHtml.slice(0, 400)}`)
+  must(teamHtml.includes('researcher'), 'teammate 会话应标出它的团队名')
+  must(css.includes('.px-badge.team'), '团队标记必须有样式，否则它只是普通文字')
+}
+
 // ── 第 2 关：用真实形状数据把整页渲染出来 ────────────────────────
 const { View } = await import(pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
 must(typeof View === 'function', 'dashboard.js 没有导出 View')
-
 const payload = buildPayload()
 
 // ── 多厂商费用：GLM 不分时只列一列，估算价要标注 ─────────────────
@@ -3408,7 +3642,12 @@ must(emptyHtml.includes('余额读取失败'), '余额读取失败时应有可�
   must(legacyHtml.includes('今日 '), '旧宿主（没有 overview.today）也必须渲染出「今日」')
 }
 
-console.log(`渲染闸门通过：${registrations.length} 个槽位、${mountedStyles.length} 张样式表、${themes.length} 套主题`)
+// 收尾日志：措辞跟着皮肤移除一起改。`themes` 现在是**反向指标**——它必须为 0，
+// 打印出来是为了让「0」这个数字在每次运行的输出里都可见（而不是只在失败时才出现）。
+console.log(
+  `渲染闸门通过：${registrations.length} 个槽位、${mountedStyles.length} 张样式表`
+  + `（tokens + dashboard）、可选主题 ${themes.length} 套 / 令牌覆盖 ${paletteLayers.length} 层（均应为 0）`,
+)
 console.log(`整页 HTML ${html.length} 字节 · 容器骨架 ${shellHtml.length} 字节 · 侧栏图标 ${iconHtml.length} 字节`)
 console.log(`数据：累计 ${payload.overview.totals.local} token、费用 ￥${payload.cost.standard}`)
 

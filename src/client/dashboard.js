@@ -2299,6 +2299,18 @@ export function SessionTable(props) {
             h('td', { className: 'px-session-cell' },
               h('span', { className: 'px-session-title', title: `${title}\n${session.id}` }, title),
               session.live ? h('span', { className: 'px-badge ok' }, '进行中') : null,
+              // 团队标记：`role` 只有新宿主才给。lead 标「团队」，teammate 标它的
+              // 团队名（拿不到就标「成员」）——两者都必须可见，否则同一件事被拆成
+              // 三行独立会话，用户看不出它们是一起的。
+              session.role === 'lead' && session.teamId !== session.id
+                ? h('span', { className: 'px-badge', title: '这是一个智能体团队的 Lead 会话' }, '团队')
+                : null,
+              session.role === 'teammate'
+                ? h('span', {
+                  className: 'px-badge team',
+                  title: `${typeof session.memberLabel === 'string' ? `${session.memberLabel}\n` : ''}所属团队 ${session.teamId}`,
+                }, typeof session.memberName === 'string' && session.memberName !== '' ? session.memberName : '成员')
+                : null,
               showWorkspace
                 ? h('span', { className: 'px-session-workspace', title: session.cwd ?? '' }, workspace)
                 : null,

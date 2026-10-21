@@ -37,6 +37,10 @@ const CAPABILITIES = [
   'sessionCost',
   'calendarByDay',
   'tieredRates',
+  // 智能体团队：响应里多了 `teams[]`，`sessions[]` 上多了 `teamId` / `role`。
+  // 缺这一项说明宿主是旧版本 —— 那时费用条只显示单会话金额（团队口径不可用），
+  // 看板照常，不整块降级。
+  'agentTeam',
 ]
 
 /** 首次扫描长会话可能较慢，给足超时余量。 */

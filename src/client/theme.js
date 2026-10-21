@@ -1,77 +1,30 @@
 /**
- * 视觉系统：保留博客的像素基因（奶油底、马卡龙色、墨色文字），
- * 但把做工升级到现代水准——细腻圆角、柔和分层、克制的描边、
- * 150-320ms 缓动与微交互，取代 3px 硬描边加硬投影的粗糙做法。
+ * 视觉系统：只负责插件自己的两块界面——用量看板整页，以及输入框下方
+ * 费用条 / 页面内提示条。全部用插件自己的 --px-* 令牌与 .px-* 类名。
  *
- * 颜色分两层下发：全局主题令牌（--dsw-alias-*）管产品区域配色，
- * 本文件的 --px-* 变量与样式管质感（层次、圆角、动效）与看板局部。
+ * **不碰产品配色。** 早先这里带两套 `--dsw-alias-*` 主题（奶油·昼 / 暮色·夜）、
+ * 一层令牌覆盖和一张全局皮肤样式表，等于替用户改掉整个产品界面的底色、文字色、
+ * 按钮圆角、滚动条与选中色。皮肤已按需求移除：产品原版的深浅色与背景完全交还
+ * DSH，插件只在上面那两块自己的界面上配色。
+ *
+ * 深浅色仍然跟着产品走：产品把 data-ds-dark-theme 打在 body 上，TOKENS 里
+ * **读**这个属性、给出深色的一套 --px-* 取值。读产品属性是允许的，**写**产品的
+ * --dsw-* 令牌不是（那会连产品窗口与侧栏的背景一起改掉）。
  * @module dsh-pixel-dashboard/client/theme
  */
 
-/** 明暗两套主题，直接映射到 DSH 的语义令牌。 */
-export const PIXEL_THEMES = {
-  day: {
-    id: 'pixel-day',
-    label: '奶油·昼',
-    colorScheme: 'light',
-    tokens: {
-      '--dsw-alias-bg-base': '#fbf4e8',
-      '--dsw-alias-bg-layer-1': '#fffdf9',
-      '--dsw-alias-bg-layer-2': '#f7efe2',
-      '--dsw-alias-bg-overlay': '#fffdf9',
-      '--dsw-alias-border-l1': 'rgba(87, 68, 58, 0.10)',
-      '--dsw-alias-border-l2': 'rgba(87, 68, 58, 0.18)',
-      '--dsw-alias-brand-primary': '#e8749f',
-      '--dsw-alias-label-primary': '#3f3129',
-      '--dsw-alias-label-secondary': '#8a7969',
-      '--dsw-alias-state-error-primary': '#d9584c',
-      '--dsw-alias-state-success-primary': '#5f9e46',
-      '--dsw-alias-state-warn-primary': '#c98a1c',
-      '--dsw-specific-sidebar-fill': '#f6ecdd',
-    },
-  },
-  night: {
-    id: 'pixel-night',
-    label: '暮色·夜',
-    colorScheme: 'dark',
-    tokens: {
-      '--dsw-alias-bg-base': '#1c2030',
-      '--dsw-alias-bg-layer-1': '#252a3d',
-      '--dsw-alias-bg-layer-2': '#2e3448',
-      '--dsw-alias-bg-overlay': '#2a3044',
-      '--dsw-alias-border-l1': 'rgba(232, 234, 245, 0.10)',
-      '--dsw-alias-border-l2': 'rgba(232, 234, 245, 0.18)',
-      '--dsw-alias-brand-primary': '#c98aa4',
-      '--dsw-alias-label-primary': '#e9ebf5',
-      '--dsw-alias-label-secondary': '#9aa3bd',
-      '--dsw-alias-state-error-primary': '#ff9a91',
-      '--dsw-alias-state-success-primary': '#9ed986',
-      '--dsw-alias-state-warn-primary': '#f2c96b',
-      '--dsw-specific-sidebar-fill': '#181c2a',
-    },
-  },
-}
-
-/**
- * 令牌覆盖层：`overrideTokens` 要求每个令牌都给出 `{ light, dark }` 一对，
- * 它按当前生效方案挑其中一值。深浅两套本就在 PIXEL_THEMES 里齐备，
- * 这里合并成一层——于是「明暗切换」由主题服务自己完成，插件无需监听
- * theme/change 重下（那样会在同一次同步 emit 里递归，见 entry.js）。
+/*
+ * 这里**不该再有** PIXEL_THEMES / PALETTE_OVERRIDES 一类东西。
+ *
+ * 它们曾把两套 --dsw-alias-* 令牌注册成可选主题（设置 → 外观里的
+ * 奶油·昼 / 暮色·夜），并默认叠一层 overrideTokens 覆盖。两者都会改动
+ * **产品自己**的配色：用户打开的不止是这个看板，还有整个窗口、侧栏与会话区。
+ * 皮肤功能已按需求移除，于是那两个导出连同 entry.js 里的注册与覆盖一起删掉了。
+ *
+ * 渲染闸门对这件事是**反向断言**：themes 与 paletteLayers 必须为 0。
+ * 看板自己的配色不靠它们，靠 TOKENS 的 --px-* 变量 + DASHBOARD 里的 .px-*
+ * 选择器；深色跟随产品靠读 body 上的 data-ds-dark-theme。
  */
-export const PALETTE_OVERRIDES = (() => {
-  const names = new Set([
-    ...Object.keys(PIXEL_THEMES.day.tokens),
-    ...Object.keys(PIXEL_THEMES.night.tokens),
-  ])
-  const layer = {}
-  for (const name of names) {
-    const light = PIXEL_THEMES.day.tokens[name] ?? PIXEL_THEMES.night.tokens[name]
-    const dark = PIXEL_THEMES.night.tokens[name] ?? PIXEL_THEMES.day.tokens[name]
-    if (light === undefined || dark === undefined) continue
-    layer[name] = { light, dark }
-  }
-  return layer
-})()
 
 /**
  * 调色板与质感变量：深浅两套并存，靠 `body[data-ds-dark-theme]` 切换。
@@ -175,80 +128,33 @@ body[data-ds-dark-theme] {
 `
 
 /**
- * 产品界面换肤：只贴近材质与节奏，不动任何布局尺寸，
- * 因此不会打乱产品排版，升级后也不会错版。
- */
-const SKIN = `
-body {
-  -webkit-font-smoothing: antialiased;
-  font-variant-numeric: tabular-nums;
-  background-image:
-    linear-gradient(var(--px-line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--px-line) 1px, transparent 1px) !important;
-  background-size: 28px 28px !important;
-  background-attachment: fixed !important;
-}
-/* 字体：一律使用产品自带字体，不替换、不引入像素字体。
-   只给数字加 tabular-nums，保证并排数字等宽不跳动。 */
-[class*='badge'], [class*='Badge'], [class*='chip'], [class*='Chip'],
-[class*='status'], [class*='Status'],
-td[class*='number'], [class*='count'], [class*='Count'], [class*='metric'], [class*='Metric'] {
-  font-variant-numeric: tabular-nums;
-}
-button, [role='button'], [role='tab'], [role='menuitem'], a, input, select, textarea {
-  transition:
-    background-color var(--px-dur) var(--px-ease),
-    border-color var(--px-dur) var(--px-ease),
-    color var(--px-dur-fast) var(--px-ease),
-    box-shadow var(--px-dur) var(--px-ease),
-    transform var(--px-dur-fast) var(--px-ease);
-}
-button, [role='button'], [role='tab'], input, select, textarea {
-  border-radius: var(--px-r-md) !important;
-}
-button:not([disabled]):hover, [role='button']:hover {
-  box-shadow: var(--px-elev-2);
-}
-button:not([disabled]):active {
-  transform: translateY(1px) scale(0.985);
-}
-input:focus-visible, textarea:focus-visible, select:focus-visible,
-button:focus-visible, [role='button']:focus-visible {
-  outline: none !important;
-  box-shadow: var(--px-ring) !important;
-}
-[role='dialog'], [role='menu'], [role='listbox'], [role='tooltip'] {
-  border-radius: var(--px-r-lg) !important;
-  border: 1px solid var(--px-line-2) !important;
-  box-shadow: var(--px-elev-3) !important;
-}
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--px-ink) 18%, transparent);
-  border: 3px solid transparent;
-  background-clip: content-box;
-  border-radius: var(--px-r-pill);
-}
-::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--px-ink) 34%, transparent);
-  background-clip: content-box;
-}
-::selection { background: color-mix(in srgb, var(--px-pink) 45%, transparent); color: var(--px-ink); }
-@media (prefers-reduced-motion: reduce) {
-  * { transition-duration: 1ms !important; animation-duration: 1ms !important; }
-}
-`
-
-/**
  * 看板局部样式：全部使用 px- 前缀类名，不依赖产品内部类名，
  * 因此产品升级不会让看板错版。
+ *
+ * 早先这里前面还有一张 SKIN 样式表（`body` 网格底纹、全局 button/input 的圆角与
+ * transition、`::-webkit-scrollbar`、`::selection`）。它已按需求删除——那张表写的
+ * 全是**全局元素选择器**，等于替用户重绘整个产品界面；产品的原版背景与控件观感
+ * 应当原样交还 DSH。
+ *
+ * 删掉它之后有两个连带后果，都在本文件里就地补上了，改这块时别丢：
+ *   1) 全局的 `button, input { border-radius; transition }` 没了，于是看板自己的
+ *      控件必须自己写圆角与过渡。`--px-*` 令牌的取值不受影响（它读的是产品打在
+ *      body 上的 data-ds-dark-theme），因此深浅色仍然对。
+ *   2) 全局 `:focus-visible` 的焦点环也没了，`.px-*` 控件要自己给一条，
+ *      否则键盘操作时看不出焦点在哪。
+ * 底纹没了之后 `.px-topbar` 的毛玻璃底色更要紧：它原本盖在 body 网格上，
+ * 现在下面就是产品自己的背景，因此这一层仍保留 color-mix + backdrop-filter。
  */
 const DASHBOARD = `
+/* 看板整页自己铺底色。早先这一层是透明的，背景靠 SKIN 打在 body 上的网格底纹；
+   皮肤删掉之后不铺就只剩产品自己的背景，浅色下奶油色卡片会直接浮在产品底色上、
+   整页也没有「这是插件的一页」的边界。铺 --px-bg 只给**这一页**上色，
+   不碰产品任何元素——这正是「插件只在自己的界面上用自己的配色」的意思。 */
 .px-root {
   box-sizing: border-box;
   min-height: 100%;
   padding: 16px 20px 36px;
+  background: var(--px-bg);
   color: var(--px-ink);
   font-family: var(--px-ui-font);
   font-variant-numeric: tabular-nums;
@@ -306,6 +212,9 @@ const DASHBOARD = `
 .px-title-sub { font-size: 11.5px; color: var(--px-muted); line-height: 1.3; }
 .px-topbar-actions { display: flex; align-items: center; gap: 10px; }
 
+/* 看板里的按钮。圆角与过渡**必须自己写**：早先这两条由 SKIN 那条全局
+   button/input 规则提供，皮肤删掉之后不自己写就会变成直角、且 hover 是硬切。
+   令牌取值（--px-r-sm 等）不受影响，因此深浅色仍然对。 */
 .px-btn {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 7px 14px;
@@ -316,10 +225,19 @@ const DASHBOARD = `
   border-radius: var(--px-r-sm);
   box-shadow: var(--px-elev-1);
   cursor: pointer;
+  transition:
+    background-color var(--px-dur) var(--px-ease),
+    border-color var(--px-dur) var(--px-ease),
+    color var(--px-dur-fast) var(--px-ease),
+    box-shadow var(--px-dur) var(--px-ease),
+    transform var(--px-dur-fast) var(--px-ease);
 }
 .px-btn:hover:not(:disabled) { background: var(--px-surface-2); box-shadow: var(--px-elev-2); transform: translateY(-1px); }
 .px-btn:active:not(:disabled) { transform: translateY(0) scale(0.98); box-shadow: var(--px-elev-1); }
 .px-btn:disabled { opacity: 0.55; cursor: default; }
+/* 焦点环：全局 :focus-visible 规则随 SKIN 一起删了，看板自己的控件要自己给一条，
+   否则键盘操作时看不出焦点落在哪个按钮上。 */
+.px-btn:focus-visible { outline: none; box-shadow: var(--px-ring); }
 .px-btn.primary {
   color: #fff; border-color: transparent;
   background: linear-gradient(145deg, var(--px-pink), var(--px-pink-deep));
@@ -351,16 +269,23 @@ const DASHBOARD = `
   box-shadow: var(--px-elev-1);
   transition: transform var(--px-dur) var(--px-ease), width var(--px-dur) var(--px-ease);
 }
+/* 分段控件里的每一枚选项。圆角跟着 thumb 走（6px）——早先这颗按钮自己没有圆角，
+   靠的是 SKIN 那条全局 button 规则；全局规则删掉后不补就变成直角，
+   而 thumb 仍是圆角，一枚圆角滑块在直角按钮上滑动看起来像错位。 */
 .px-seg-btn {
   position: relative; z-index: 1;
   padding: 5px 13px;
   font: inherit; font-size: 12px; font-weight: 550;
   color: var(--px-muted);
   background: none; border: none; cursor: pointer;
-  transition: color var(--px-dur-fast) var(--px-ease);
+  border-radius: 6px;
+  transition:
+    color var(--px-dur-fast) var(--px-ease),
+    background-color var(--px-dur) var(--px-ease);
 }
 .px-seg-btn:hover { color: var(--px-ink-2); }
 .px-seg-btn[aria-selected='true'] { color: var(--px-ink); }
+.px-seg-btn:focus-visible { outline: none; box-shadow: var(--px-ring); }
 
 /* 卡片内的次级分段控件（趋势维度）：比顶部那个窗口切换器小一号。
    两者若长得一样重，用户会以为「模型 / 提供商」也是全局窗口设置。 */
@@ -512,6 +437,14 @@ const DASHBOARD = `
   background: linear-gradient(145deg, var(--px-pink), var(--px-pink-deep));
   color: #fff;
   border-color: transparent;
+}
+/* 团队标记：会话清单里标出「它属于/它就是一个智能体团队」。
+   用紫色而不是粉/绿——后两者在这份界面里已经有含义（粉 = 高峰/选中，
+   绿 = 空闲/正常），团队是另一种维度，混用会让人读成时段状态。 */
+.px-badge.team {
+  background: color-mix(in srgb, var(--px-purple) 34%, transparent);
+  color: var(--px-tone-purple);
+  border-color: color-mix(in srgb, var(--px-tone-purple) 28%, transparent);
 }
 .px-pulse { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: px-pulse 1.8s var(--px-ease) infinite; }
 
@@ -831,8 +764,15 @@ const DASHBOARD = `
   background: var(--px-surface);
   border: 1px solid var(--px-line-2);
   border-radius: var(--px-r-sm);
+  transition:
+    border-color var(--px-dur) var(--px-ease),
+    box-shadow var(--px-dur) var(--px-ease),
+    background-color var(--px-dur) var(--px-ease);
 }
 .px-input:disabled { opacity: 0.55; }
+/* 输入框的焦点环同样要自己给（全局那条随 SKIN 删了）：原来那圈 outline 是
+   产品默认样式，在暗色底下几乎看不见。 */
+.px-input:focus-visible { outline: none; border-color: var(--px-pink-deep); box-shadow: var(--px-ring); }
 /* min-width: 0 是**必须**的：flex 容器默认 min-width:auto，会被内部输入框的固有宽度
    撑住不收缩，于是整行溢出到面板外面（grid/flex 层叠里的经典坑）。 */
 .px-rate-field { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -1437,6 +1377,9 @@ const DASHBOARD = `
   display: inline-flex; align-items: center; gap: 7px;
   font-size: 12.5px; color: var(--px-ink-2);
 }
+/* 阈值输入框。圆角与过渡原本由 SKIN 的全局 button/input 规则统一给，皮肤删掉后
+   必须在这里自己写——否则这几个框会变成直角，跟旁边同样走 --px-r-sm 的
+   .px-input 摆在一起明显不一致。选择器仍以 .px-* 开头，不外溢到产品界面。 */
 .px-notify-input input {
   width: 84px;
   padding: 5px 8px;
@@ -1445,6 +1388,13 @@ const DASHBOARD = `
   color: var(--px-ink);
   background: var(--px-surface);
   border: 1px solid var(--px-line-2);
+  border-radius: var(--px-r-sm);
+  transition:
+    border-color var(--px-dur) var(--px-ease),
+    box-shadow var(--px-dur) var(--px-ease);
+}
+.px-notify-input input:focus-visible {
+  outline: none; border-color: var(--px-pink-deep); box-shadow: var(--px-ring);
 }
 .px-notify-recent { margin-bottom: 4px; }
 
@@ -1507,11 +1457,29 @@ const DASHBOARD = `
   .px-root { padding: 14px 14px 40px; }
   .px-topbar { margin: -14px -14px 16px; padding: 12px 14px; top: -14px; }
 }
+
+/* 降级动效：**只作用在插件自己的元素上**。
+   早先这条选择器写的是全局通配符（随 SKIN 一起删了）——那会连产品自己的动画一起
+   关掉，而用户可能正依赖产品的某个过渡来理解状态变化。这里一律走 .px-*，
+   于是系统开了「减少动态效果」时只有本插件的动效被压到 1ms。 */
+@media (prefers-reduced-motion: reduce) {
+  .px-root *, .px-toast, .px-pill, .px-period-inline {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
+  }
+}
 `
 
-/** 样式表清单：装配与卸载共用同一份来源。 */
+/**
+ * 样式表清单：装配与卸载共用同一份来源。
+ *
+ * **只有两张。** 早先还有第三张 `['skin', SKIN]`（全局皮肤），已随皮肤功能移除。
+ * 两张就够了，因为配色分工是清楚的：
+ *   - `tokens`：--px-* 变量（:root 浅色 + body[data-ds-dark-theme] 深色），只管变量；
+ *   - `dashboard`：全部 .px-* 选择器，看板整页 + 费用条 + 提示条的实样式。
+ * 两者都不写全局元素选择器，因此不会外溢到产品界面。渲染闸门断言这里恰好两张。
+ */
 export const STYLES = [
   ['tokens', TOKENS],
-  ['skin', SKIN],
   ['dashboard', DASHBOARD],
 ]

@@ -1081,8 +1081,207 @@ await check('账本不存在时视为空账本而不是报错', async () => {
   assert.equal(missing.lastError, undefined)
 })
 
-console.log('ledger：合并与历史保留')
+// ── 智能体团队：会话头归组 ────────────────────────────────────────
+//
+// 团队归组只用会话头的**持久**字段（`parentSession` / `origin` /
+// `delegationDepth`），因此这一组用例不需要任何 DSH 运行时：假的 persistence
+// 把 header 交进来即可。断言的是三件用户会直接看到的事：
+//   1. teammate 归到 lead 名下，而不是各占一行独立会话；
+//   2. 团队合计**逐位等于**成员之和（用户会把它们加起来对一遍）；
+//   3. 认不出父会话时不硬猜——按独立根处理，宁可少归一个团队也不归错。
+console.log('agent team：会话头归组与合计')
 
+/**
+ * 造一份带团队会话头的假 persistence。
+ *
+ * `headers` 是 `[id, extraHeader]` 的数组；`events` 决定各自的用量。
+ * @param {Array<[string, object]>} headers - 会话 id 与会话头增量。
+ * @param {Record<string, object[]>} events - 会话 id → 事件。
+ * @returns {object} 假 persistence。
+ */
+function teamPersistence(headers, events) {
+  return {
+    async list() {
+      return headers.map(([id, extra]) => ({
+        header: { id, createdAt: T('2026-09-10T02:00:00Z'), cwd: 'D:\\team', ...extra },
+        revision: String((events[id] ?? []).length),
+        eventCount: (events[id] ?? []).length,
+      }))
+    },
+    async open(id) {
+      return {
+        async read(offset = 0, length = 500) {
+          return { events: (events[id] ?? []).slice(offset, offset + length) }
+        },
+        async close() {},
+      }
+    },
+  }
+}
+
+/** 造一条团队名册事件（与 DSH 的 `team/member` 同形）。 */
+function teamMemberEvent(seq, time, member) {
+  return { type: 'team/member', seq, time, data: { version: 2, teamId: 'lead-1', member } }
+}
+
+await check('teammate 归到 lead 名下，团队合计逐位等于成员之和', async () => {
+  const leadEvents = [
+    { type: 'turn/start', seq: 0, time: T('2026-09-10T02:00:00Z') },
+    teamMemberEvent(1, T('2026-09-10T02:00:00Z'), {
+      id: 'mate-1', name: 'researcher', description: '调研', provider: 'spawn', context: 'fresh', phase: 'provisioning',
+    }),
+    message(2, T('2026-09-10T02:00:00Z'), 'deepseek-flash', { input: 1_000_000, output: 100_000 }),
+    // 同一成员再落一条 active 快照：必须覆盖，而不是变成两行
+    teamMemberEvent(3, T('2026-09-10T02:10:00Z'), {
+      id: 'mate-1', name: 'researcher', description: '调研', provider: 'spawn', context: 'fresh', phase: 'active',
+    }),
+  ]
+  const mateEvents = [
+    message(0, T('2026-09-10T04:30:00Z'), 'deepseek-flash', { input: 2_000_000, output: 300_000 }),
+  ]
+  const catalog = new UsageCatalog({
+    persistence: () => teamPersistence(
+      [['lead-1', {}], ['mate-1', { parentSession: 'lead-1', origin: 'subagent', delegationDepth: 1 }]],
+      { 'lead-1': leadEvents, 'mate-1': mateEvents },
+    ),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('team-basic'),
+  })
+  const teamData = await catalog.read()
+  assert.ok(teamData.capabilities.includes('agentTeam'), 'capabilities 应声明 agentTeam')
+
+  const lead = teamData.sessions.find((row) => row.id === 'lead-1')
+  const mate = teamData.sessions.find((row) => row.id === 'mate-1')
+  assert.equal(lead.teamId, 'lead-1', 'lead 的 teamId 是它自己')
+  assert.equal(lead.role, 'lead')
+  assert.equal(mate.teamId, 'lead-1', 'teammate 必须归到 lead 名下，而不是自己当根')
+  assert.equal(mate.role, 'teammate')
+  assert.equal(mate.depth, 1)
+  // 名册里的名字来自 `team/member`，不是标题、也不是 id 片段
+  assert.equal(mate.memberName, 'researcher', '成员名应取自 team/member 名册')
+  assert.equal(mate.memberPhase, 'active', '同一成员的后续快照必须覆盖，且 on 到最新 phase')
+
+  const team = teamData.teams.find((row) => row.id === 'lead-1')
+  assert.ok(team !== undefined, '多成员会话必须单列成一个团队')
+  assert.equal(team.memberCount, 2, '成员数含 lead 自己')
+  assert.equal(team.members[0].role, 'lead', 'lead 永远排在第一位')
+  assert.equal(team.members[1].name, 'researcher')
+
+  // 核心断言：用户会把成员金额加起来与合计对一遍，因此必须**逐位**相等。
+  const memberSum = Math.round(team.members.reduce((acc, item) => acc + item.cost.standard, 0) * 1e6) / 1e6
+  assert.equal(team.cost.standard, memberSum, '团队合计必须严格等于成员金额之和')
+
+  // 团队合计不能把用量重复计入总量：`overview` 仍按全量记录算一遍。
+  const sessionSum = teamData.sessions.reduce((acc, row) => acc + row.cost.standard, 0)
+  assert.ok(
+    Math.abs(sessionSum - teamData.cost.standard) < 1e-4,
+    `会话金额之和(${sessionSum})应等于总量(${teamData.cost.standard})，团队分组不得重复计数`,
+  )
+
+  // 响应里不得夹带逐模型用量：那是 160 多个会话 × 十几个模型的体积
+  assert.equal(
+    teamData.sessions.some((row) => Object.hasOwn(row, 'byModel')),
+    false,
+    '会话行不该带 byModel（团队合计已在宿主算好）',
+  )
+  rmSync(ledgerFor('team-basic'), { force: true })
+})
+
+await check('父会话不存在时不硬猜：按独立根处理，且标记 detached', async () => {
+  const orphan = [message(0, T('2026-09-10T02:00:00Z'), 'deepseek-flash', { input: 1_000, output: 100 })]
+  const catalog = new UsageCatalog({
+    persistence: () => teamPersistence(
+      // 父会话 lead-gone 不在本次扫描里（已被删除 / 来自别的机器）
+      [['orphan-1', { parentSession: 'lead-gone', origin: 'subagent', delegationDepth: 1 }]],
+      { 'orphan-1': orphan },
+    ),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('team-orphan'),
+  })
+  const orphanData = await catalog.read()
+  const row = orphanData.sessions.find((item) => item.id === 'orphan-1')
+  assert.equal(row.role, 'teammate', '它确实是某个团队的一员（有父会话）')
+  assert.equal(row.teamId, 'lead-gone', '团队键仍是那个已知的父会话 id')
+  assert.equal(row.detached, true, '父会话不在本机时必须标记 detached，供界面说明')
+  // 一个人也成不了一个「团队行」：成员数为 1 不单列
+  assert.equal(orphanData.teams.length, 0, '单人团队不该单列（那只是普通会话）')
+  rmSync(ledgerFor('team-orphan'), { force: true })
+})
+
+await check('多级委派一路归到根，且环不会让扫描死循环', async () => {
+  const usage = [message(0, T('2026-09-10T02:00:00Z'), 'deepseek-flash', { input: 1_000, output: 100 })]
+  /** 造一个深度为 `depth` 的链：root → c1 → c2 … */
+  const headers = [['root', {}]]
+  const events = { root: usage }
+  let previous = 'root'
+  for (let depth = 1; depth <= 3; depth += 1) {
+    const id = `c${depth}`
+    headers.push([id, { parentSession: previous, origin: 'subagent', delegationDepth: depth }])
+    events[id] = usage
+    previous = id
+  }
+  const catalog = new UsageCatalog({
+    persistence: () => teamPersistence(headers, events),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('team-chain'),
+  })
+  const chainData = await catalog.read()
+  for (const depth of [1, 2, 3]) {
+    const row = chainData.sessions.find((item) => item.id === `c${depth}`)
+    assert.equal(row.teamId, 'root', `第 ${depth} 层成员也必须归到根会话`)
+    assert.equal(row.depth, depth)
+  }
+  const chainTeam = chainData.teams.find((row) => row.id === 'root')
+  assert.ok(chainTeam !== undefined, '四代同堂也该是一个团队')
+  assert.equal(chainTeam.memberCount, 4)
+
+  // 环：伪造两条指向彼此的父会话。判据必须有界，否则整次扫描会挂死在这里。
+  const cycleCatalog = new UsageCatalog({
+    persistence: () => teamPersistence(
+      [
+        ['loop-a', { parentSession: 'loop-b', origin: 'subagent', delegationDepth: 1 }],
+        ['loop-b', { parentSession: 'loop-a', origin: 'subagent', delegationDepth: 1 }],
+      ],
+      { 'loop-a': usage, 'loop-b': usage },
+    ),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('team-cycle'),
+  })
+  const cycleData = await cycleCatalog.read()
+  assert.equal(cycleData.sessions.length, 2, '环上的会话仍要被扫出来，不能被吞掉')
+  // 不要求算出某个特定根（那是无意义的），只要求有界、不抛错、不丢数据
+  for (const row of cycleData.sessions) {
+    assert.equal(typeof row.teamId, 'string')
+    assert.notEqual(row.teamId, '', '环上也要给一个非空的团队键')
+  }
+  rmSync(ledgerFor('team-chain'), { force: true })
+  rmSync(ledgerFor('team-cycle'), { force: true })
+})
+
+await check('没有团队头字段的普通会话保持单会话口径（旧口径逐字节不变）', async () => {
+  const catalog = new UsageCatalog({
+    persistence: () => teamPersistence(
+      [['solo', {}]],
+      { solo: [message(0, T('2026-09-10T02:00:00Z'), 'deepseek-flash', { input: 1_000, output: 100 })] },
+    ),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('team-solo'),
+  })
+  const soloData = await catalog.read()
+  const row = soloData.sessions[0]
+  assert.equal(row.role, 'lead')
+  assert.equal(row.teamId, 'solo')
+  assert.equal(row.memberName, '')
+  assert.equal(soloData.teams.length, 0, '普通会话不该产生团队行')
+  rmSync(ledgerFor('team-solo'), { force: true })
+})
+
+console.log('ledger：合并与历史保留')
 await check('把账本拷到另一台机器后，两边记录合并成一份历史', async () => {
   const otherPath = join(tmpdir(), `dsh-pixel-copied-${process.pid}.jsonl`)
   rmSync(otherPath, { force: true })

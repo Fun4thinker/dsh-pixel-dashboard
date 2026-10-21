@@ -951,6 +951,14 @@ assert.equal(commandCodePlanInfo(''), undefined)
 assert.ok(COMMAND_CODE_CAP_TOLERANCE > 0 && COMMAND_CODE_CAP_TOLERANCE < 1, '容差应是比例而不是绝对值')
 
 // 真实账号的形状（2026-09 实测）：月度只有剩余余额，已用在用量汇总接口里
+//
+// **重置时刻必须用「相对未来」的日期，不能写死一个具体日期。** 这里原先写的是
+// `2026-10-14T12:26:13.000Z`（就是当时实测到的那个计费周期末），而下面有一条
+// 断言要求它是「未来的毫秒时间戳」——于是日期一过，闸门自己就红了，
+// 与任何代码改动都无关。这种「时间炸弹」最难排查：现象是某一天突然全红，
+// 而 git diff 里什么都没有。改成相对时间后，这条用例永远只在验契约本身
+// （ISO 串能不能被解析成未来时刻），不再依赖今天几号。
+const futurePeriodEnd = new Date(Date.now() + 9 * 86_400_000).toISOString()
 const ccLive = parseCommandCodeCredits({
   credits: { belowThreshold: false, monthlyCredits: 65.5512769625, freeCredits: 0, purchasedCredits: 0 },
   windowLimits: {
@@ -960,7 +968,7 @@ const ccLive = parseCommandCodeCredits({
   },
 }, {
   success: true,
-  data: { planId: 'individual-goat', status: 'active', currentPeriodEnd: '2026-10-14T12:26:13.000Z' },
+  data: { planId: 'individual-goat', status: 'active', currentPeriodEnd: futurePeriodEnd },
 }, {
   totalCount: 1350,
   totalCredits: 4.429013998500001,
@@ -977,17 +985,17 @@ assert.equal(ccLiveMonth.usedPercent, 6.33, `月度真实已用约 6.33%，实�
 assert.notEqual(ccLiveMonth.usedPercent, 0, '月度百分比绝不能是 0（那是「未知被画成 0」的老毛病）')
 // 月度的**重置时刻**也必须到手。用户报过：「看不出月额度多久后重置」——
 // 5 小时与每周都带 resetAt，月度却只能靠 `subscriptions` 的 `currentPeriodEnd`，
-// 而那个字段是 **ISO 日期串**（`"2026-10-14T12:26:13.000Z"`），不是数字时间戳。
+// 而那个字段是 **ISO 日期串**（`"2026-10-14T12:26:13.000Z"` 这种形状），不是数字时间戳。
 // 早先 `normalizeEpoch` 只认数字，ISO 串被静默读成 undefined：不报错、不显示 0，
 // 只是月度那一栏永远少一句「多久后重置」——最容易被当成「本来就没有」的形态。
-assert.equal(ccLiveMonth.resetAt, Date.parse('2026-10-14T12:26:13.000Z'),
+assert.equal(ccLiveMonth.resetAt, Date.parse(futurePeriodEnd),
   '月度重置时刻必须能从 ISO 串的 currentPeriodEnd 解析出来（这正是用户报的那个缺失）')
 assert.ok(Number.isFinite(ccLiveMonth.resetAt) && ccLiveMonth.resetAt > Date.now(),
   '月度重置时刻应是未来的毫秒时间戳')
 // 数字形状**不能**因为新增 ISO 支持而回归：秒/毫秒都照旧
 const ccEpochShapes = parseCommandCodeCredits(
   { credits: { monthlyCredits: { used: 1, cap: 10, resetAt: 1_790_000_000_000 } } },
-  { data: { planId: 'individual-goat', currentPeriodEnd: '2026-10-14T12:26:13.000Z' } },
+  { data: { planId: 'individual-goat', currentPeriodEnd: futurePeriodEnd } },
 )
 const ccEpochMonth = ccEpochShapes.windows.find((win) => win.window === 'monthly')
 assert.equal(ccEpochMonth.resetAt, 1_790_000_000_000, '数字毫秒时间戳照旧优先于订阅周期')
@@ -1089,7 +1097,7 @@ const ccService = new plansModule.PlansService({
       })
     }
     if (url.endsWith('/alpha/billing/subscriptions')) {
-      return json({ success: true, data: { planId: 'individual-goat', currentPeriodEnd: '2026-10-14T12:26:13.000Z' } })
+      return json({ success: true, data: { planId: 'individual-goat', currentPeriodEnd: futurePeriodEnd } })
     }
     if (url.endsWith('/alpha/usage/summary')) return json({ totalMonthlyCredits: 4.429013998500001 })
     return new Response('{}', { status: 404 })

@@ -33,6 +33,7 @@ const MODULES = [
   'provider.js',
   'planView.js',
   'account.js',
+  'team.js',
   'notify.js',
   'period.js',
   'usage.js',
