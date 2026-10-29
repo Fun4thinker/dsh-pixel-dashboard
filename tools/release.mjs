@@ -33,13 +33,27 @@ const positional = argv.filter((a) => !a.startsWith('--'))
 const dryRun = flags.has('--dry-run')
 const tagOnly = flags.has('--tag-only')
 
+/**
+ * 是否需要 shell 才能跑这条命令。
+ *
+ * Windows 上的 `npm` / `pnpm` / `dsh` 是 `.cmd` 批处理包装，`execFileSync` 不能直接执行，
+ * 必须交给 shell；而开了 shell 之后参数只是用空格拼起来、**不加引号**，含空格的消息
+ * 会被 cmd 拆成多个 argv（这正是 `git commit -m "release: x@y"` 里 `@y` 被当成 pathspec 的原因）。
+ *
+ * 所以规则是：**能不开 shell 就不开**。`git` 是真正的 .exe，直接执行即可，
+ * 参数原样传递、不经过任何 shell 解析——这样含空格、冒号、`@` 的消息都是安全的。
+ */
+function needsShell(command) {
+  return process.platform === 'win32' && !/^git(\.exe)?$/i.test(command)
+}
+
 /** 跑一条命令并把输出转给终端；失败直接抛，让进程以非零退出。 */
 function run(command, args, options = {}) {
   console.log(`\n$ ${command} ${args.join(' ')}`)
   return execFileSync(command, args, {
     cwd: root,
     stdio: 'inherit',
-    shell: process.platform === 'win32',
+    shell: needsShell(command),
     ...options,
   })
 }
@@ -49,7 +63,7 @@ function capture(command, args, options = {}) {
   return execFileSync(command, args, {
     cwd: root,
     encoding: 'utf8',
-    shell: process.platform === 'win32',
+    shell: needsShell(command),
     ...options,
   }).trim()
 }
