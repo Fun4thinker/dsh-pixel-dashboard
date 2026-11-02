@@ -1474,8 +1474,13 @@ must(dockOnlyBalance.includes('¥7.00'), `只有余额时也应渲染：${dockOn
     panelHtml.includes('75.0%'),
     `缓存命中率应是 12000/(12000+3000+1000)=75.0%，实际面板：${panelHtml}`,
   )
-  // 口径说明必须写在面板里（不是只在 title 上）
-  must(panelHtml.includes('不是实际账单'), '脚注要说明这是估算而不是实际账单')
+  // 常规情况下**面板底部不留任何说明文字**。
+  // 用户看了真实界面的反馈是「底下的描述性文字我觉得可以去掉」：面板是读数的地方，
+  // 常驻的解释等于每次都让人先跨过一段说明才能看数字。
+  // 因此这条是反向断言——只有「会改变读法」的告警才允许出现（见下一段的估算态）。
+  must(!panelHtml.includes('px-detail-notes'),
+    `常规情况下不该有脚注（用户已明确要求去掉），实际：${panelHtml}`)
+  must(!panelHtml.includes('不是实际账单'), '「不是实际账单」这类口径说明应留在 README，不进面板')
 
   // 「无输入」时命中率是**未知**而不是 0%——0% 会显示成「缓存完全没命中」
   must(cacheHitRate({}) === undefined, '没有输入时缓存命中率应为 undefined，不能折成 0%')
@@ -1512,7 +1517,9 @@ must(dockOnlyBalance.includes('¥7.00'), `只有余额时也应渲染：${dockOn
   const failedModel = costDetailModel({ cost: undefined, failed: true })
   const failedPanel = renderToStaticMarkup(React.createElement(CostDetailPanel, { model: failedModel }))
   must(failedPanel.includes('费用不可用'), '失败态面板要明说费用不可用')
-  must(failedPanel.includes('版本'), '失败态要指出「插件与宿主版本可能不一致」这条排查路径')
+  // 失败态只留「为什么没有数字」一句；排查指引属于文档，不进面板。
+  must(failedPanel.includes('宿主未提供该会话的费用数据'), `失败态要说明缺数据，实际：${failedPanel}`)
+  must(!failedPanel.includes('版本'), '排查指引（版本不一致之类）不该塞进面板，那是 README 的事')
   must(!failedPanel.includes('¥0'), '失败态绝不能画出 ¥0——那是把「不知道」显示成「没花钱」')
 
   // 5b) 账户那一节：余额与套餐**互斥**，且套餐百分比 >100 时条夹满、数字照实
