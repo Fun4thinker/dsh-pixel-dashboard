@@ -1065,7 +1065,12 @@ const withCost = renderToStaticMarkup(React.createElement(SessionCostView, {
 }))
 must(withCost.includes('¥0.123'), `费用条应显示金额，实际：${withCost}`)
 must(withCost.includes('tokens'), '费用条应显示 token 数')
-must(withCost.includes('高峰') && withCost.includes('空闲'), '悬停说明应含高峰/空闲分档')
+// 分档信息**从 title 移到了面板里**：这里不能再断言 title（它已经被刻意去掉，
+// 那正是用户嫌丑的裸浮窗）。分档内容的断言在下面的「费用详情面板」一节，
+// 那里用 costDetailModel 折出面板数据再逐项验，比翻 title 字符串更准。
+must(!/<button[^>]*\stitle=/.test(withCost),
+  '可点开的那一枚不得再挂 title——详情在面板里，两套并存的后果是'
+  + '悬停时还要在打开的面板之上再弹一个系统裸浮窗')
 
 // 金额为 0 也要显示（新会话刚开就应看到 ¥0，而不是空白）
 const zeroCost = renderToStaticMarkup(React.createElement(SessionCostView, {
@@ -1094,7 +1099,11 @@ must(
 // ── 团队模式：这一枚**取代**「本次会话」那一枚 ─────────────────────
 // 用户的要求是「开启团队后当前会话计费改成团队总」。因此两件事同时要成立：
 //   - 显示的是**团队合计**（¥12.50），而不是本次会话那一份（¥3.00）；
-//   - 本次会话的金额不能丢，它进了悬停说明的第一行。
+//   - 本次会话的金额不能丢，它进了面板的「本次会话」一节。
+//
+// 成员明细**不在 title 里了**（title 已按用户要求移除，改用可点击的面板），
+// 因此这里只断言徽标这一层，面板内容的断言在下面「费用详情面板」一节里，
+// 用同一个 team 数据折出 model 来验——两处口径来自同一份输入，不会各说各话。
 {
   const teamOnly = renderToStaticMarkup(React.createElement(SessionCostView, {
     cost: { standard: 3, peak: 2, idle: 1 },
@@ -1105,8 +1114,8 @@ must(
       memberCount: 2,
       title: 'dsh-pixel-dashboard',
       lines: [
-        { id: 'lead-1', name: 'lead', role: 'lead', detail: 'lead（lead） · ¥10.00' },
-        { id: 'mate-1', name: 'researcher', role: '成员', detail: 'researcher（成员） · ¥2.50' },
+        { id: 'lead-1', name: 'lead', role: 'lead', cost: 10, detail: 'lead（lead） · ¥10.00' },
+        { id: 'mate-1', name: 'researcher', role: '成员', cost: 2.5, detail: 'researcher（成员） · ¥2.50' },
       ],
     },
   }))
@@ -1114,10 +1123,12 @@ must(
   must(teamOnly.includes('¥12.50'), `团队模式下显示的必须是团队合计 ¥12.50：${teamOnly}`)
   must(!teamOnly.includes('本次会话'), '团队模式下不该再并排一枚「本次会话」（dock 是横向 flex，宽度要省）')
   must(teamOnly.includes('团队'), '角标应点明这是团队口径')
-  must(teamOnly.includes('researcher'), '悬停说明必须带上成员明细（title 里也要有）')
-  // 本次会话金额不丢：它进了 title 的第一行
-  must(teamOnly.includes('高峰') || teamOnly.includes('空闲'),
-    `本次会话的分档说明应保留在 title 里，不因切换成团队口径而丢失：${teamOnly}`)
+  must(teamOnly.includes('px-pill-button'), '团队那一枚同样必须是可点开的按钮（成员明细在面板里）')
+  // 只钉**可点的那一枚**：不可点的 token 胶囊上的短 title 是另一回事（它是速览，
+  // 不打开展开面板）。判据是「<button> 标签里没有 title 属性」。
+  must(!/<button[^>]*\stitle=/.test(teamOnly),
+    '可点开的那一枚不得再挂 title：详情在面板里，两套并存的后果是悬停时'
+    + '在已打开的面板之上再弹一个系统裸浮窗')
 
   // 团队模式下 token 那一枚也换成团队总量
   must(teamOnly.includes('3.00M'), `应显示团队 token 总量（3.00M）：${teamOnly}`)
@@ -1375,7 +1386,18 @@ must(dockOnlyBalance.includes('¥7.00'), `只有余额时也应渲染：${dockOn
   }))
   must(estimated.includes('px-pill-tag'), '有不在价目表里的模型时费用那一枚应带角标')
   must(estimated.includes('估算'), `角标应写明「估算」：${estimated}`)
-  must(estimated.includes('mystery-model-x'), '悬停里要点明是哪个模型没有价')
+  // 「是哪个模型没价」不再写在 title 里（title 已移除），而在面板脚注里。
+  // 这里直接验面板模型，口径与界面同源。
+  const { costDetailModel } = await import(pathToFileURL(join(root, 'lib', 'client', 'costDetail.js')).href)
+  const estimatedModel = costDetailModel({
+    cost: { standard: 0.5, peak: 0.2, idle: 0.3 },
+    unpriced: ['mystery-model-x'],
+  })
+  must(estimatedModel.badge === '估算', '模型不在价目表里时面板应带「估算」角标')
+  must(
+    estimatedModel.notes.some((note) => note.includes('mystery-model-x')),
+    `面板脚注必须点名是哪个模型没价：${JSON.stringify(estimatedModel.notes)}`,
+  )
   // 没有未定价模型时不该出现角标（否则等于每一条都标估算）
   const notEstimated = renderToStaticMarkup(React.createElement(SessionCostView, {
     cost: { standard: 0.5, peak: 0.2, idle: 0.3 },
@@ -1384,6 +1406,157 @@ must(dockOnlyBalance.includes('¥7.00'), `只有余额时也应渲染：${dockOn
     account: { kind: 'none' },
   }))
   must(!notEstimated.includes('px-pill-tag'), '不在价目表里的模型时才该标估算')
+}
+
+// ── 费用详情面板：从「裸文本浮窗」改成可点击展开的面板 ──────────────
+//
+// 用户的原话：「对话框下方的计价详情……现在直接是一个裸文本浮窗，不好看」。
+// 这一组钉住三件事，每一件都对应一个**不会报错**的失败模式：
+//   1. 徽标必须是可点的 <button>（带 aria-expanded），否则键盘与触屏用户根本
+//      打不开详情——而界面上看不出任何异常；
+//   2. 面板必须在**默认收起**时什么都不渲染（否则静态渲染里冒出一块固定定位的
+//      浮层，真实首屏也会先闪一下）；
+//   3. 面板里的每一个数字都得来自 `costDetailModel`，且口径与看板一致
+//      （分档之和 = 合计、缓存命中率的分母是计费输入、缺失不写成 0）。
+{
+  const detailModule = await import(pathToFileURL(join(root, 'lib', 'client', 'costDetail.js')).href)
+  const { costDetailModel, cacheHitRate, billedTotal } = detailModule
+  must(typeof costDetailModel === 'function', 'costDetail.js 应导出 costDetailModel')
+  must(typeof cacheHitRate === 'function', 'costDetail.js 应导出 cacheHitRate')
+  must(typeof billedTotal === 'function', 'costDetail.js 应导出 billedTotal')
+  const { CostDetailPanel } = viewModule
+  must(typeof CostDetailPanel === 'function', 'SessionCost.js 应导出 CostDetailPanel')
+
+  const usage = {
+    cacheReadTokens: 12_000,
+    uncachedInputTokens: 3_000,
+    cacheWriteTokens: 1_000,
+    outputTokens: 2_000,
+  }
+
+  // 1) 徽标是可点的按钮：`aria-expanded` 是「能展开」这件事的机器可读形式，
+  //    自绘小三角只是给人看的。
+  const clickable = renderToStaticMarkup(React.createElement(SessionCostView, {
+    cost: { standard: 0.5, peak: 0.3, idle: 0.2 },
+    tokens: 1000,
+    usage,
+    account: { kind: 'none' },
+  }))
+  must(clickable.includes('<button'), `费用那一枚必须渲染成 button（可点击展开），实际：${clickable.slice(0, 300)}`)
+  must(clickable.includes('aria-expanded="false"'), '默认应收起：aria-expanded 为 false')
+  must(clickable.includes('aria-haspopup="dialog"'), '按钮应声明 aria-haspopup="dialog"')
+  must(clickable.includes('px-pill-caret'), '可点的徽标要带一个小三角，否则用户不知道这一枚与旁边两枚行为不同')
+  // 不可点的那两枚（token 数、余额）**不能**是按钮：点了没反应比不可点更糟
+  must(
+    !/aria-label="[^"]*tokens[^"]*"/.test(clickable),
+    `token 那一枚不该是按钮：${clickable}`,
+  )
+
+  // 2) 默认收起时面板不渲染（渲染闸门的静态渲染里没有 createPortal，也不该有面板节点）
+  must(!clickable.includes('px-detail'), '收起时不应渲染详情面板')
+
+  // 3) 面板本体：直接用 model 渲染，逐项断言内容与口径
+  const sessionModel = costDetailModel({ cost: { standard: 1.2, peak: 0.8, idle: 0.4 }, usage })
+  const panelHtml = renderToStaticMarkup(React.createElement(CostDetailPanel, { model: sessionModel }))
+  must(panelHtml.includes('px-detail'), '面板应带 px-detail 结构类')
+  must(panelHtml.includes('role="dialog"'), '面板是浮层对话框，必须声明 role="dialog"')
+  must(panelHtml.includes('本次会话'), '面板抬头要写明这是本次会话')
+  must(panelHtml.includes('¥1.20'), `面板要显示合计金额，实际：${panelHtml.slice(0, 400)}`)
+  // 分档：两档都在，且金额与 `cost` 逐项对上（不重新算一遍）
+  must(panelHtml.includes('高峰时段') && panelHtml.includes('空闲时段'), '面板要分档列出高峰与空闲')
+  must(panelHtml.includes('¥0.800') && panelHtml.includes('¥0.400'), `两档金额必须取宿主算好的那份：${panelHtml}`)
+  // 用量构成：四个桶 + 缓存命中率 + 总量
+  for (const label of ['缓存命中读', '未缓存输入', '缓存写入', '输出', '缓存命中率', '计费 token']) {
+    must(panelHtml.includes(label), `用量构成缺少「${label}」这一行：${panelHtml}`)
+  }
+  // 缓存命中率的分母是**计费输入**（未命中 + 命中读 + 写入），不是全部 token
+  must(
+    panelHtml.includes('75.0%'),
+    `缓存命中率应是 12000/(12000+3000+1000)=75.0%，实际面板：${panelHtml}`,
+  )
+  // 口径说明必须写在面板里（不是只在 title 上）
+  must(panelHtml.includes('不是实际账单'), '脚注要说明这是估算而不是实际账单')
+
+  // 「无输入」时命中率是**未知**而不是 0%——0% 会显示成「缓存完全没命中」
+  must(cacheHitRate({}) === undefined, '没有输入时缓存命中率应为 undefined，不能折成 0%')
+  must(billedTotal(usage) === 18_000, `计费 token 应为 18000，实际 ${billedTotal(usage)}`)
+
+  // 4) 团队口径：抬头换成团队合计，并按成员分列；本次会话的金额不丢
+  const teamModel = costDetailModel({
+    cost: { standard: 3, peak: 2, idle: 1 },
+    usage,
+    team: {
+      cost: 12.5,
+      tokens: 3_000_000,
+      memberCount: 2,
+      title: 'dsh-pixel-dashboard',
+      lines: [
+        { name: 'lead', role: 'lead', cost: 10, tokens: 2_000_000 },
+        { name: 'researcher', role: '成员', cost: 2.5, tokens: 1_000_000 },
+      ],
+    },
+  })
+  const teamPanel = renderToStaticMarkup(React.createElement(CostDetailPanel, { model: teamModel }))
+  must(teamPanel.includes('团队合计'), '团队口径下面板抬头应是团队合计')
+  must(teamPanel.includes('成员（2 位）'), `面板要写出成员节与人数：${teamPanel.slice(0, 400)}`)
+  must(teamPanel.includes('lead') && teamPanel.includes('researcher'), '面板必须按成员分列')
+  must(teamPanel.includes('¥10.00') && teamPanel.includes('¥2.50'), '每位成员的金额都要出现')
+  must(teamPanel.includes('本次会话'), '团队口径下本次会话的金额不能丢——它要说清「我这一支花了多少」')
+  // 团队口径下**不显示**用量构成：那里的 token 是本会话的，摆在团队金额下面会被读成团队用量
+  must(
+    !teamPanel.includes('用量构成'),
+    '团队口径下不该显示「用量构成」——那会让本会话用量被读成团队用量',
+  )
+
+  // 5) 失败态：明说不可用，并把「可能是版本不一致」这条排查路径给出来
+  const failedModel = costDetailModel({ cost: undefined, failed: true })
+  const failedPanel = renderToStaticMarkup(React.createElement(CostDetailPanel, { model: failedModel }))
+  must(failedPanel.includes('费用不可用'), '失败态面板要明说费用不可用')
+  must(failedPanel.includes('版本'), '失败态要指出「插件与宿主版本可能不一致」这条排查路径')
+  must(!failedPanel.includes('¥0'), '失败态绝不能画出 ¥0——那是把「不知道」显示成「没花钱」')
+
+  // 5b) 账户那一节：余额与套餐**互斥**，且套餐百分比 >100 时条夹满、数字照实
+  const withBalance = costDetailModel({
+    cost: { standard: 1, peak: 1, idle: 0 },
+    account: { kind: 'balance', label: '余额', text: '¥12.34', source: 'route', payload: { official: true } },
+  })
+  const balanceSection = withBalance.sections.find((section) => section.label === '账户')
+  must(balanceSection !== undefined, '绑到官方余额时面板应有「账户」一节')
+  must(balanceSection.rows.some((row) => row.value === '¥12.34'), '账户一节要显示余额金额')
+  // 官方端点时不写「查询端点」那一行（那是噪音）；非官方才写
+  must(!balanceSection.rows.some((row) => row.label === '查询端点'), '官方端点时不该多写一行端点说明')
+  const nonOfficial = costDetailModel({
+    cost: { standard: 1, peak: 1, idle: 0 },
+    account: { kind: 'balance', label: '余额', text: '¥1.00', payload: { official: false } },
+  }).sections.find((section) => section.label === '账户')
+  must(nonOfficial.rows.some((row) => row.label === '查询端点'), '非官方端点时必须写出来（数字可能不对）')
+
+  const overQuota = costDetailModel({
+    cost: { standard: 1, peak: 1, idle: 0 },
+    account: {
+      kind: 'plan', planId: 'zhipu', label: '智谱', fullLabel: '智谱 GLM Coding Plan', source: 'route',
+      plan: { window: { window: 'fiveHour', label: '5 小时', exceeded: true }, percent: 140 },
+    },
+  }).sections.find((section) => section.label === '账户')
+  must(overQuota !== undefined, '绑到套餐时面板应有「账户」一节')
+  must(overQuota.rows[0].value === '140.0%',
+    '超限时数字必须照实显示 140.0%——夹到 100% 会把「已严重超限」伪装成「刚好用满」')
+  must(overQuota.rows[0].share === 1, '超限时占比条要夹到满（1），否则「已严重超限」会被画成「刚好用满」')
+  must(overQuota.rows[0].tone === 'red', '超限时应用警戒色')
+
+  // 6) 空模型不渲染空壳（浮层空壳会在页面上留一块看不见但挡点击的区域）
+  must(
+    renderToStaticMarkup(React.createElement(CostDetailPanel, {
+      model: costDetailModel({ cost: undefined, tokens: undefined }),
+    })) === '',
+    '什么数据都没有时面板不应渲染任何节点',
+  )
+  // 缓存写入为 0 时省掉那一行：写「0」会让人去找「为什么我没写入」
+  const noWrite = costDetailModel({ cost: { standard: 1, peak: 1, idle: 0 }, usage: { cacheReadTokens: 100, outputTokens: 50 } })
+  const noWriteHtml = renderToStaticMarkup(React.createElement(CostDetailPanel, { model: noWrite }))
+  must(!noWriteHtml.includes('缓存写入'), '缓存写入为 0 时应省掉那一行，而不是写一个 0')
+
+  // 7) 样式层面的断言放在文件后面（那里才取到 STYLES），见「费用详情面板的样式」一节
 }
 
 // 容器组件在服务端渲染下停在骨架，这里只要求它能渲染且不抛错
@@ -1791,6 +1964,37 @@ must(css.includes('tabular-nums'), '数字应保留 tabular-nums，保证并排�
   )
 }
 
+// ── 费用详情面板的样式 ─────────────────────────────────────────────
+//
+// 面板是**浮层**，因此它的样式规则与看板那张卡片不同（固定定位、按内容取宽、
+// 阴影更重）。这里钉三条最容易退化的：
+//   1. 占比条轨道不得铺 --px-surface-2（面板已是白「块」，再铺米色就成
+//      「白块里嵌色块」——用户报过的「东一块西一块」正是这样来的）；
+//   2. 面板要有入场动画，且被 prefers-reduced-motion 覆盖到；
+//   3. `.px-pill-button` 必须清掉浏览器按钮的默认外观，否则 dock 里会冒出一个
+//      灰底描边的方盒，与旁边两枚胶囊不是一套东西。
+{
+  must(/\.px-detail\s*\{/.test(css), '缺少 .px-detail 样式规则')
+  must(/\.px-pill-button\s*\{/.test(css), '缺少 .px-pill-button（可点击徽标）样式')
+  const clickBlock = /\.px-pill-button\s*\{([^}]*)\}/.exec(css)
+  must(
+    /appearance\s*:\s*none/.test(clickBlock[1]),
+    '.px-pill-button 必须清掉浏览器按钮默认外观（appearance: none），'
+    + '否则 dock 里会出现一个灰底描边的方盒，与旁边的统计胶囊不是一套',
+  )
+  const meterBlock = /\.px-detail-meter\s*\{([^}]*)\}/.exec(css)
+  must(meterBlock !== null, '缺少 .px-detail-meter（占比条轨道）样式')
+  must(
+    !/background(?:-color)?\s*:\s*var\(--px-surface-2\)/.test(meterBlock[1]),
+    '占比条轨道不得用 --px-surface-2：面板本身已是白色「块」，再铺米色就成「白块里嵌色块」',
+  )
+  must(/@keyframes px-detail-in/.test(css), '面板缺少入场动画（@keyframes px-detail-in）')
+  must(
+    /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[^}]*\.px-detail/.test(css),
+    '面板的动效必须被 prefers-reduced-motion 的降级规则覆盖到',
+  )
+}
+
 // ── 看板控件必须自己兜住圆角与过渡（删掉 SKIN 的直接后果）──────────────
 //
 // 删掉皮肤最容易被忽略的连带伤害：`.px-btn` / `.px-input` / `.px-seg-btn` 这几颗
@@ -1893,13 +2097,13 @@ must(
 // 深色必须真的重定义核心令牌，而不是只写个空块
 const darkBlock = /body\[data-ds-dark-theme\]\s*\{([\s\S]*?)\}/.exec(css)
 must(darkBlock !== null, '深色令牌块无法解析')
-for (const token of ['--px-ink', '--px-surface', '--px-surface-2', '--px-muted', '--px-label-tertiary']) {
+for (const token of ['--px-ink', '--px-surface', '--px-surface-2', '--px-muted', '--px-label-tertiary', '--px-detail-label']) {
   must(darkBlock[1].includes(token), `深色块里缺少 ${token} 的重定义`)
 }
 // 深浅两套取值必须不同：相同就说明只下发了一套配色
 const lightBlock = /:root\s*\{([\s\S]*?)\}/.exec(css)
 const valueOf = (block, name) => new RegExp(`${name}\\s*:\\s*([^;]+);`).exec(block)?.[1]?.trim()
-for (const token of ['--px-ink', '--px-surface', '--px-surface-2']) {
+for (const token of ['--px-ink', '--px-surface', '--px-surface-2', '--px-detail-label']) {
   const light = valueOf(lightBlock[1], token)
   const dark = valueOf(darkBlock[1], token)
   must(light !== undefined && dark !== undefined, `${token} 缺少明或暗取值`)
@@ -2111,6 +2315,9 @@ for (const level of ['ok', 'warn', 'error']) {
 {
   const { findTeamOf, memberNameOf, teamDetailText, teamSummaryOf } =
     await import(pathToFileURL(join(root, 'lib', 'client', 'team.js')).href)
+  // 面板模型：成员明细的断言打在这一层（title 已移除，详情改走可点击面板）
+  const { costDetailModel } = await import(pathToFileURL(join(root, 'lib', 'client', 'costDetail.js')).href)
+    await import(pathToFileURL(join(root, 'lib', 'client', 'team.js')).href)
   const { teamPillOf } = await import(pathToFileURL(join(root, 'lib', 'client', 'SessionCost.js')).href)
   const { formatCny, formatTokens } = await import(pathToFileURL(join(root, 'lib', 'client', 'format.js')).href)
   const format = { formatCny, formatTokens }
@@ -2150,22 +2357,38 @@ for (const level of ['ok', 'warn', 'error']) {
   must(summary.cost === 12.5, `团队合计应直接取宿主的值，实际 ${summary.cost}`)
   must(summary.tokens === 3_000_000)
 
-  // 4) 悬停内容必须真的按成员分列
+  // 4) 成员明细：**面板**必须真的按成员分列（title 已按用户要求移除）
+  const teamPanelModel = costDetailModel({
+    cost: { standard: 3, peak: 2, idle: 1 },
+    team: summary,
+  })
+  // 纯文本快照（不参与渲染）：一行一眼看清「成员名 + 金额都在」
   const detail = teamDetailText(summary)
-  must(detail.includes('团队合计'), `悬停说明里应写明这是团队合计：${detail}`)
-  must(detail.includes('2 位成员'), `悬停说明应写出人数：${detail}`)
-  must(detail.includes('researcher'), `悬停说明必须按成员分列，缺少成员名：${detail}`)
-  must(detail.includes('lead'), `lead 自己也要列出来，否则「其他成员」无从对照：${detail}`)
-  must(detail.includes('¥2.50') && detail.includes('¥10.00'),
-    `每位成员的金额都要出现（¥10.00 与 ¥2.50）：${detail}`)
-  must(detail.split('\n').length >= 3, `成员应逐行列出（标题行 + 每人一行）：${detail}`)
+  const memberSection = teamPanelModel.sections.find((section) => section.label.startsWith('成员'))
+  must(memberSection !== undefined,
+    `团队口径下面板应有「成员」一节：${JSON.stringify(teamPanelModel.sections.map((s) => s.label))}`)
+  must(memberSection.label.includes('2 位'), `成员一节要写出人数：${memberSection.label}`)
+  const memberLabels = memberSection.rows.map((row) => row.label).join(' ')
+  must(memberLabels.includes('researcher'), `成员一节必须按成员分列，缺少成员名：${memberLabels}`)
+  must(memberLabels.includes('lead'), `lead 自己也要列出来，否则「其他成员」无从对照：${memberLabels}`)
+  const memberValues = memberSection.rows.map((row) => row.value).join(' ')
+  must(memberValues.includes('¥10.00') && memberValues.includes('¥2.50'),
+    `每位成员的金额都要出现（¥10.00 与 ¥2.50）：${memberValues}`)
+  // 成员占比之和应当等于 1：「团队合计 = 成员之和」这条等式在界面侧的旁证
+  const shareSum = memberSection.rows.reduce((sum, row) => sum + Number(row.share ?? 0), 0)
+  must(Math.abs(shareSum - 1) < 0.001, `成员占比之和应为 1（合计即成员之和），实际 ${shareSum}`)
+  // 本次会话的钱不丢：团队口径下另有一节专门说它
+  must(teamPanelModel.sections.some((section) => section.label === '本次会话'),
+    '团队口径下本次会话的金额必须仍可见（面板里单列一节）')
 
   // 5) 徽标文案：标签是「团队合计」、角标是「团队」——不标的话两个 ¥ 并排没人分得清
   const pill = teamPillOf(summary)
   must(pill !== undefined, '团队口径应产出徽标文案')
   must(pill.tag === '团队', `角标必须写明这是团队口径，实际「${pill.tag}」`)
   must(pill.value === '¥12.50', `徽标数值应是团队合计，实际「${pill.value}」`)
-  must(pill.title.includes('researcher'), '悬停说明要一起进 title（静态渲染里读不到 tooltip）')
+  // 徽标**不再**产出 title：详情在面板里，保留两段文本一定会漂移
+  must(pill.title === undefined, 'teamPillOf 不得再产出 title（悬停裸浮窗已按需求移除）')
+  must(detail.split('\n').length >= 3, `成员应逐行列出（标题行 + 每人一行）：${detail}`)
 
   // 6) 缺成员 / 缺金额时不得渲染成 ¥0——「不知道」与「真的是 0」是两件事
   must(teamSummaryOf({ members: [] }, format) === undefined, '空成员列表不得产出团队口径')

@@ -18,6 +18,10 @@ dsh-web.log
 *.tgz
 *.tmp
 *.invalid
+# 视觉验收的截图与中间页（tools/visual-check.mjs 的产物）。
+# 它们是**给人看的一次性产物**：PNG 会随每次样式改动而变，提交进仓库只会
+# 让 diff 变得无法阅读。要留证据就贴进 PR/issue，不要进历史。
+/tmp/
 # 提交时用的临时消息文件（`git commit -F`）。用文件而不是 -m 是为了写多行说明，
 # 忘了删就会跟着提交进去——已经踩过三次（.git-msg*.txt、commit-msg.txt、.msg-2103.txt
 # 各一次），每次都以为「这次记得删」。**前两条是教训，第三条是模式**：

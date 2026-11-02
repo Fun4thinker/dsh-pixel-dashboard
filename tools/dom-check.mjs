@@ -973,5 +973,146 @@ const results = []
   results.push('费用条：只有官方 activity 时仍补上 token 总数（不误判成「官方已在显示」）')
 }
 
+// ── 10) 费用详情面板：点开、点外面/Esc 收起、且不污染 dock ─────────────
+//
+// 这一块**只能**在真实 DOM 里验：面板是 portal 到 `document.body` 的固定定位浮层，
+// 服务端渲染既不执行 effect 也没有 DOM，静态 HTML 里它永远不存在。而这里恰好有
+// 三类「代码看着对、DOM 是错的」的失败模式：
+//   1. 面板 portal 到了 dock 里 → 把横向行撑开、与官方胶囊抢宽度；
+//   2. 点徽标展不开（事件被 <span> 吃掉 / state 没接上）；
+//   3. 展得开收不起（点外面、Esc 都没反应）——那会留下一个永远悬着的浮层。
+{
+  const Cost = registrations.find((item) => item.spec?.name === 'conversation.composer.dock')?.component
+  must(Cost !== undefined, '找不到费用条组件')
+
+  // 费用来自宿主 `/dsh-pixel/data`（组件的 effect 会去取），因此这里必须把
+  // **那一条**也桩上。不桩的话组件会停在「折算中」，面板里就只有一句说明——
+  // 而这一关要验的正是「金额、分档、占比条都真的画出来了」。
+  // 同时保留余额/套餐的通用桩（它们返回空对象时组件会安静降级，不影响本关）。
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/dsh-pixel/data')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          version: 'test',
+          capabilities: ['sessionCost', 'agentTeam'],
+          sessions: [{ id: 'session-detail-panel', cost: { standard: 1.2345, peak: 0.8, idle: 0.4345 }, models: [] }],
+          models: [],
+          teams: [],
+        }),
+      }
+    }
+    return realFetch(url)
+  }
+
+  const dock = window.document.createElement('div')
+  dock.className = 'dock'
+  window.document.body.appendChild(dock)
+  const slot = window.document.createElement('div')
+  dock.appendChild(slot)
+
+  await renderInto(slot, React.createElement(Cost, {
+    sessionId: 'session-detail-panel',
+    useProjection: () => ({
+      // 分桶数字要全：面板的「用量构成」一节直接吃这份投影
+      val: {
+        totals: {
+          uncachedInputTokens: 3000,
+          outputTokens: 2000,
+          cacheReadTokens: 12000,
+          cacheWriteTokens: 1000,
+        },
+      },
+    }),
+  }))
+  await settle()
+
+  // 前提：面板默认收起。收起时 DOM 里不该有任何 .px-detail 节点
+  // （浮层留一个不可见的空壳会挡住下面的点击，而界面上完全看不出来）。
+  must(window.document.querySelector('.px-detail') === null, '详情面板默认必须收起')
+  const trigger = slot.querySelector('button.px-pill-button')
+  must(trigger !== null, '费用那一枚必须是可点击的 button（带 .px-pill-button）')
+  must(trigger.getAttribute('aria-expanded') === 'false', '收起时 aria-expanded 应为 false')
+
+  // 1) 点开：面板必须 portal 到 **body**，不能留在 dock 里
+  await React.act(async () => {
+    trigger.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+  })
+  await settle()
+
+  const panel = window.document.querySelector('.px-detail')
+  must(panel !== null, '点击费用徽标后应渲染出详情面板')
+  must(panel.getAttribute('role') === 'dialog', '面板应声明 role="dialog"')
+  must(trigger.getAttribute('aria-expanded') === 'true', '展开后 aria-expanded 应为 true')
+  // 关键位置断言：面板**不在** dock 里。在 dock 里会占横向 flex 的一格，
+  // 于是「看详情」这个动作会把官方胶囊挤窄——那正是这块踩过两次的坑。
+  must(!dock.contains(panel), '面板必须 portal 到 body，绝不能留在 dock 那一行里（会与官方胶囊抢宽度）')
+  must(panel.parentElement === window.document.body || panel.closest('.px-detail-anchor') !== null,
+    '面板应挂在 body 下（或其定位外壳里）')
+  // 外层定位壳必须是 fixed：否则它会以静态流插进 body 末尾，先在页面底部闪一下
+  const anchorShell = panel.closest('.px-detail-anchor')
+  must(anchorShell !== null, '面板应该有一个 .px-detail-anchor 定位外壳')
+  must(
+    String(anchorShell.getAttribute('style') ?? '').includes('fixed'),
+    '定位外壳必须是 position: fixed（面板 portal 到 body，静态流会把它插到页面底部）',
+  )
+
+  // 2) 内容：金额、分档、用量构成都要真的画出来（不是只写在 title 上）
+  must(panel.textContent.includes('本次会话'), '面板抬头应写明这是本次会话')
+  must(panel.textContent.includes('高峰时段') && panel.textContent.includes('空闲时段'),
+    '面板要分档列出高峰与空闲')
+  must(panel.textContent.includes('缓存命中率'), '面板要给出缓存命中率')
+  // 12000 / (12000+3000+1000) = 75.0%
+  must(panel.textContent.includes('75.0%'), `缓存命中率应按计费输入算（75.0%），实际：${panel.textContent}`)
+  // 占比条真的画了：带内联宽度的填充块
+  const fill = panel.querySelector('.px-detail-meter-fill')
+  must(fill !== null, '带比例的行应画出占比条')
+  must(String(fill.getAttribute('style') ?? '').includes('width'),
+    '占比条填充必须带内联宽度（否则恒为 0 宽，等于没画）')
+
+  // 3) 点面板内部**不**收起（用户要能在里面选中金额复制）
+  await React.act(async () => {
+    panel.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true }))
+  })
+  await settle()
+  must(window.document.querySelector('.px-detail') !== null, '点在面板内部不该收起面板')
+
+  // 4) 点外面收起
+  await React.act(async () => {
+    window.document.body.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true }))
+  })
+  await settle()
+  must(window.document.querySelector('.px-detail') === null, '点面板之外应收起面板')
+  must(trigger.getAttribute('aria-expanded') === 'false', '收起后 aria-expanded 应回到 false')
+
+  // 5) 再点开，Esc 收起——`role="dialog"` 的浮层必须能用键盘关掉
+  await React.act(async () => {
+    trigger.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+  })
+  await settle()
+  must(window.document.querySelector('.px-detail') !== null, '第二次点击应能重新展开')
+  await React.act(async () => {
+    window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  })
+  await settle()
+  must(window.document.querySelector('.px-detail') === null, 'Esc 应能收起面板（无障碍的最低要求）')
+
+  // 6) 不抢宽度：展开前后 dock 里我们那一项的声明宽度不变，且没有 width:100%
+  const group = slot.querySelector('.px-pill-group')
+  must(group !== null, '费用条应渲染 .px-pill-group')
+  must(
+    !String(group.getAttribute('style') ?? '').includes('100%'),
+    '展开面板不得改变 dock 里那一项的宽度声明（面板是独立的浮层，与这一行无关）',
+  )
+
+  await unmountAll()
+  dock.remove()
+  globalThis.fetch = realFetch
+  results.push('费用详情面板：点击展开 + 点外面/Esc 收起，且不 portal 进 dock（不抢官方宽度）')
+  results.push('费用详情面板：金额、分档、缓存命中率、占比条都真的画出来了')
+}
+
 console.log('真实 DOM 闸门（jsdom）通过：')
 for (const line of results) console.log(`  ✓ ${line}`)

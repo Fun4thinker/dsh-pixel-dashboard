@@ -27,6 +27,8 @@ const outFile = join(outDir, 'client.js')
 const MODULES = [
   'format.js',
   'cost.js',
+  // 费用详情面板的纯数据模型：`SessionCost.js` 依赖它，因此必须排在它之前。
+  'costDetail.js',
   'rates.js',
   'balance.js',
   'plans.js',
