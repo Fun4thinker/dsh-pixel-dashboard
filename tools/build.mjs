@@ -36,7 +36,7 @@ const outDir = join(root, 'lib')
  * **新增宿主模块必须登记到这里**，否则它不会被复制进 lib/——而失败形态是运行时
  * `ERR_MODULE_NOT_FOUND`（构建本身成功，装到 profile 里才炸）。因此这里列全。
  */
-const HOST_SOURCES = ['host.js', 'pricing.js', 'holidays.js', 'ledger.js', 'balance.js', 'plans.js', 'volc-sign.js', 'prefs.js', 'notify.js', 'custom-rates.js']
+const HOST_SOURCES = ['host.js', 'pricing.js', 'holidays.js', 'ledger.js', 'balance.js', 'plans.js', 'volc-sign.js', 'prefs.js', 'notify.js', 'custom-rates.js', 'timing.js']
 
 /**
  * 由宿主源码内容算出的短哈希，用作实现版本号。

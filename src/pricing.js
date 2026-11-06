@@ -152,7 +152,167 @@ export const MODEL_RATES = {
     cacheMiss: { peak: 1, idle: 1 },
     output: { peak: 3, idle: 3 },
   },
+  // ── 阿里云百炼 / 千问（元 / 百万 token，**中国内地**官方价）──────────
+  // 来源：https://www.alibabacloud.com/help/zh/model-studio/model-pricing
+  // （更新时间 2026-11-05，取「华北2（北京）」小节）
+  //
+  // ## 为什么统一取中国内地
+  //
+  // 千问的价目**同时**受三个维度影响：地域（北京 / 新加坡 / 香港 / 法兰克福 /
+  // 弗吉尼亚 / 东京）、阶梯（按单次请求输入 token 数分档）、限时折扣。
+  // 同一个 `qwen3.8-max` 在官网能看到 $1.650/$4.951（北京）、$2/$6（新加坡）、
+  // $0.345/$1.377（qwen-max 内地特例）等不同价。
+  //
+  // 而**账本里没有地域信息**（DSH 事件只给模型名与 token 数），任何取值都只能是
+  // 「某一条件下」的价。这里统一按**中国内地（北京）标准价**接入——使用这套插件
+  // 的场景绝大多数走国内节点；同时保留 `tiered: true`，让界面注明「按最低档估算」，
+  // 与 GLM-4.6V 的处理一致：宁可标注不精确，也不假装精确。
+  //
+  // 缓存命中：官方口径为**标准输入价的 10%**（显式缓存创建为 125%），
+  // 这里按 10% 计——与其它厂商的 cacheHit 口径一致，不额外建模创建费。
+  //
+  // 价格直接取国内站的人民币整数价（platform.qianwenai.com/pricing/api），
+  // **不做美元折算**——折算会把 ¥12 变成 11.88 这种脏数字，且与用户账单对不上。
+  'qwen3.8-max': {
+    label: 'Qwen3.8-Max',
+    vendor: '千问',
+    version: 'qwen3.8-max',
+    flat: true,
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 32_768,
+    // 国内站（platform.qianwenai.com/pricing/api）：¥12 / ¥36 / 缓存命中 ¥1.5
+    cacheHit: { peak: 1.5, idle: 1.5 },
+    cacheMiss: { peak: 12, idle: 12 },
+    output: { peak: 36, idle: 36 },
+  },
+  'qwen3.7-max': {
+    label: 'Qwen3.7-Max',
+    vendor: '千问',
+    version: 'qwen3.7-max',
+    flat: true,
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 32_768,
+    // 国内站：¥12 / ¥36 / 缓存命中 ¥2.4（注意与 3.8-max 的 1.5 不同）
+    cacheHit: { peak: 2.4, idle: 2.4 },
+    cacheMiss: { peak: 12, idle: 12 },
+    output: { peak: 36, idle: 36 },
+  },
+  'qwen3.8-flash': {
+    label: 'Qwen3.8-Flash',
+    vendor: '千问',
+    version: 'qwen3.8-flash',
+    flat: true,
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 32_768,
+    // 国内站：¥0.8 / ¥2.7 / 缓存命中 ¥0.1
+    cacheHit: { peak: 0.1, idle: 0.1 },
+    cacheMiss: { peak: 0.8, idle: 0.8 },
+    output: { peak: 2.7, idle: 2.7 },
+  },
+  'qwen3.7-plus': {
+    label: 'Qwen3.7-Plus',
+    vendor: '千问',
+    version: 'qwen3.7-plus',
+    flat: true,
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 32_768,
+    // 国内站：原价 ¥2 / ¥8 / 缓存 ¥0.4；限时 8 折 → ¥1.6 / ¥6.4 / ¥0.32（0<Token≤256K）
+    // 取**折后价**：用户当前实际扣费按 8 折算，按原价会高估 25%。
+    cacheHit: { peak: 0.32, idle: 0.32 },
+    cacheMiss: { peak: 1.6, idle: 1.6 },
+    output: { peak: 6.4, idle: 6.4 },
+  },
+  // qwen-max 是内地**特例价**：国内 $0.345 / $1.377，与国际站 $1.6 / $6.4 差 4 倍多。
+  // 单独列一条而不是折进 qwen3.8-max，否则国内用户按国际价算会高估近 5 倍。
+  'qwen-max': {
+    label: 'Qwen-Max',
+    vendor: '千问',
+    version: 'qwen-max',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 8_192,
+    // 北京（中国内地）：$0.345 / $1.377，无阶梯
+    cacheHit: { peak: 0.2484, idle: 0.2484 },
+    cacheMiss: { peak: 2.484, idle: 2.484 },
+    output: { peak: 9.9144, idle: 9.9144 },
+  },
+  // qwen3.7-flash 按**输入长度三档**计价（国内站）：
+  //   ≤32K        ¥0.2  / ¥0.8  / 缓存 ¥0.04
+  //   32K–256K    ¥0.6  / ¥2.4  / 缓存 ¥0.12
+  //   256K–1M     ¥1.2  / ¥4.8  / 缓存 ¥0.24
+  // 账本里没有逐请求输入长度，只能取最低档并标 tiered（与 GLM-4.6V 同一处理）。
+  // 这一条尤其要标清楚：取错档会低估 6 倍。
+  'qwen3.7-flash': {
+    label: 'Qwen3.7-Flash',
+    vendor: '千问',
+    version: 'qwen3.7-flash',
+    flat: true,
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 32_768,
+    cacheHit: { peak: 0.04, idle: 0.04 },
+    cacheMiss: { peak: 0.2, idle: 0.2 },
+    output: { peak: 0.8, idle: 0.8 },
+  },
+  // ── OpenAI GPT（元 / 百万 token，按 7.2 折算）────────────────────
+  // 来源：https://developers.openai.com/api/docs/pricing.md（Standard 档）
+  //
+  // 只录 Standard：Batch 五折、Fast/Ultrafast 加价、长上下文（>272K）另有档位，
+  // 而账本里没有这些标识，录进来只会让「按什么价算的」变成谜。
+  //
+  // gpt-5.6-terra 是本机账本里**真实出现**的模型（provider: openai-codex），
+  // 早先没有条目，它一直被按 Flash 兜底价标成「估算价」——数字有、只是错的。
+  'gpt-5.6-terra': {
+    label: 'GPT-5.6 Terra',
+    vendor: 'OpenAI',
+    version: 'gpt-5.6-terra',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $2.00 / $12.00 / cached $0.20
+    cacheHit: { peak: 1.44, idle: 1.44 },
+    cacheMiss: { peak: 14.4, idle: 14.4 },
+    output: { peak: 86.4, idle: 86.4 },
+  },
+  'gpt-5.6-sol': {
+    label: 'GPT-5.6 Sol',
+    vendor: 'OpenAI',
+    version: 'gpt-5.6-sol',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $4.00 / $20.00 / cached $0.40
+    cacheHit: { peak: 2.88, idle: 2.88 },
+    cacheMiss: { peak: 28.8, idle: 28.8 },
+    output: { peak: 144, idle: 144 },
+  },
+  'gpt-5.6-luna': {
+    label: 'GPT-5.6 Luna',
+    vendor: 'OpenAI',
+    version: 'gpt-5.6-luna',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $0.20 / $1.20 / cached $0.02
+    cacheHit: { peak: 0.144, idle: 0.144 },
+    cacheMiss: { peak: 1.44, idle: 1.44 },
+    output: { peak: 8.64, idle: 8.64 },
+  },
 }
+
+/**
+ * 未知厂商的模型**不会**被 `MODEL_RATES` 认出来，此时落到 {@link FALLBACK_RATES}。
+ *
+ * 这正是本机账本里 `gpt-5.6-terra` 的处境：它有真实用量，但内置表没有它，
+ * 于是被标成「估算价」并按 Flash 折算——数字有、不报错，只是不对。
+ * 想改对有两个入口：
+ *   1) 在面板里填「自定义单价」（写入 `custom-rates.json`，见 custom-rates.js）；
+ *   2) 给本项目提 PR 把官方价补进 `MODEL_RATES`。
+ */
 
 /**
  * 未知模型的兜底价：按 Flash 计，避免看板出现空洞。
@@ -189,6 +349,28 @@ export const MODEL_ALIASES = {
   'glm-5-turbo': 'glm-5.3-flash',
   'glm-4.7': 'glm-5.3-flash',
   'glm-5v-turbo': 'glm-5.3-flash',
+  // ── 千问：官方模型 ID 带日期后缀（`qwen3.8-max-0902`），不同网关还会加
+  // `qwen/` 前缀。这些写法指向**同一个计价模型**，不折叠就会各自变成一行
+  // 「估算价」，而官方并没有给它们单独定价。
+  'qwen3.8-max-0902': 'qwen3.8-max',
+  'qwen3.7-max-2026-06-08': 'qwen3.7-max',
+  'qwen3.7-max-2026-05-20': 'qwen3.7-max',
+  'qwen3.7-max-preview': 'qwen3.7-max',
+  'qwen3.7-plus-2026-05-26': 'qwen3.7-plus',
+  'qwen3.6-plus': 'qwen3.7-plus',
+  'qwen3.6-plus-2026-04-02': 'qwen3.7-plus',
+  'qwen3.8-flash-0902': 'qwen3.8-flash',
+  'qwen/qwen3.8-max': 'qwen3.8-max',
+  'qwen/qwen3.7-max': 'qwen3.7-max',
+  'qwen/qwen3.8-flash': 'qwen3.8-flash',
+  'qwen/qwen3.7-plus': 'qwen3.7-plus',
+  'qwen3.8-2.4t-a95b': 'qwen3.8-max',
+  'qwen3.7-flash-2026-07-15': 'qwen3.7-flash',
+  // ── OpenAI：网关常带 openai/ 前缀，或写成版本化 id ──────────────
+  'openai/gpt-5.6-terra': 'gpt-5.6-terra',
+  'openai/gpt-5.6-sol': 'gpt-5.6-sol',
+  'openai/gpt-5.6-luna': 'gpt-5.6-luna',
+  'gpt-5.6-terra-2026': 'gpt-5.6-terra',
 }
 
 /**
@@ -917,7 +1099,16 @@ export function periodState(epochMs, timeZone = DEFAULT_TIMEZONE) {
  *
  * 口径正确性的关键：历史用量必须按它当时处于高峰还是空闲来计价，
  * 不能把整段用量套同一个折扣。
- * @param {{cacheHit:number,cacheMiss:number,output:number}} usage - token 数。
+ *
+ * ## 缓存写入按 1.25 × 命中价计（差点一直漏掉）
+ *
+ * 官方对 DeepSeek 的缓存写入口径是「按标准输入价的 1.25 倍」；而价目表里
+ * `cacheHit` 是**命中**价（标准输入的 10%）。因此写入不能直接乘 `cacheHit`，
+ * 折成命中价的倍率是 12.5 倍——用 12.5 × cacheHit 来表达。
+ *
+ * 早先这里**完全没算 cacheWrite**：长会话里写缓存的那部分成本被静默漏掉，
+ * 金额偏小且不报错——正是本项目最忌讳的那类错。现在显式计入。
+ * @param {{cacheHit:number,cacheMiss:number,cacheWrite?:number,output:number}} usage - token 数。
  * @param {object} rates - 价目表条目。
  * @param {'peak'|'idle'} period - 该笔用量所属时段。
  * @returns {number} 金额（元）。
@@ -927,6 +1118,8 @@ export function costOf(usage, rates, period) {
   return (
     (Number(usage.cacheHit ?? 0) / million) * rates.cacheHit[period]
     + (Number(usage.cacheMiss ?? 0) / million) * rates.cacheMiss[period]
+    // 缓存写入 = 1.25 × 标准输入价；cacheHit 是 0.1 × 标准输入价 → 12.5 倍。
+    + (Number(usage.cacheWrite ?? 0) / million) * rates.cacheHit[period] * 12.5
     + (Number(usage.output ?? 0) / million) * rates.output[period]
   )
 }

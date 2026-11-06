@@ -68,6 +68,11 @@ const TOKENS = `
   --px-pink: #f2a8c4;
   --px-pink-deep: #d9739b;
   --px-pink-soft: #fdeef4;
+  /* 会话详情的强调色：浅色下用粉（与看板主色一致）。
+     深色下换成紫——粉色在暗底上偏灰、像脏掉的高光，紫色同族但更清透。 */
+  --px-detail-accent: #d9739b;
+  --px-detail-accent-soft: #fdeef4;
+  --px-detail-accent-line: #f2a8c4;
   --px-blue: #9ed3f5;
   --px-blue-deep: #5a9fd4;
   --px-green: #b3e59c;
@@ -130,6 +135,10 @@ body[data-ds-dark-theme] {
   --px-detail-label: #acb5cd;
 
   --px-pink-soft: #3a2b34;
+  /* 详情强调色在深色下走紫：见浅色处说明。 */
+  --px-detail-accent: #c3aef0;
+  --px-detail-accent-soft: #2f2b45;
+  --px-detail-accent-line: #8b6cc4;
   /* 深色下这几个「深色强调色」要反向变亮：它们用在文字与描边上
      （如 .px-links a:hover），沿用浅色深号会在暗底上糊成一团。 */
   --px-pink-deep: #f0a8c4;
@@ -637,7 +646,11 @@ const DASHBOARD = `
    标题可能很长（模型生成的标题是一句话），因此这一列要能被压缩并省略——
    表格用 min-width: 0 + text-overflow 才生效（默认的 table 布局会撑开）。 */
 .px-session-table { table-layout: auto; }
-.px-session-cell {
+/* **不要**把 display:flex 加在 td 上：td 一旦脱离表格布局，
+   该列的剩余宽度就不再被它占据，于是展开行的粉色底只铺到文字处，
+   右侧露出一块刺眼的白（用户报的「条目里缺一块」就是它）。
+   正确做法是 td 保持表格单元格，flex 放进内层 div。 */
+.px-session-cell-inner {
   display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
   max-width: 420px;
 }
@@ -659,6 +672,202 @@ const DASHBOARD = `
   color: var(--px-muted);
   white-space: nowrap;
 }
+
+/* 可点的标题：点它跳到那条会话。用下划线提示「这里是一个动作」，
+   靠 hover 变色确认，而不是整行变色——整行点的是「展开」。 */
+.px-session-link { cursor: pointer; }
+.px-session-link:hover { text-decoration: underline; text-underline-offset: 2px; }
+.px-session-link:focus-visible {
+  outline: 2px solid var(--px-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.px-session-row { cursor: pointer; }
+/* 展开状态：**不铺底色**——详情区本身已经是一块内容区，整行再加底色会叠成
+   两层色块（正是用户说的「东一块西一块」）。改用左侧色条 + 标题加粗。 */
+.px-session-row-open > td:first-child {
+  box-shadow: inset 3px 0 0 var(--px-accent);
+}
+.px-session-when { color: var(--px-muted); white-space: nowrap; }
+
+/* ============================================================
+   会话详情的视觉设计（第二轮重做）
+
+   用户对上一版的评价是「底色还是很丑、没有视觉重点、看不出收起展开」。
+   因此这一版按三条重来：
+
+   1) **白 + 粉**：详情区底色用白色（与页面唯一的「块」一致），
+      只在顶部叠一层极淡的粉色晕染作为「这是同一行的延续」的信号；
+      强调色统一用马卡龙粉（--px-pink-deep），不再铺奶油色底。
+   2) **层级靠字号与留白**：四个主打指标（金额/Token/时长/工具）用大号数字，
+      其余明细是安静的标签-值行——上一版把所有数字做成同样大小，所以没有落点。
+   3) **状态可发现**：行首折叠箭头（▸/▾）表达「能点」，hover 换底色；
+      团队用标签页切换成员，不再拆成多行。
+   ============================================================ */
+
+/* 行首折叠箭头：可发现性的唯一落点，给了明确的 12px 槽位与转动动画。 */
+.px-session-chev { width: 18px; padding-right: 0 !important; }
+.px-chev {
+  display: inline-block;
+  color: var(--px-muted);
+  font-size: 10px; line-height: 1;
+  transition: transform var(--px-dur) var(--px-ease), color var(--px-dur) var(--px-ease);
+}
+.px-chev-open { transform: rotate(90deg); color: var(--px-detail-accent); }
+.px-session-row:hover .px-chev { color: var(--px-detail-accent); }
+
+/* 行 hover：告诉用户整行可点。展开行用左侧粉色条标出位置，
+   不铺底色（铺了会与详情区叠成两层色块）。 */
+.px-session-row { cursor: pointer; transition: background var(--px-dur) var(--px-ease); }
+.px-session-row:hover > td { background: var(--px-hover, rgba(0, 0, 0, .02)); }
+/* 展开行：整行铺**淡强调色**。同一时刻只展开一行，所以不会出现满屏碎色块；
+   用底色而不是只画侧条，是因为用户明确要「区分其他收起态的条目」。 */
+.px-session-row-open > td { background: var(--px-detail-accent-soft); }
+.px-session-row-open > td:first-child { box-shadow: inset 3px 0 0 var(--px-detail-accent); }
+.px-session-when { color: var(--px-muted); white-space: nowrap; }
+
+/* ── 详情容器：白底 + 顶部粉色晕染 ─────────────────────────────── */
+.px-session-detail-row > td { padding: 0; border-top: 0; }
+.px-session-detail {
+  padding: 16px 18px 18px;
+  background:
+    linear-gradient(180deg, var(--px-detail-accent-soft) 0, transparent 120px),
+    var(--px-surface);
+  /* **不要 border-top**（用户：条目与详情之间那条黑线去掉）：上一行的粉色底
+     已经把两者分开了，再压一条实边会变成一道生硬的缝。 */
+  border-left: 3px solid var(--px-detail-accent);
+}
+
+/* ── 成员标签页 ───────────────────────────────────────────────── */
+.px-dtabs {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--px-line);
+}
+.px-dtab {
+  appearance: none;
+  padding: 5px 12px;
+  font: inherit; font-size: 12px; font-weight: 550;
+  color: var(--px-ink-2);
+  background: var(--px-surface);
+  border: 1px solid var(--px-line);
+  border-radius: var(--px-r-pill);
+  cursor: pointer;
+  transition: all var(--px-dur) var(--px-ease);
+}
+.px-dtab:hover { border-color: var(--px-detail-accent-line); color: var(--px-detail-accent); }
+.px-dtab-on {
+  color: var(--px-detail-accent);
+  background: var(--px-detail-accent-soft);
+  border-color: var(--px-detail-accent-line);
+  font-weight: 650;
+}
+
+/* ── 四个主打指标：第一眼的落点 ───────────────────────────────── */
+.px-heroes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.px-hero {
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 11px 13px 10px;
+  background: var(--px-surface);
+  border: 1px solid var(--px-line);
+  border-left: 3px solid var(--px-accent);
+  border-radius: var(--px-r-md);
+  box-shadow: var(--px-elev-1);
+  min-width: 0;
+  --px-accent: var(--px-detail-accent);
+}
+.px-hero-accent { --px-accent: var(--px-detail-accent); }
+.px-hero-blue { --px-accent: var(--px-tone-blue); }
+.px-hero-green { --px-accent: var(--px-tone-green); }
+.px-hero-purple { --px-accent: var(--px-tone-purple); }
+.px-hero-label {
+  font-size: 11px; font-weight: 550; color: var(--px-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.px-hero-value {
+  font-family: var(--px-num-font);
+  font-size: 23px; line-height: 1.15; letter-spacing: .3px;
+  font-variant-numeric: tabular-nums;
+  color: var(--px-ink);
+}
+.px-hero-foot {
+  font-size: 10.5px; color: var(--px-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+
+/* ── 两栏明细：安静的标签-值行，靠虚线分隔而不是每项一张卡 ───────── */
+.px-dcols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+  gap: 6px 28px;
+  margin-bottom: 14px;
+}
+.px-dcol { min-width: 0; }
+.px-dcol-title {
+  display: block; margin-bottom: 6px;
+  font-size: 11px; font-weight: 650; letter-spacing: .05em;
+  color: var(--px-muted);
+}
+.px-drow {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 14px;
+  padding: 5px 0;
+  border-bottom: 1px dashed var(--px-line);
+  font-size: 12px;
+}
+.px-drow:last-child { border-bottom: 0; }
+.px-drow-label {
+  display: flex; align-items: center; gap: 7px;
+  color: var(--px-muted);
+  min-width: 0;
+}
+.px-drow-value {
+  font-family: var(--px-num-font);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--px-ink);
+  text-align: right;
+  word-break: break-word;
+}
+/* 语义色点：与 hero 的色条同一套颜色，于是「这数属于哪类」不用读文字 */
+.px-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+.px-dot-pink { background: var(--px-pink); }
+.px-dot-blue { background: var(--px-tone-blue); }
+.px-dot-green { background: var(--px-tone-green); }
+.px-dot-purple { background: var(--px-tone-purple); }
+.px-dot-yellow { background: var(--px-tone-yellow); }
+.px-dot-accent { background: var(--px-detail-accent); }
+
+/* ── 峰时/闲时：两段都画出来，两端百分比上色 ──────────────────── */
+.px-dpeak { max-width: 520px; }
+.px-dpeak-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  margin-bottom: 7px;
+}
+.px-dpeak-split { display: flex; gap: 12px; font-size: 11.5px; }
+.px-peak-bar {
+  display: flex;
+  height: 10px; border-radius: var(--px-r-pill);
+  background: var(--px-surface-2);
+  border: 1px solid var(--px-line);
+  overflow: hidden;
+}
+.px-peak-fill {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, var(--px-yellow-deep), var(--px-yellow));
+  transition: width .25s var(--px-ease);
+}
+.px-peak-rest { display: block; flex: 1; height: 100%; background: var(--px-tone-blue); opacity: .22; }
+.px-peak-peak { color: var(--px-yellow-deep); font-weight: 600; }
+.px-peak-idle { color: var(--px-tone-blue); font-weight: 600; }
+
+
 
 .px-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 12px; }
 .px-grid-2 .px-panel { margin-bottom: 12px; }
@@ -1724,6 +1933,106 @@ const DASHBOARD = `
     animation-duration: 1ms !important;
     transition-duration: 1ms !important;
   }
+}
+
+/* ── 展开/收起过渡 ───────────────────────────────────────────────────
+   详情行只在展开时渲染（条件渲染），所以这里做的是**入场动画**：
+   淡入 + 轻微上移。比高度动画更稳——详情内容由异步数据驱动，
+   测量高度往往拿到 0，硬做 height 过渡会跳。
+   220ms + 项目既有 --px-ease，与其它交互的手感一致。 */
+.px-session-detail-row > td { padding: 0; border: 0; }
+.px-session-detail {
+  animation: px-detail-in 220ms var(--px-ease) both;
+}
+@keyframes px-detail-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+
+
+/* ── 耗时构成：横向堆叠条 + 图例 ─────────────────────────────────────
+   上一版是环形图，用户明确说不喜欢——环形要顺着弧长目测比例，读数成本高。
+   换成一条横向堆叠条：谁占得多一眼可见，且与「请求分布」那条同一种语言。
+   布局是三段式：左端总时长锚点 / 中间堆叠条 / 下方图例。 */
+.px-timing {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 20px;
+  align-items: center;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  background: var(--px-surface);
+  border: 1px solid var(--px-line);
+  border-radius: var(--px-r-lg);
+}
+@media (max-width: 560px) {
+  /* 窄屏：总时长与条上下排，否则条会被压得没法读比例。 */
+  .px-timing { grid-template-columns: 1fr; }
+}
+.px-timing-total {
+  display: flex; flex-direction: column; gap: 1px;
+  min-width: 108px;
+}
+.px-timing-total b {
+  font-family: var(--px-num-font);
+  font-size: 22px; line-height: 1.15; letter-spacing: .3px;
+  font-variant-numeric: tabular-nums;
+  color: var(--px-ink);
+}
+.px-timing-total span { font-size: 10.5px; color: var(--px-muted); }
+.px-timing-avg { font-variant-numeric: tabular-nums; }
+.px-timing-main { min-width: 0; }
+.px-timing-bar {
+  display: flex;
+  height: 12px;
+  border-radius: var(--px-r-pill);
+  overflow: hidden;
+  background: var(--px-surface-2);
+  border: 1px solid var(--px-line);
+}
+.px-timing-seg { display: block; height: 100%; }
+.px-timing-seg-yellow { background: var(--px-yellow); }
+.px-timing-seg-blue { background: var(--px-tone-blue); }
+.px-timing-seg-green { background: var(--px-tone-green); }
+.px-timing-legend {
+  display: flex; flex-wrap: wrap; gap: 6px 18px;
+  margin-top: 8px;
+}
+.px-timing-item {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px;
+}
+.px-timing-item-name { color: var(--px-ink-2); }
+.px-timing-item-pct {
+  font-family: var(--px-num-font);
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  color: var(--px-ink);
+}
+.px-timing-item-ms {
+  font-family: var(--px-num-font);
+  font-variant-numeric: tabular-nums;
+  color: var(--px-muted);
+}
+/* 三段各自的色点：与堆叠条同色，于是「哪一段对应哪一行」不用配对读。 */
+.px-tdot { width: 7px; height: 7px; border-radius: 2px; flex: none; }
+.px-tdot-yellow { background: var(--px-yellow); }
+.px-tdot-blue { background: var(--px-tone-blue); }
+.px-tdot-green { background: var(--px-tone-green); }
+.px-timing-note {
+  margin: 7px 0 0;
+  font-size: 10.5px; line-height: 1.5;
+  color: var(--px-muted);
+}
+/* 空态：没有 step 计时时给一句解释，而不是留一块空白。 */
+.px-timing-empty {
+  display: block;
+  padding: 12px 16px;
+}
+.px-timing-empty-title {
+  display: block; margin-bottom: 3px;
+  font-size: 11px; font-weight: 650; color: var(--px-muted);
 }
 `
 

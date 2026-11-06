@@ -161,6 +161,77 @@ export function shortDate(key) {
   return `${Number(parts[1])}/${Number(parts[2])}`
 }
 
+/**
+ * 毫秒 → 人类可读时长（与 {@link formatSpan} 同一套单位，但入参是**时长**而非两端）。
+ *
+ * 分开写而不是复用 `formatSpan`：那边收的是「首末时刻」，语义是跨度；这里收的是
+ * 一堆累计毫秒（总等待、平均每轮），混用会让「0 表示没有数据」这条约定失真——
+ * 累计 0 毫秒是**合法值**（真的没等），而 `formatSpan(0,0)` 表示没有数据。
+ * @param {number} ms - 时长（毫秒）。
+ * @returns {string} 时长文本；负数或非数字返回 `—`。
+ */
+export function formatDurationMs(ms) {
+  const value = Number(ms)
+  if (!Number.isFinite(value) || value < 0) return '—'
+  const seconds = Math.round(value / 1000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  if (minutes < 60) return rest === 0 ? `${minutes}m` : `${minutes}m${rest}s`
+  const hours = Math.floor(minutes / 60)
+  const restMinutes = minutes % 60
+  return restMinutes === 0 ? `${hours}h` : `${hours}h${restMinutes}m`
+}
+
+/**
+ * 峰时 / 闲时的占比（按**请求数**，不是按 token）。
+ *
+ * ## 为什么按请求数
+ *
+ * 用户要看的是「我的使用有多少落在贵时段」。按 token 会把一个超长请求的权重放大到
+ * 掩盖其它所有请求；按请求数才对应「我有多少次调用是在峰时」这个原始问题。
+ * 金额另有单独的字段呈现，两者互补。
+ *
+ * 无数据时返回 `undefined`——调用方显示 `—`，而不是画一条 0% 的空条。
+ * @param {object|undefined} totals - 会话的 totals（含 peak / idle 分档）。
+ * @returns {{peak:number,idle:number,peakRatio:number}|undefined} 峰值与占比。
+ */
+export function peakShare(totals) {
+  const peak = Number(totals?.peak?.requests ?? 0)
+  const idle = Number(totals?.idle?.requests ?? 0)
+  const total = peak + idle
+  if (!Number.isFinite(total) || total <= 0) return undefined
+  return { peak, idle, peakRatio: peak / total }
+}
+
+/**
+ * 一段跨度 → 人类可读的时长（`12s` / `3m27s` / `1h26m`）。
+ *
+ * 这是「用量视角」里最容易读歪的一个数，因此规则写死在这里：
+ *   - 两端任一为 0（没有数据）就返回 `—`，**不返回 `0s`**——「不知道」与「零秒」
+ *     是两件事，把前者显示成后者会让整列数字失去意义；
+ *   - 负值（时钟回拨 / 日志乱序）同样按无数据处理；
+ *   - 只保留两级单位：`1h26m` 够用，`1h26m13s` 在表格里反而难扫读。
+ * @param {number} firstAt - 起始时刻（毫秒）。
+ * @param {number} lastAt - 结束时刻（毫秒）。
+ * @returns {string} 时长文本；无数据时为 `—`。
+ */
+export function formatSpan(firstAt, lastAt) {
+  const from = Number(firstAt)
+  const to = Number(lastAt)
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from <= 0 || to <= 0) return '—'
+  const ms = to - from
+  if (ms < 0) return '—'
+  const seconds = Math.round(ms / 1000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  if (minutes < 60) return rest === 0 ? `${minutes}m` : `${minutes}m${rest}s`
+  const hours = Math.floor(minutes / 60)
+  const restMinutes = minutes % 60
+  return restMinutes === 0 ? `${hours}h` : `${hours}h${restMinutes}m`
+}
+
 /** 时刻 → 站点时区下的 `MM-DD HH:MM`。 */
 export function formatDateTime(epochMs, timeZone) {
   if (!epochMs) return '—'

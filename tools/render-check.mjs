@@ -2355,6 +2355,10 @@ must(
     '.px-seg',            // 分段控件的凹槽（滑块是白的，浮在里面）
     '.px-barrow-track',   // 进度条轨道（填充部分才是内容）
     '.px-table th',       // 表头（唯一一处「整行凹进」的表格语义）
+    // 峰时/闲时占比条与耗时构成条：都是轨道（填充段才是内容），
+    // 与 .px-barrow-track 同一语义——不是「一整块色块」。
+    '.px-peak-bar',
+    '.px-timing-bar',
   ]
   const users = []
   for (const m of css.matchAll(/(^|\n)([^\n{}@/][^\n{}]*)\{([^{}]*)\}/g)) {
@@ -2623,6 +2627,11 @@ for (const level of ['ok', 'warn', 'error']) {
 }
 // 会话清单里的团队徽标：`role` 只有新宿主才给，但两者都必须可见——
 // 否则同一件事被拆成三行独立会话，用户看不出它们是一起的。
+//
+// **第二版起成员不再单独成行**（用户要求）：lead 行标出成员数，
+// 成员本身只在展开后的标签页里出现。这条断言因此改验两件事：
+//   1) lead 行写明了「团队 · N 名成员」（不展开就知道有没有团队）；
+//   2) 成员名**不出现在收起态**（它是标签页内容，不该挤进表格）。
 {
   const { SessionTable } = await import(pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
   const tablePayload = buildPayload()
@@ -2636,8 +2645,10 @@ for (const level of ['ok', 'warn', 'error']) {
     ],
     timezone: tablePayload.timezone,
   }))
-  must(teamHtml.includes('团队'), `lead 会话应标出「团队」，实际：${teamHtml.slice(0, 400)}`)
-  must(teamHtml.includes('researcher'), 'teammate 会话应标出它的团队名')
+  must(teamHtml.includes('团队 · 1 名成员'),
+    `lead 行应写明成员数（用户：这个会话有没有用团队也不知道），实际：${teamHtml.slice(0, 400)}`)
+  must(!teamHtml.includes('researcher'),
+    '成员不该出现在收起态的表格里——它是展开后标签页的内容')
   must(css.includes('.px-badge.team'), '团队标记必须有样式，否则它只是普通文字')
 }
 
@@ -3522,6 +3533,11 @@ must(html.includes('user/balance'), '余额面板应标出数据来源端点')
         totals: { local: 161_000 },
         models: ['deepseek-flash'],
         live: true,
+        // 用量视角的时间维度：1h26m 跨度、36 步、516 次工具调用
+        firstAt: Date.UTC(2026, 1, 9, 4, 0, 0),
+        lastAt: Date.UTC(2026, 1, 9, 5, 26, 0),
+        steps: 36,
+        toolCalls: 516,
       },
       {
         // 还没有生成标题的新会话：宿主给的是工作目录末段（与侧栏一致）
@@ -3569,7 +3585,7 @@ must(html.includes('user/balance'), '余额面板应标出数据来源端点')
   // 旧宿主（只有 workspace）：**标题槽**里应是目录末段，而不是十六进制。
   // 注意不能搜整个 HTML：会话 id 仍会以次要样式出现在同一行的 .px-session-id 里
   // （那是刻意的，排查问题要用），所以必须只看标题槽本身。
-  const titleTexts = [...tableHtml.matchAll(/class="px-session-title"[^>]*>([^<]*)</g)].map((m) => m[1])
+  const titleTexts = [...tableHtml.matchAll(/class="px-session-title[^"]*"[^>]*>([^<]*)</g)].map((m) => m[1])
   must(titleTexts.length === 4, `应渲染 4 行会话标题，实际 ${titleTexts.length}`)
   must(titleTexts.includes('legacy'),
     `旧宿主没有 title 时，标题槽应回落到工作目录末段，实际 ${JSON.stringify(titleTexts)}`)
@@ -3582,6 +3598,170 @@ must(html.includes('user/balance'), '余额面板应标出数据来源端点')
   // 会话 id 仍可查（悬停 title），只是不在最显眼的位置
   must(tableHtml.includes('session-8155bc37-087f-4541-b7d6-dda20b7411cc'),
     '会话 id 仍应可查（悬停可复制），排查问题时要用')
+
+  // ── 详情面板（就地展开）────────────────────────────────────────
+  //
+  // 用户指定的字段清单：Token 用量、缓存命中/未命中、峰时/闲时占比（水平条）、
+  // 金额、等待模型输出总时长、平均每轮、最久一轮、轮次、模型×提供商、工具调用。
+  // 步数**不要**（「步数是始终不需要」）。
+  {
+    const { SessionDetail } = await import(pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
+    must(typeof SessionDetail === 'function', 'SessionDetail 应被导出（否则详情面板永远没被断言过）')
+    const detailHtml = renderToStaticMarkup(React.createElement(SessionDetail, {
+      timezone: 'Asia/Shanghai',
+      members: [],
+      lead: {
+        id: 'session-detail-test',
+        createdAt: Date.UTC(2026, 1, 9, 4, 0, 0),
+        turns: 8,
+        firstAt: Date.UTC(2026, 1, 9, 4, 0, 0),
+        lastAt: Date.UTC(2026, 1, 9, 5, 26, 0),
+        steps: 36,
+        toolCalls: 42,
+        turnWallMs: 5_160_000,
+        timedTurns: 8,
+        // 耗时分解：等待 30m / 回复 20m / 工具 36m（合计 1h26m）
+        timing: { ttftMs: 1_800_000, genMs: 1_200_000, toolsMs: 2_160_000, steps: 36, totalMs: 5_160_000 },
+        maxTurnMs: 900_000,
+        totals: {
+          local: 1000, cacheHit: 300000, cacheMiss: 500000, cacheWrite: 0, output: 200000, requests: 10,
+          peak: { requests: 3 }, idle: { requests: 7 },
+        },
+        cost: { standard: 1.5, ifAllIdle: 2, saved: 0.5 },
+        models: ['deepseek-flash@cc-go'],
+      },
+    }))
+    // 用户点名的字段，逐个必须在。
+    for (const label of ['估算金额', '总 Token', '模型耗时', '工具调用',
+      '峰时 Token', '闲时 Token', '缓存命中率', '峰时占比',
+      '模型 × 提供商']) {
+      must(detailHtml.includes(label), `详情面板缺少「${label}」——用户在需求里点名要它`)
+    }
+    // 第二轮起「输入命中 / 未命中」不再单列（用户：不需要单独分出来），
+    // 改由「峰时 Token / 闲时 Token + 缓存命中率」回答「钱花在贵时段了没有」。
+    must(!detailHtml.includes('输入（未命中缓存）'),
+      '输入命中/未命中不该再单列——用户要的是峰时/闲时 Token 与命中率')
+    // 「活跃时长 = 创建到最后使用」被用户否掉了（放三周再聊两句会算成几百小时），
+    // 换成「模型耗时」= 等待 + 回复 + 工具，即模型真正在干活的那段时间。
+    must(!detailHtml.includes('活跃时长'), '详情不该再用「活跃时长」这种跨度指标')
+
+    // 会话 ID 不进详情卡片（用户：对分析完全没用）。
+    must(!detailHtml.includes('会话 ID'), '会话 ID 不该出现在详情卡片里')
+    // 步数：用户明确说「始终不需要」，详情里也不能出现。
+    must(!detailHtml.includes('步数'), '步数不该出现在详情里（用户明确说始终不需要）')
+    // 峰闲占比必须是**一条水平条**，且比例正确：3/10 = 30%。
+    must(detailHtml.includes('px-peak-bar'), '峰时/闲时应用水平条呈现，而不是两个孤立数字')
+    must(detailHtml.includes('width:30%'),
+      `峰时占比应为 3/10 = 30%，实际渲染里找不到 width:30%——条形宽度算错了`)
+    // 时长对比条已**移除**：它拿「列表里最久的会话」当参照，而那个参照物对用户
+    // 不可见（谁知道 532h 是哪条），对数尺度还让 29h 与 532h 看起来差不多——
+    // 用户原话「这个条状的时长对比是啥意思」。单条时长已由 hero 卡表达。
+    must(!detailHtml.includes('px-spanbar'), '不该再有不可解读的时长对比条')
+    // 时间三项：5,160,000ms = 1h26m；平均 ≈ 10m45s；最久 900000ms = 15m
+    // 耗时构成：环形图 + 图例（用户要求对齐 dsh-context 的耗时统计）。
+    // 数据来自宿主侧新增的 TimingBreakdown：等待 / 回复 / 工具三段。
+    must(detailHtml.includes('px-timing'), '详情应有耗时构成环形图')
+    must(detailHtml.includes('等待模型') && detailHtml.includes('模型回复') && detailHtml.includes('工具执行'),
+      '环形图图例应含三段：等待模型 / 模型回复 / 工具执行')
+    // 改用横向堆叠条（用户明确不喜欢环形图）：三段按比例铺开，宽度即占比。
+    must(detailHtml.includes('px-timing-seg'), '耗时构成应是横向堆叠条，而不是环形图')
+    must(detailHtml.includes('px-timing-seg-yellow'), '堆叠条应含「等待模型」段')
+    must(detailHtml.includes('px-timing-legend'), '堆叠条下方应有图例（百分比 + 时长）')
+    // 「思考」无法从事件里切分，界面必须如实说明，而不是编一个假数。
+    must(detailHtml.includes('无法分离'), '必须说明思考与回复在日志层面无法分离')
+  }
+
+  // ── 团队成员必须挂在 lead 行下，不自己成为顶层条目 ──────────────────
+  //
+  // 用户原话：「成员数据放在 lead 会话下，不要自己成为一行条目」。
+  // 早先 teammate 是顶层行，导致一个团队被拆成几段、还各自参与排序。
+  {
+    const { SessionTable: TableForTeam } = await import(pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
+    const lead = {
+      id: 'session-lead-0000', createdAt: 1000, lastAt: 5000, workspace: 'dev', title: '团队 Lead',
+      turns: 5, totals: { local: 1000, requests: 1 }, models: [], live: false,
+      role: 'lead', teamId: 'session-lead-0000', depth: 0,
+    }
+    const member1 = {
+      id: 'session-m1', createdAt: 1000, lastAt: 9000, workspace: 'dev', title: '成员一',
+      turns: 2, totals: { local: 500, requests: 1 }, models: [], live: false,
+      role: 'teammate', teamId: 'session-lead-0000', memberName: '研究员', depth: 1,
+    }
+    const solo = {
+      id: 'session-solo', createdAt: 2000, lastAt: 3000, workspace: 'x', title: '独立会话',
+      turns: 1, totals: { local: 100, requests: 1 }, models: [], live: false,
+    }
+    const teamHtml = renderToStaticMarkup(React.createElement(TableForTeam, {
+      timezone: 'Asia/Shanghai', sessions: [lead, member1, solo],
+    }))
+    // 顶层行只有 lead 与独立会话：成员不占 .px-session-row（那是顶层行的类）。
+    const topTitles = [...teamHtml.matchAll(/class="px-session-title[^"]*"[^>]*>([^<]*)</g)].map((m) => m[1])
+    must(topTitles.length === 2,
+      `顶层会话行应只有 2 条（lead + 独立会话），实际 ${JSON.stringify(topTitles)}`)
+    must(!topTitles.includes('成员一'), '成员不该成为顶层条目——它是 lead 的从属数据')
+    // 第二版起成员不再占行，而是**展开后的标签页**（用户建议）。
+    must(!teamHtml.includes('px-session-member-row'),
+      '成员不该再渲染成表格行——改用详情里的标签页')
+    // lead 徽标注出成员数，用户一眼能看出这个会话背后有没有团队。
+    must(teamHtml.includes('团队 · 1 名成员'), 'lead 徽标应写明成员数')
+    // 排序按最后使用：成员 lastAt=9000 最新，但它不该因此跑到最前（它跟着 lead 走）。
+    must(teamHtml.indexOf('团队 Lead') < teamHtml.indexOf('独立会话'),
+      '排序看 lead 的最后使用（5000 > 3000），团队应排在独立会话之前')
+
+    // 成员作为标签页出现在详情里：直接渲染 SessionDetail 验它。
+    const { SessionDetail: DetailForTeam } = await import(pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
+    const detailTeam = renderToStaticMarkup(React.createElement(DetailForTeam, {
+      timezone: 'Asia/Shanghai', lead, members: [member1],
+    }))
+    must(detailTeam.includes('px-dtabs') && detailTeam.includes('px-dtab'),
+      '团队成员应以标签页呈现（用户建议按子标签页看子智能体数据）')
+    // 标签用 DSH 官方称呼：lead 那个标签叫「Lead」，成员用它的名字。
+    // 早先写「本会话」是把内部视角漏到了界面上（用户指出）。
+    must(detailTeam.includes('Lead') && detailTeam.includes('研究员'),
+      '标签页应同时含「Lead」与成员名——用官方称呼，不用内部视角的「本会话」')
+    must(!detailTeam.includes('本会话'), '标签页不该再用「本会话」这种内部措辞')
+    must(detailTeam.includes('role="tablist"'),
+      '标签页应有 role="tablist"，否则屏幕阅读器读不出一组可切换项')
+  }
+
+  // ── 用量视角的时间维度 ──────────────────────────────────────────
+  //
+  // 用户的要求原话：「用量不只是金额、Token，人消耗的注意力和时间也是一个数据」。
+  // 因此这张表必须有「活跃时长」列，且**没有数据时显示 —，不是 0**：
+  // 「不知道」与「零」是两件事，把前者显示成后者会让整列数字失去意义。
+  must(tableHtml.includes('活跃时长'), '会话清单应有「活跃时长」列（时间也是用量）')
+  // 步数**不进表**：用户原话是「步数是始终不需要」。它既不在收起行、也不在详情里。
+  must(!tableHtml.includes('>步数<'), '步数不该出现在会话清单里（用户明确说始终不需要）')
+  must(tableHtml.includes('1h26m'),
+    '1h26m 的跨度应渲染成 1h26m——两级单位最好扫读')
+  // 第二行没有 firstAt/lastAt：必须是破折号而不是 0s。
+  const spans = [...tableHtml.matchAll(/<td[^>]*>(\d+[hms][\dhms]*)<\/td>|<td[^>]*>(—)<\/td>/g)].map((m) => m[1] ?? m[2])
+  must(spans.includes('—'),
+    `没有时间数据时必须显示 —（而不是 0s），实际 ${JSON.stringify(spans.slice(0, 6))}`)
+  must(spans.every((text) => text !== '0s'),
+    '任何情况下都不该出现 0s——那会把「没有数据」伪装成「零耗时」')
+
+  // ── 排序与交互（用户指定）──────────────────────────────────────
+  //
+  // 默认按「最后使用」倒序；点标题跳会话、点其余区域就地展开。
+  // 这三条都是**交互契约**，静态渲染只能验到结构层面的部分：
+  must(tableHtml.startsWith('<div class="px-table-wrap">'), '会话清单根节点应是表格容器')
+  // **flex 不能加在 td 上**（踩过）：td 一旦脱离表格布局，该列剩余宽度就不再被它占据，
+  // 展开行的底色只铺到文字处、右侧露出白块（用户报的「条目里缺一块」）。
+  must(!/.px-session-cell {[^}]*display:s*flex/.test(css),
+    'px-session-cell 不能是 td 上的 flex——必须用内层 div 承载 flex，否则表格列会露出白块')
+  must(tableHtml.includes('px-session-cell-inner'),
+    '会话单元格应有内层 .px-session-cell-inner 承载 flex 布局')
+  // 表头顺序：最后使用 → 会话 → 轮次 → Token → 活跃时长
+  const headers = [...tableHtml.matchAll(/<th[^>]*>([^<]*)<\/th>/g)].map((m) => m[1])
+  // 第一列是折叠箭头槽（空表头），因此断言从第二列开始逐项校验。
+  must(headers.slice(1).join('|') === '最后使用|会话|轮次|Token|活跃时长',
+    `表头顺序应为「最后使用 / 会话 / 轮次 / Token / 活跃时长」，实际 ${JSON.stringify(headers)}`)
+  // 标题可点（跳会话）：必须带 role=link 与 tabIndex，键盘也能触发
+  must(/class="px-session-title[^"]*px-session-link[^"]*"/.test(tableHtml),
+    '标题必须带 .px-session-link（点它跳会话）')
+  must(tableHtml.includes('role="link"'), '标题应 role="link"，否则屏幕阅读器不知道它是动作')
+  must(tableHtml.includes('tabindex="0"'), '标题应可聚焦（tabIndex=0），否则键盘用户无法触发跳转')
   // 工作区列被并进第一列后，表头不该还有独立的「工作区」列
   must(!tableHtml.includes('<th>工作区</th>'),
     '工作区已并进标题列，不该再单开一列（会白占宽度）')

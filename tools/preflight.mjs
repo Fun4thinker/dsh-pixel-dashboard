@@ -111,11 +111,13 @@ const balanceRoute = routeOf('/dsh-pixel/balance')
 const plansRoute = routeOf('/dsh-pixel/plans')
 const toggleRoute = routeOf('/dsh-pixel/toggle')
 const notifyRoute = routeOf('/dsh-pixel/notify')
+// 桌面端把窗口拉到前台（宿主唤起 dsh://open）。
+const focusRoute = routeOf('/dsh-pixel/focus')
 const ratesRoute = routeOf('/dsh-pixel/rates')
 const credsRoute = routeOf('/dsh-pixel/plan-credentials')
 // 路由条数是**有意**钉死的：新增路由必须在这里显式加一行，并想清楚它是否需要
 // 同源闸门与写权限，而不是让新增悄悄溜过去（见 lib/host.js 的注册处）。
-assert.equal(routes.length, 9, `应注册恰好九条路由，实际 ${routes.length}`)
+assert.equal(routes.length, 10, `应注册恰好十条路由，实际 ${routes.length}`)
 
 /**
  * 最小 req/res 替身。
@@ -190,6 +192,8 @@ const REQUIRED_CAPABILITIES = [
   // 没有这条路由的旧版本，界面据此不画移除入口（而不是画一个必然失败的按钮）。
   'planCredentials',
   'notifyJournal', 'notifyThresholds',
+  // 桌面端把窗口拉到前台的能力（dsh://open → focusPrimaryWindow）。
+  'focusWindow',
   // 会话清单里的预览标题（与 DSH 侧栏同源）。旧的 id 片段用户对不上侧栏任何一个会话。
   'sessionTitle',
 ]
@@ -1635,6 +1639,42 @@ assert.notEqual(
   'FlashX 与 Flash 必须是两份不同的价目条目',
 )
 
+// ── 千问：统一按**中国内地（华北2 北京）**取价 ──────────────────────
+//
+// 千问同一模型在不同地域价差很大（qwen3.8-max 北京 $1.650/$4.951 vs 新加坡
+// $2/$6），而账本里没有地域信息。这里钉住「统一按内地价」这个约定：
+// 换价时必须同时改这里，否则口径会悄悄漂回国际站。
+// 美元按 7.2 折人民币（与内置表其余条目同币种）。
+assert.equal(MODEL_RATES['qwen3.8-max'].cacheMiss.peak, 12,
+  'qwen3.8-max 输入应为国内站整数价 ¥12——不要用美元折算，折算会得到 11.88 这种对不上账的数字')
+assert.equal(MODEL_RATES['qwen3.8-max'].output.peak, 36, 'qwen3.8-max 输出应为 ¥36')
+assert.equal(MODEL_RATES['qwen3.8-max'].cacheHit.peak, 1.5, 'qwen3.8-max 缓存命中应为 ¥1.5')
+// 3.7-max 与 3.8-max 输入输出同价，但**缓存命中价不同**（2.4 vs 1.5）：
+// 折叠成一条会算错缓存成本，而这正是长会话里占比最大的部分。
+assert.equal(MODEL_RATES['qwen3.7-max'].cacheHit.peak, 2.4, 'qwen3.7-max 缓存命中是 ¥2.4，与 3.8-max 不同')
+// qwen3.7-flash 分三档（0.2/0.6/1.2），取最低档必须标 tiered，否则会被当成精确价。
+assert.equal(MODEL_RATES['qwen3.7-flash'].cacheMiss.peak, 0.2, 'qwen3.7-flash 输入应为最低档 ¥0.2')
+assert.equal(MODEL_RATES['qwen3.7-flash'].tiered, true, '分档模型必须标 tiered')
+// 限时 8 折：按折后价录，按原价会高估 25%。
+assert.equal(MODEL_RATES['qwen3.7-plus'].cacheMiss.peak, 1.6, 'qwen3.7-plus 应取 8 折后的 ¥1.6')
+// OpenAI：账本里真实出现的 gpt-5.6-terra 必须有价，否则它一直显示「估算价」。
+assert.equal(MODEL_RATES['gpt-5.6-terra'].cacheMiss.peak, 14.4, 'gpt-5.6-terra 输入 $2 × 7.2')
+assert.equal(MODEL_RATES['gpt-5.6-terra'].output.peak, 86.4, 'gpt-5.6-terra 输出 $12 × 7.2')
+assert.equal(pricingOf('gpt-5.6-terra').known, true, '账本里出现过的模型必须 known=true')
+assert.equal(MODEL_RATES['qwen-max'].cacheMiss.peak, 2.484,
+  'qwen-max 是内地特例价 $0.345，与国际站 $1.6 差 4 倍多，不能折进 qwen3.8-max')
+assert.equal(MODEL_RATES['qwen3.8-max'].tiered, true,
+  '千问按阶梯计价，必须标 tiered —— 界面据此注明「按最低档估算」而不是假装精确')
+// 日期后缀与 qwen/ 前缀指向同一个计价模型：不折叠就会各变成一行「估算价」。
+assert.equal(normalizeModel('qwen3.8-max-0902'), 'qwen3.8-max', '日期后缀应折到基础模型')
+assert.equal(normalizeModel('qwen/qwen3.7-max'), 'qwen3.7-max', 'qwen/ 前缀应折到基础模型')
+assert.equal(normalizeModel('qwen3.6-plus'), 'qwen3.7-plus', '上一代 plus 折到当前 plus')
+// 没录价的模型必须如实标成「不知道」——不能让它看起来像官方价。
+{
+  const unknown = pricingOf('some-unreleased-model-x')
+  assert.equal(unknown.known, false, '未录价的模型必须 known=false，界面据此显示「估算价」')
+}
+
 // 不分时的模型 peak 必须等于 idle——这是「flat」判定的依据，界面靠它决定列数
 for (const [key, rates] of Object.entries(MODEL_RATES)) {
   if (rates.flat !== true) continue
@@ -1838,6 +1878,25 @@ assert.equal(badWrite.statusCode, 400, '数组体应被拒绝')
 const putRoute = await call(notifyRoute, 'PUT', '/dsh-pixel/notify')
 assert.equal(putRoute.statusCode, 405, 'PUT 应返回 405')
 
+// ── /focus：桌面端把窗口拉到前台 ────────────────────────────────────
+//
+// 渲染进程提不动窗口（实测 window.focus() 无效、preload 无 focus 通道），
+// 所以由宿主用系统命令唤起 `dsh://open`，交给 Electron 主进程的
+// focusPrimaryWindow() 做 restore→show→focus。三条断言：
+//   1) 只接受 POST（它会让宿主启动外部程序，不该被 GET 触发）；
+//   2) 跨站请求必须拒绝（同上，否则任意网页都能戳它）；
+//   3) 正常 POST 返回 200 且带上 attempted/ok 字段，让调用方能判断结果。
+assert.ok(focusRoute !== undefined, '应注册 /dsh-pixel/focus 路由')
+const focusGet = await call(focusRoute, 'GET', '/dsh-pixel/focus')
+assert.equal(focusGet.statusCode, 405, '/focus 的 GET 应返回 405')
+const focusCrossSite = await call(focusRoute, 'POST', '/dsh-pixel/focus', undefined, { 'sec-fetch-site': 'cross-site' })
+assert.equal(focusCrossSite.statusCode, 403, '/focus 的跨站 POST 应被拒绝')
+const focusOk = await call(focusRoute, 'POST', '/dsh-pixel/focus')
+assert.equal(focusOk.statusCode, 200, '/focus 的正常 POST 应返回 200')
+const focusBody = JSON.parse(focusOk.body)
+assert.equal(typeof focusBody.attempted, 'boolean', '/focus 应回报 attempted')
+assert.equal(typeof focusBody.ok, 'boolean', '/focus 应回报 ok')
+
 // ── 自定义单价：用户不必改源码就能补一个官方价 ──────────────────────
 //
 // 这是用户要求的入口：新模型发布得很勤，而「我用的模型没有价」的表现是它被标成
@@ -1907,7 +1966,7 @@ assert.equal(putRoute.statusCode, 405, 'PUT 应返回 405')
 // 恢复：把开关文件清干净，避免影响后续断言
 rmSync(sandboxPrefs, { force: true })
 
-console.log(`预检通过：插件形状、9 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
+console.log(`预检通过：插件形状、10 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
   + 'POST 拒绝、时段时钟、余额隐私与开关、套餐解析与凭据打码、多厂商价目、自定义单价、通知日志与预警阈值')
 
 rmSync(sandboxPrefs, { force: true })

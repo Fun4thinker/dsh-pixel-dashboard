@@ -498,6 +498,9 @@ await check('每个条目都带上自己那一份单价，客户端不必再按�
 await check('费用按分档单价折算，不是整段套一个折扣', () => {
   const model = data.models[0]
   const rates = ratesOf(model.rollup)
+  // 重算必须与宿主用**同一份桶数据**：漏掉 cacheWrite（按 1.25× 输入价计）
+  // 就会得到「测试说 0.009562、实现算出 0.009587」这种只差千分之三的漂移，
+  // 而那点差值恰恰是缓存写入的成本。
   const expected = costOf(model.totals.peak, rates, 'peak') + costOf(model.totals.idle, rates, 'idle')
   assert.equal(Number(model.cost.standard.toFixed(6)), Number(expected.toFixed(6)))
   assert.ok(model.cost.standard > 0)
@@ -564,8 +567,10 @@ await check('会话费用按分档口径算出，与模型单价一致', () => {
   // a 会话：1 条高峰（周四 10:00）+ 2 条空闲（12:30 / 12:40）
   const sessionA = data.sessions.find((row) => row.id === 'a')
   const rates = ratesOf('deepseek-flash')
-  const expectedPeak = costOf({ cacheHit: 800, cacheMiss: 200, output: 200 }, rates, 'peak')
-  const expectedIdle = costOf({ cacheHit: 1500, cacheMiss: 900, output: 1300 }, rates, 'idle')
+  // cacheWrite 必须写进来：fixtures 里 idle 桶确实有 100 个写入 token
+  // （见 message(2, …, cacheWrite: 100)），漏掉它这条断言就永远对不上。
+  const expectedPeak = costOf({ cacheHit: 800, cacheMiss: 200, cacheWrite: 0, output: 200 }, rates, 'peak')
+  const expectedIdle = costOf({ cacheHit: 1500, cacheMiss: 900, cacheWrite: 100, output: 1300 }, rates, 'idle')
   assert.equal(Number(sessionA.cost.peak.toFixed(6)), Number(expectedPeak.toFixed(6)))
   assert.equal(Number(sessionA.cost.idle.toFixed(6)), Number(expectedIdle.toFixed(6)))
 })
@@ -823,9 +828,55 @@ await check('第三方网关的各种写法都认得出是同一个模型（用�
 
 // 宽容不能变成乱认：把别家的模型按 DeepSeek 计价比认不出更危险，
 // 因为界面上数字有、也不报错，只是**错的**。
+// ── 耗时分解：等待 / 回复 / 工具 ─────────────────────────────────────
+//
+// 用户明确否掉了「活跃时长 = 创建到最后使用」：会话放三周再聊两句会被算成
+// 数百小时。有用的口径是「模型真正在干活」的那段，即：
+//   ttft  = step/start → 首条 assistant/message
+//   gen   = 首条 assistant/message → step/end，再扣掉工具执行的部分
+//   tools = tool/call → tool/result 的配对时长
+await check('耗时分解把等待、回复、工具三段算准', async () => {
+  const { TimingBreakdown } = await import('../lib/timing.js')
+  const timing = new TimingBreakdown()
+  // 一个 step：0s 开始 → 10s 首字（等待 10s）→ 20s 结束（回复窗口 10s，无工具）
+  timing.observe({ type: 'step/start', time: 0 })
+  timing.observe({ type: 'assistant/message', time: 10_000 })
+  timing.observe({ type: 'step/end', time: 20_000 })
+  const one = timing.toJSON()
+  assert.equal(one.ttftMs, 10_000, '等待应为首字时刻减 step 起点')
+  assert.equal(one.genMs, 10_000, '回复应为 step 结束减首字')
+  assert.equal(one.toolsMs, 0, '没有工具调用时工具耗时为 0')
+  assert.equal(one.totalMs, 20_000, '总耗时 = 三段之和')
+  assert.equal(one.steps, 1, '应记到 1 个 step')
+
+  // 第二个 step 里有一次工具调用：回复窗口要把工具那段扣掉
+  const timing2 = new TimingBreakdown()
+  timing2.observe({ type: 'step/start', time: 0 })
+  timing2.observe({ type: 'assistant/message', time: 10_000 })
+  timing2.observe({ type: 'tool/call', time: 12_000, data: { callId: 'c1' } })
+  timing2.observe({ type: 'tool/result', time: 17_000, data: { callId: 'c1' } })
+  timing2.observe({ type: 'step/end', time: 20_000 })
+  const two = timing2.toJSON()
+  assert.equal(two.toolsMs, 5_000, '工具耗时应为 call→result 的 5s')
+  // 回复窗口 10s 里含 5s 工具，扣掉后应为 5s；不扣就会把工具时间算成模型生成。
+  assert.equal(two.genMs, 5_000, '回复应扣掉工具执行的那段（否则模型看起来慢了一倍）')
+
+  // 异常中断：tool/call 没有 result，step/end 时应把未闭合的调用补记到 step 结束
+  const timing3 = new TimingBreakdown()
+  timing3.observe({ type: 'step/start', time: 0 })
+  timing3.observe({ type: 'assistant/message', time: 1_000 })
+  timing3.observe({ type: 'tool/call', time: 2_000, data: { callId: 'c2' } })
+  timing3.observe({ type: 'step/end', time: 6_000 })
+  assert.equal(timing3.toJSON().toolsMs, 4_000, '未闭合的工具调用应在 step 结束时按起点补记')
+
+  // 空数据：没有 step 时必须是 0，而不是 NaN —— NaN 会让界面显示成假 0。
+  const empty = new TimingBreakdown().toJSON()
+  assert.equal(empty.totalMs, 0, '没有事件时总耗时为 0')
+  assert.ok(!Number.isNaN(empty.totalMs), '不能是 NaN')
+})
 await check('宽容归一不得把别的模型错认成价目表里的条目', () => {
   const mustMiss = [
-    'doubao-seed-2-0-pro', 'qwen3.6-max', 'gpt-5.6-sol', 'claude-sonnet-4-6',
+    'doubao-seed-2-0-pro', 'qwen3.6-max', 'claude-sonnet-4-6',
     'glm-4.5-air', 'kimi-k2-thinking', 'minimax-m2.5',
     // 未来的版本号：价目表里没有就**不能**认
     'deepseek-v5', 'glm-6', 'deepseek-v4-pro-max',
@@ -838,6 +889,11 @@ await check('宽容归一不得把别的模型错认成价目表里的条目', (
     // 认不出来时保留原名，好在「只有调用量」的监看里认出它
     assert.equal(normalizeModel(name), name, `${name} 认不出时应原样保留`)
   }
+  // gpt-5.6-sol 曾经在这份「不能认」清单里（当时价目表确实没有它）。
+  // 现在它有了官方价条目，因此**移出**该清单——但必须仍然认得准，不能被折到
+  // 别的厂商或别的 GPT 型号上（折错比认不出更危险）。
+  assert.equal(pricingOf('gpt-5.6-sol').known, true, 'gpt-5.6-sol 已录价，应 known=true')
+  assert.equal(normalizeModel('gpt-5.6-sol'), 'gpt-5.6-sol', 'gpt-5.6-sol 应折到自己，不是 terra/luna')
 })
 
 // 规范化会主动撞车时不能任选一个——那会把 A 的价按到 B 头上，且界面看不出来。
