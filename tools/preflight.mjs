@@ -1738,6 +1738,20 @@ assert.equal(clean.warnQuotaPercent, 250, '超过 100 的阈值是合法用法�
 assert.equal(normalizeNotify({ warnQuotaPercent: 'abc' }).warnQuotaPercent, NOTIFY_DEFAULTS.warnQuotaPercent, '读不懂的百分比应退回默认')
 assert.deepEqual(Object.keys(clean).sort(), Object.keys(NOTIFY_DEFAULTS).sort(), '归一结果只能含已知键')
 
+// 3b) 提示音：认不出的模式必须回落到 `system`（= 什么都不改），**不是**静音。
+//     默认成静音会让没设过的人以为通知坏了；而 `system` 只是「不动系统音效」。
+assert.equal(normalizeNotify({}).notifySound, 'system', '没设过提示音时应跟随系统')
+assert.equal(normalizeNotify({ notifySound: 'nope' }).notifySound, 'system', '认不出的模式应回落 system')
+assert.equal(normalizeNotify({ notifySound: 'off' }).notifySound, 'off', 'off 是合法取值')
+assert.equal(normalizeNotify({ notifySound: 'chime' }).notifySound, 'chime', '内置音效是合法取值')
+// 音频地址最终会进 new Audio(url)：只放行 http(s) 与 data:audio，
+// 其余协议（尤其是 javascript:）一律丢弃——否则等于给配置触发任意行为留口子。
+assert.equal(normalizeNotify({ notifySoundUrl: 'https://a/b.mp3' }).notifySoundUrl, 'https://a/b.mp3')
+assert.equal(normalizeNotify({ notifySoundUrl: 'data:audio/wav;base64,AAAA' }).notifySoundUrl, 'data:audio/wav;base64,AAAA')
+assert.equal(normalizeNotify({ notifySoundUrl: 'javascript:alert(1)' }).notifySoundUrl, '', '非音频协议必须被丢弃')
+assert.equal(normalizeNotify({ notifySoundUrl: 'file:///C:/a.mp3' }).notifySoundUrl, '', '本地文件路径必须被丢弃')
+assert.equal(normalizeNotify({ notifySoundUrl: 'x'.repeat(4096) }).notifySoundUrl, '', '超长地址应被丢弃')
+
 // 4) 路由行为：GET 带 since 读增量；POST 写配置；跨站被拒
 const notifyRead = await call(notifyRoute, 'GET', '/dsh-pixel/notify')
 assert.equal(notifyRead.statusCode, 200)

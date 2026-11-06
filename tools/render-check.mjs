@@ -747,8 +747,12 @@ must(
   const runtime = new NotifierRuntime({
     store: runtimeStore,
     uiSession: () => undefined,
-    sessions: () => ({ open: (id) => { opened.push(id) } }),
+    // 切换会话只认 uiWorkspace.openSession。给人造一个**故意不带 open** 的
+    // sessions 服务：这正是 0.2.1 的真实形状（open=undefined），旧实现会在这里
+    // 静默失败，而新实现必须完全不依赖它。
+    sessions: () => ({ list: { getSnapshot: () => ({ ids: [], byId: {}, phase: 'ready' }) } }),
     layout: () => ({ selectPanel: (id) => { selected.push(id) } }),
+    workspace: () => ({ openSession: (id) => { opened.push(id) } }),
     scope: {
       Notification: ClickableNotification,
       // 用户从系统通知中心点回来时窗口可能还在别的应用后面，切完要聚焦
@@ -772,13 +776,14 @@ must(
     '带会话 id 的系统通知必须挂上 onclick——这正是用户报的「点了没切过去」')
   must(fired.onclick !== undefined, 'onclick 应可调用')
 
-  // 触发点击：两个动作都必须发生
+  // 触发点击：必须切到通知说的那条会话。
+  // 退出主区面板这件事由 uiWorkspace.openSession 内部完成（它最后就调
+  // layout.selectPanel(null)），插件不再重复调一次——重复调没有意义，
+  // 而且会让「到底谁负责退出面板」变得含糊。这里只钉住真正要保证的事：
+  // 目标会话被切过去、窗口被聚焦。
   fired.onclick()
   must(opened.includes('session-other'),
     `点通知应切到通知说的那条会话，实际切到 ${JSON.stringify(opened)}`)
-  must(selected.includes(null),
-    '点通知还必须**退出主区面板**（selectPanel(null)）——'
-    + '否则用户正停在看板上时主区仍显示看板，看起来就是点了没反应')
   must(focused.length === 1, '从通知中心点回来时应顺带聚焦窗口，否则切了还在别的应用后面')
   must(runtimeStore.recent.length >= 1, '点通知不该影响「最近通知」的记录')
 
@@ -932,7 +937,19 @@ must(
     const runtime = new NotifierRuntime({
       store,
       uiSession: () => undefined,
-      sessions: () => ({ list: { getSnapshot: () => ({ current }) } }),
+      // 「当前会话」按**真实快照形状**给：0.2.1 的 list 快照只有
+      // ids/byId/phase/projectionsBySession，没有 current 字段。
+      // 主视图正在看哪条会话，由 byId[id].retainedBy.mainView 表达。
+      sessions: () => ({
+        list: {
+          getSnapshot: () => ({
+            ids: current === undefined ? [] : [current],
+            byId: current === undefined ? {} : { [current]: { id: current, retainedBy: { mainView: 1 } } },
+            phase: 'ready',
+            projectionsBySession: {},
+          }),
+        },
+      }),
       scope: { Notification: QuietNotification, document: doc },
     })
     // 「用户最近一次动页面」的时间戳：0 表示刚刚动过，大值表示人早就走了。

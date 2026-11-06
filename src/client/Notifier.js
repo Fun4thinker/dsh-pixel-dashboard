@@ -46,6 +46,8 @@ import {
   permissionOf,
   quotaAlerts,
   shouldStayQuiet,
+  soundPlan,
+  SOUND_TONES,
 } from './notify.js'
 import { fetchPlans } from './plans.js'
 
@@ -186,6 +188,28 @@ export class NotifyStore {
   }
 
   /**
+   * 记一次「点了通知之后跳转成不成功」。
+   *
+   * 单独一个字段而不是往 record 里塞：跳转发生在通知**已经展示之后**，
+   * 它需要更新的是那条已有记录，而不是新增一条。
+   * @param {{at:number,sessionId:string,ok:boolean,error?:string}} outcome - 结果。
+   */
+  noteClick(outcome) {
+    this.lastClick = outcome
+    const index = this.recent.findIndex((item) => item?.sessionId === outcome.sessionId)
+    if (index < 0) return
+    const target = this.recent[index]
+    const next = {
+      ...target,
+      clickFailed: outcome.ok ? undefined : String(outcome.error ?? '未知原因'),
+      clickOk: outcome.ok === true,
+    }
+    const recent = [...this.recent]
+    recent[index] = next
+    this.patch({ recent })
+  }
+
+  /**
    * 发一条测试通知。
    *
    * 这是一条**自证**通道：「通知到底能不能弹」不该靠用户去等一个真实任务跑完来
@@ -290,11 +314,12 @@ export class NotifierRuntime {
    * @param {() => object|undefined} deps.layout - 客户端 layout 服务（可缺）；点通知切会话时要用。
    * @param {object} [deps.scope] - 全局对象，测试注入用。
    */
-  constructor({ store, uiSession, sessions, layout, scope = globalThis }) {
+  constructor({ store, uiSession, sessions, layout, workspace, scope = globalThis }) {
     this.store = store
     this.uiSession = uiSession
     this.sessions = sessions
     this.layout = layout
+    this.workspace = workspace
     this.scope = scope
     this.seen = new SeenTracker()
     this.latch = new AlertLatch()
@@ -606,6 +631,41 @@ export class NotifierRuntime {
   }
 
   /**
+   * 当前主视图显示的会话 id。
+   *
+   * **不能用 `sessions.list.getSnapshot().current`**：0.2.1 的客户端列表快照只有
+   * `ids / byId / phase / projectionsBySession`，`current` 恒为 `undefined`。
+   * 早先的判据读的就是它，于是 `shouldStayQuiet` 里「当前会话」这一条永远不成立
+   * ——「当前会话不打扰」实际处于永不生效的状态（用户关掉它也看不出差别，
+   * 原因就在这里）。
+   *
+   * 真正的事实来源有两个，按可靠性依次取：
+   *   1) `sessions.list.byId[id].retainedBy.mainView > 0` —— 主视图的 retain 计数，
+   *      这正是 DSH 自己 `isMain()` 的判据；
+   *   2) `uiSession.mainRetainId` —— 派生值，作为兜底。
+   * @returns {string|undefined} 会话 id；判不出来时 undefined（调用方按「不静默」处理）。
+   */
+  currentSessionId() {
+    try {
+      const byId = this.sessions?.()?.list?.getSnapshot?.()?.byId
+      if (byId !== undefined && byId !== null) {
+        for (const [id, row] of Object.entries(byId)) {
+          if ((row?.retainedBy?.mainView ?? 0) > 0) return id
+        }
+      }
+    } catch {
+      // 读不出来就往下走兜底，绝不在这里抛。
+    }
+    try {
+      const retained = this.uiSession?.()?.mainRetainId
+      if (typeof retained === 'string' && retained !== '') return retained
+    } catch {
+      // 同上。
+    }
+    return undefined
+  }
+
+  /**
    * 这条会话结束通知是否应当**不打扰**。
    *
    * 判据是「页面正被看着」且「就是当前选中的会话」且「那条会话的界面确实在屏幕上」。
@@ -628,7 +688,7 @@ export class NotifierRuntime {
   #quiet(notice) {
     return shouldStayQuiet(notice, {
       config: this.config,
-      current: this.sessions?.()?.list?.getSnapshot?.()?.current,
+      current: this.currentSessionId(),
       onScreen: conversationOnScreen(this.scope?.document),
       ...this.presence.read(),
     })
@@ -686,26 +746,93 @@ export class NotifierRuntime {
   openSession(sessionId) {
     const id = typeof sessionId === 'string' ? sessionId.trim() : ''
     if (id === '') return false
-    let opened = false
+    // 切换会话的正主是 `uiWorkspace.openSession(target)`。它内部做三件事：
+    // `sessions.retain(target, { source: 'mainView' })`（让主视图持有这条会话，
+    // 也是 `retainedBy.mainView` 的计数来源）、写 selection、再
+    // `layout.selectPanel(null)` 退出主区面板。
+    //
+    // 早先这里调的是 `sessions.open(id)`——那个方法在 0.2.1 的客户端控制器上
+    // **根本不存在**（实测 `open=undefined`，方法表里只有 retain/using/fork/...），
+    // 于是异常被 catch 吞掉，表现就是「点通知只把窗口带到前台、会话没切」。
     try {
-      const sessions = this.sessions?.()
-      if (sessions !== undefined && typeof sessions.open === 'function') {
-        sessions.open(id)
-        opened = true
+      const workspace = this.workspace?.()
+      if (workspace !== undefined && typeof workspace.openSession === 'function') {
+        workspace.openSession(id)
+        return true
       }
-    } catch {
-      // 会话不在列表里（已删除 / 属于别的机器）：保持安静，见方法说明。
+    } catch (error) {
+      // 会话可能已被删除、或属于另一台机器：不让它打断运行时。
+      this.lastOpenError = String(error?.message ?? error)
+      return false
     }
-    // 即使 open 失败也把面板关掉：用户点的是「去看这条会话」，留在面板上更没意义。
+    // 兜底：服务缺失时至少退出主区面板，免得看起来「完全没反应」。
     try {
       const layout = this.layout?.()
-      if (layout !== undefined && typeof layout.selectPanel === 'function') {
-        layout.selectPanel(null)
+      if (layout !== undefined && typeof layout.selectPanel === 'function') layout.selectPanel(null)
+    } catch {
+      // 面板服务缺失：不阻断。
+    }
+    this.lastOpenError = 'uiWorkspace 服务不可用（宿主版本过旧？）'
+    return false
+  }
+
+  /**
+   * 播放提示音（只在用户选择了「自己发声」的音效时才调用）。
+   *
+   * ## 为什么内置音效用 WebAudio 合成而不是放音频文件
+   *
+   * 插件产物要能随包发布，塞 wav/mp3 会让包体和构建都变复杂；而三个提示音无非是
+   * 几声正弦音，现场合成几行就够，且**不需要网络、不需要用户额外授权**。
+   *
+   * ## 为什么全程 try/catch 且失败不抛
+   *
+   * `AudioContext` 在部分环境里需要用户手势才能 resume、也可能被策略禁用。
+   * 声音是附加体验：放不出来**绝不能**影响通知本身（通知已经弹出来了）。
+   * @param {{play:'chime'|'soft'|'deep'|'custom'|undefined, url:string}} plan - 发声口径。
+   */
+  #playSound(plan) {
+    const mode = plan?.play
+    if (mode === undefined) return
+    try {
+      if (mode === 'custom') {
+        const AudioCtor = this.scope?.Audio
+        if (typeof AudioCtor !== 'function' || plan.url === '') return
+        const audio = new AudioCtor(plan.url)
+        const played = audio.play?.()
+        // play() 返回 Promise：拒绝（自动播放策略）时静默吞掉，只留一句 warn。
+        if (played !== undefined && typeof played.catch === 'function') {
+          played.catch(() => {})
+        }
+        return
+      }
+      const tones = SOUND_TONES[mode]
+      if (tones === undefined) return
+      const Ctx = this.scope?.AudioContext ?? this.scope?.webkitAudioContext
+      if (typeof Ctx !== 'function') return
+      this.audioCtx ??= new Ctx()
+      const ctx = this.audioCtx
+      if (ctx?.state === 'suspended') void ctx.resume?.()
+      let cursor = 0
+      for (const tone of tones) {
+        const start = ctx.currentTime + cursor
+        const end = start + tone.ms / 1000
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.type = 'sine'
+        osc.frequency.value = tone.hz
+        // 简单的包络：直接开关会有爆音，两头各留一小段淡入淡出。
+        gain.gain.setValueAtTime(0, start)
+        gain.gain.linearRampToValueAtTime(0.18, start + 0.012)
+        gain.gain.linearRampToValueAtTime(0, end)
+        osc.connect(gain)
+        gain.connect(ctx.destination)
+        osc.start(start)
+        osc.stop(end)
+        cursor += tone.ms / 1000 + 0.02
       }
     } catch {
-      // 面板服务缺失 / 主区面板未注册：不阻断会话本身的切换。
+      // 声音是附加体验：放不出来不影响通知已经送达的事实。
     }
-    return opened
   }
 
   /**
@@ -743,34 +870,64 @@ export class NotifierRuntime {
     const Notification = this.scope?.Notification
     if (typeof Notification !== 'function') return '环境里没有 Notification，无法弹系统通知'
     try {
+      // 提示音口径：自己发声时把系统通知设成 silent，否则会「系统一声 + 插件一声」。
+      const plan = soundPlan(this.config)
       // tag 让同一条会话/同一条预警的新通知**替换**旧的那条，
       // 而不是在通知中心堆成一列——预警持续期间尤其明显。
-      const notification = new Notification(spec.title, { body: spec.body, tag: spec.tag })
+      // `silent` **只在需要静音时才传**：默认的「跟随系统」什么都不传，
+      // 保证和改动之前完全一样的构造参数，避免再引入未知回退。
+      const options = { body: spec.body, tag: spec.tag }
+      if (plan.silent) options.silent = true
+      const notification = new Notification(spec.title, options)
+      // 自己发声放在构造之后：通知构造失败时不该还有一声孤零零的响。
+      if (plan.play !== undefined) this.#playSound(plan)
       // 点通知切到那条会话。只在**确实带着会话 id** 时挂这个回调：
       // 余额 / 套餐阈值那类预警不属于任何会话，点它切会话是无意义的动作。
       const sessionId = typeof spec.sessionId === 'string' ? spec.sessionId.trim() : ''
       if (sessionId !== '') {
         notification.onclick = () => {
+          // ## 顺序是这里最要紧的东西（踩过回退）
+          //
+          // 曾经能生效的版本里，切会话那一步是**立刻抛错**的（调了不存在的
+          // sessions.open），所以 `focus()` 早就执行完了。改成真正能切之后，
+          // `uiWorkspace.openSession` 会同步触发主区重挂载（退出看板 + 重建整个
+          // 会话视图），把渲染进程占住几百毫秒——而用户看到的是「点了，窗口还是
+          // 没到前台」。
+          //
+          // 所以顺序固定为：**先请求聚焦 → 再收通知 → 最后才做切会话这件重活**，
+          // 并追加一次延迟重试（有的引擎会丢掉「页面正忙时」的第一次聚焦请求）。
           try {
-            // 先把系统通知收掉，再切界面：否则通知中心里会留着一条已经处理过的提醒。
-            notification.close?.()
-            // 把窗口拉到前台——**这一步是尽力而为，不是保证**。
-            //
-            // 按规范 `window.focus()` 只是一次「请求」：MDN 明确写着它可能因用户
-            // 设置而失败，返回前也不保证窗口已在最前。浏览器普遍拒绝脚本改窗口
-            // z 序（防广告骚扰），Firefox 基本直接忽略，Chrome 也只在部分条件下认。
-            //
-            // 可靠把窗口拉到前台的是 **Service Worker 的 notificationclick**
-            // （`clients.openWindow()` / `client.focus()`），但那是另一条通知通道，
-            // 而 DSH 的 Web 端没有注册 Service Worker（见 AGENT.md）。
-            // 因此这里照常调用（有环境会生效），但绝不假设它成功。
             this.scope?.focus?.()
-            // 即使拉不到前台，**切会话这件事仍会完成**：用户手动切回窗口时，
-            // 看到的已经是那条会话。这是当前技术条件下能做到的部分。
-            this.openSession(sessionId)
           } catch {
-            // 切界面失败不影响这条通知已经送达的事实。
+            // 聚焦失败不影响后面的切会话。
           }
+          try {
+            this.scope?.setTimeout?.(() => {
+              try {
+                this.scope?.focus?.()
+              } catch {
+                // 重试失败就到此为止：这是尽力而为的一步。
+              }
+            }, 80)
+          } catch {
+            // 没有 setTimeout 的环境（测试闸门）：跳过重试。
+          }
+          try {
+            // 把系统通知收掉：否则通知中心里会留着一条已经处理过的提醒。
+            notification.close?.()
+          } catch {
+            // 关不掉也不影响切会话。
+          }
+          // 切会话放最后：这一步会重建主区，可能占住渲染进程。
+          // 结果**必须可见**——用户报过「点了没反应」，而当时异常被吞掉，
+          // 只能靠反查宿主 API 才查出来（sessions.open 根本不存在）。
+          try {
+            const ok = this.openSession(sessionId)
+            this.store.noteClick({ at: Date.now(), sessionId, ok, error: this.lastOpenError })
+          } catch (error) {
+            this.store.noteClick({ at: Date.now(), sessionId, ok: false, error: String(error?.message ?? error) })
+          }
+          return true
         }
       }
       return undefined
@@ -888,6 +1045,9 @@ export function installNotifier(ctx, store) {
       // layout 只在「点通知切会话」时用到；它可能缺失（旧宿主 / 服务未就绪），
       // 那时会话仍会切换，只是不再额外退出主区面板。
       layout: () => ctx.get('layout'),
+      // 切换会话的正主：uiWorkspace.openSession(target)。
+      // 不能用 sessions.open —— 0.2.1 的 sessions 服务没有这个方法。
+      workspace: () => ctx.get('uiWorkspace'),
     })
     // 先标记 ready：面板不该先渲染一屏空白再等第一轮轮询（最坏 4 秒）。
     // 配置仍是 undefined（运行时拿到宿主回应后才填），面板会用自带默认值兜底。

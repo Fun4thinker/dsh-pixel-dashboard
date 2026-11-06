@@ -21,6 +21,7 @@ import { notifyStore } from './Notifier.js'
 import {
   NOTIFY_DEFAULTS,
   NOTIFY_FLAGS,
+  NOTIFY_SOUND_OPTIONS,
   PERMISSION_TEXT,
   balanceAlerts,
   composeRecentLine,
@@ -1611,6 +1612,7 @@ function NotifyPanel(props) {
   const permission = snapshot.permission ?? 'default'
   const rows = Array.isArray(balance?.balances) ? balance.balances : []
   const thresholds = config.warnBalance ?? {}
+  const soundMode = typeof config.notifySound === 'string' ? config.notifySound : 'system'
   const active = balanceAlerts(balance, thresholds)
   const quotaHit = quotaAlerts(plans, config.warnQuotaPercent)
 
@@ -1681,6 +1683,39 @@ function NotifyPanel(props) {
         onChange: (event) => { save({ [flag.key]: event.target.checked }) },
       }),
       h('span', null, flag.label)))),
+
+    // ── 提示音 ────────────────────────────────────────────────────
+    // 只影响**本插件的通知**，不动 Windows 全局声音设置：
+    // 选「关闭」或任一自定义音效时，我们给系统通知加 `silent`，
+    // 再由插件自己发声（内置音效现场合成，自定义给个音频地址）。
+    h('div', { className: 'px-notify-flags' },
+      h('label', { className: 'px-notify-flag px-notify-sound', title: '只影响 DSH 的通知气泡，不改 Windows 全局声音设置' },
+        h('span', null, '提示音'),
+        h('select', {
+          className: 'px-input px-notify-sound-select',
+          value: soundMode,
+          disabled: saving,
+          onChange: (event) => { save({ notifySound: event.target.value === 'system' ? 'system' : event.target.value }) },
+        },
+        NOTIFY_SOUND_OPTIONS.map((option) => h('option', {
+          key: option.value,
+          value: option.value,
+          title: option.hint,
+        }, option.label))))),
+    soundMode === 'custom'
+      ? h('div', { className: 'px-notify-flags' },
+        h('label', { className: 'px-notify-flag px-notify-sound', title: 'http(s) 音频链接，或 data:audio/… 内联音频' },
+          h('span', null, '音频地址'),
+          h('input', {
+            type: 'text',
+            className: 'px-input px-notify-sound-url',
+            defaultValue: config.notifySoundUrl ?? '',
+            placeholder: 'https://example.com/done.mp3',
+            disabled: saving,
+            onBlur: (event) => { save({ notifySoundUrl: event.target.value.trim() }) },
+            onKeyDown: (event) => { if (event.key === 'Enter') { save({ notifySoundUrl: event.target.value.trim() }) } },
+          })))
+      : null,
 
     // ── 余额预警阈值 + 套餐额度预警 ────────────────────────────────
     // 两项阈值并排一行：它们各自的正文只有「一个标签 + 一个数字框」，
