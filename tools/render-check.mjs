@@ -817,12 +817,25 @@ must(
 // 会话上，于是它完成时提醒被静默吞掉。因此判据必须含「界面真的在屏幕上」。
 {
   const { NotifierRuntime } = await import(pathToFileURL(join(root, 'lib', 'client', 'Notifier.js')).href)
-  const { shouldStayQuiet, conversationOnScreen, CONVERSATION_ANCHOR_SELECTOR } = notifyModule
+  const {
+    shouldStayQuiet,
+    conversationOnScreen,
+    CONVERSATION_ANCHOR_SELECTOR,
+    QUIET_IDLE_MS,
+  } = notifyModule
 
-  // ── 纯函数层：四个条件逐个钉死，缺任何一个都不许静默 ──────────────
-  const view = { config: { notifyQuietFocused: true }, focused: true, current: 'session-A', onScreen: true }
+  // ── 纯函数层：六个条件逐个钉死，缺任何一个都不许静默 ──────────────
+  // `idleMs: 0` = 用户刚刚在页面里动过；缺了它（undefined）一律不静默。
+  const view = {
+    config: { notifyQuietFocused: true },
+    focused: true,
+    visible: true,
+    idleMs: 0,
+    current: 'session-A',
+    onScreen: true,
+  }
   const noticeA = { sessionId: 'session-A', category: 'done' }
-  must(shouldStayQuiet(noticeA, view) === true, '四个条件都成立时应静默（你正盯着那条会话跑完）')
+  must(shouldStayQuiet(noticeA, view) === true, '六个条件都成立时应静默（你正盯着那条会话跑完）')
   must(shouldStayQuiet(noticeA, { ...view, focused: false }) === false,
     '页面没有焦点时不得静默——切去别的标签页正是最该提醒的时候')
   must(shouldStayQuiet({ sessionId: 'session-B' }, view) === false,
@@ -838,6 +851,24 @@ must(
   must(shouldStayQuiet(noticeA, { ...view, config: undefined }) === false,
     '配置还没到手时不得静默——「没读到设置」不等于「用户开了它」')
 
+  // ── 回归本体（Electron 焦点卡死）：焦点说「有焦点」，但人早就不在页面里了 ──
+  //
+  // 用户报的是：「主会话跑完没通知，只有子智能体完成才有」。根因是判据只信
+  // `document.hasFocus()`，而 Electron 在窗口「以未聚焦状态加载」时会永远返回
+  // true（electron/electron#7125、#28897），于是主会话（当前会话）被恒定静默；
+  // 子智能体是另一条 session id，不参与这条比较，照常弹。
+  //
+  // 这两条断言在旧实现上必红：旧实现只看 focused，而下面两例 focused 都是 true。
+  must(shouldStayQuiet(noticeA, { ...view, idleMs: QUIET_IDLE_MS + 1 }) === false,
+    '页面 5 分钟没有任何输入时不得静默——人在别的应用里时页面收不到任何事件，'
+    + '这正是 Electron 里 hasFocus 卡在 true 时唯一能救回提醒的判据')
+  must(shouldStayQuiet(noticeA, { ...view, idleMs: undefined }) === false,
+    '判不出「最近有没有输入」时不得静默——读不出来就不许替用户回答「他正在看」')
+  must(shouldStayQuiet(noticeA, { ...view, visible: false }) === false,
+    '页面不可见（最小化 / 被遮挡）时不得静默——此时焦点读数不可信')
+  must(shouldStayQuiet(noticeA, { ...view, idleMs: QUIET_IDLE_MS }) === true,
+    '刚好卡在窗口边界上仍算「在场」——边界取闭区间，免得实现里出现 off-by-one 的悄悄收紧')
+
   // 判不出来时必须落到「不静默」。两者代价不对称：少静默一次只是轻微打扰，
   // 多静默一次是一条**永远不会被看见**的提醒。
   must(conversationOnScreen(undefined) === false, '没有 document 时判为「不在屏幕上」→ 不静默')
@@ -849,14 +880,44 @@ must(
   must(conversationOnScreen({ querySelector: (sel) => (sel === '[data-rightbar-fullscreen]' ? {} : {}) }) === false,
     '全屏浮层盖住主区时会话界面虽还在 DOM 里，但用户看不见，必须判为「没在看」')
 
+  // ── 在场跟踪本身：初值不许撒谎，读数必须能被假时钟驱动 ────────────
+  const { PresenceTracker } = notifyModule
+  must(typeof PresenceTracker === 'function', 'PresenceTracker 应被导出（运行时靠它判「在场」）')
+  {
+    let clock = 1_000
+    const fakeDoc = {
+      hasFocus: () => true,
+      visibilityState: 'visible',
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }
+    const tracker = new PresenceTracker({ document: fakeDoc }, { now: () => clock })
+    must(tracker.read().idleMs === undefined,
+      '刚加载、用户还没动过任何东西时 idleMs 必须是 undefined——说「他刚刚在看」是无中生有，'
+      + '而判不出来必须落到「不静默」')
+    tracker.noteInput()
+    must(tracker.read().idleMs === 0, '记过输入之后空闲时长应为 0')
+    clock += 90_000
+    must(tracker.read().idleMs === 90_000,
+      `空闲时长应按注入的时钟算出来，实际 ${tracker.read().idleMs}`)
+    // 没有 document / 没有 addEventListener 的环境（SSR、部分渲染闸门）不许抛错。
+    const bare = new PresenceTracker({}, { now: () => 0 })
+    bare.start()
+    must(bare.read().focused === false && bare.read().visible === true,
+      '没有 document 时焦点判为假（→ 不静默），可见性缺省为真（不拿它当理由）')
+    bare.stop()
+  }
+
   // ── 运行时层：同一个判定必须真的作用在派发路径上 ──────────────────
   /** 造一个运行时并驱动一轮日志轮询，返回弹了哪些通知、记了哪些最近通知。 */
-  async function runQuiet({ current, anchor, events }) {
+  async function runQuiet({ current, anchor, events, idleMs = 0, visible = true }) {
     const fired = []
     function QuietNotification(title, options) { fired.push({ title, ...options }) }
     QuietNotification.permission = 'granted'
     const doc = {
+      // 焦点**恒为 true**：这就是 Electron 里那个卡死的读数，回归正是在它说谎时成立的。
       hasFocus: () => true,
+      visibilityState: visible ? 'visible' : 'hidden',
       // 只有「会话锚点」这一条选择器会被命中；其余（含浮层标记）返回 null。
       querySelector: (sel) => (sel === CONVERSATION_ANCHOR_SELECTOR && anchor ? {} : null),
       createElement: (tag) => fakeElement(tag),
@@ -870,6 +931,8 @@ must(
       sessions: () => ({ list: { getSnapshot: () => ({ current }) } }),
       scope: { Notification: QuietNotification, document: doc },
     })
+    // 「用户最近一次动页面」的时间戳：0 表示刚刚动过，大值表示人早就走了。
+    runtime.presence.lastInputAt = Date.now() - idleMs
     store.setConfig({ ...NOTIFY_CONFIG_STUB })
     // 游标记为已知，这样首轮不会走「只学游标」的分支，事件会真的被派发。
     runtime.seen.cursor = 0
@@ -912,6 +975,21 @@ must(
     + '会话界面这时根本没挂在屏幕上，静默它就是用户报的漏提醒')
   must(onPanel.recent.every((item) => item.quiet !== true),
     '会话界面不在屏幕上时不该产生任何「已静默」记录')
+
+  // (b2) **回归本体**：焦点读数说谎（恒 true）、会话也确实在屏幕上，但人已经切到
+  //      别的应用很久了（页面没有任何输入）→ 必须照样弹。
+  //      旧实现在这一例上会静默，用户看到的就是「主会话跑完一声不响」。
+  const away = await runQuiet({ current: 'session-A', anchor: true, events: [doneA], idleMs: QUIET_IDLE_MS + 60_000 })
+  must(away.fired.some((item) => item.tag === 'dsh-pixel-session-A-1'),
+    '人已经不在页面里（5 分钟无任何输入）时，当前会话完成**必须**弹通知——'
+    + ' Electron 的 hasFocus 会一直返回 true，不能拿它当唯一判据')
+  must(away.recent.every((item) => item.quiet !== true),
+    '这一例不该产生「已静默」记录')
+
+  // (b3) 页面被隐藏（最小化 / 被遮挡）时同理不得静默。
+  const hidden = await runQuiet({ current: 'session-A', anchor: true, events: [doneA], visible: false })
+  must(hidden.fired.some((item) => item.tag === 'dsh-pixel-session-A-1'),
+    '页面不可见时当前会话完成必须弹通知')
 
   // (c) 被静默的那条必须在面板里**看得出来**。
   //     「最近通知」默认收起（收起时内容不渲染），整页静态渲染到不了这里，
