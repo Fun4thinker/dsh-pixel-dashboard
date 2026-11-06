@@ -75,6 +75,7 @@
     "install:official": "node tools/install-official.mjs",
     "doctor": "node tools/doctor.mjs",
     "pack": "npm pack",
-    "prepublishOnly": "node tools/build.mjs && node tools/test.mjs && node tools/preflight.mjs"
+    "prepublishOnly": "node tools/build.mjs && node tools/test.mjs && node tools/preflight.mjs",
+    "sync:desktop": "node tools/sync-desktop.mjs"
   }
 }
