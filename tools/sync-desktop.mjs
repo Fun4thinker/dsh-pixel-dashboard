@@ -44,6 +44,24 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2))
 const profileDir = join(args.home, 'profiles', args.profile)
+/**
+ * 从 lock 文本里取出本插件被钉住的 commit。
+ *
+ * pnpm 对 github 依赖有两种写法，**必须都认**——只认一种就会把「解析成功」
+ * 误报成「lock 里没有钉点」：
+ *   - SSH 形态：git+ssh://git@github.com/o/r.git#<commit>
+ *   - tarball 形态：https://codeload.github.com/o/r/tar.gz/<commit>
+ */
+function pinnedCommitOf(text) {
+  const match = /dsh-pixel-dashboard:[\s\S]{0,300}?version:\s*(\S+)/.exec(text)
+  const spec = match === null ? '' : match[1]
+  // SSH 形态：...#<commit>；tarball 形态：.../tar.gz/<commit>
+  const viaHash = /#([0-9a-f]{40})/.exec(spec)
+  if (viaHash !== null) return viaHash[1]
+  const viaTar = /tar\.gz\/([0-9a-f]{40})/.exec(spec)
+  return viaTar === null ? undefined : viaTar[1]
+}
+
 
 /** 跑一条命令并取输出；失败返回 undefined（调用方负责说明原因，绝不假装成功）。 */
 function capture(command, cmdArgs, options = {}) {
@@ -75,9 +93,9 @@ const installedVersion = existsSync(installedPkg)
 
 const lockPath = join(profileDir, 'pnpm-lock.yaml')
 const lockText = existsSync(lockPath) ? readFileSync(lockPath, 'utf8') : ''
-// lock 里这一行的形状：version: git+ssh://...#<40 位 commit>
-const lockedCommit = /dsh-pixel-dashboard:[\s\S]{0,200}?version:\s*\S*#([0-9a-f]{40})/.exec(lockText)?.[1]
-
+// lock 里这一行的形状有两种（SSH 的 #<commit> 与 codeload 的 tar.gz/<commit>），
+// 统一交给 pinnedCommitOf 解析——只认一种会把「解析成功」误报成「没有钉点」。
+const lockedCommit = pinnedCommitOf(lockText)
 // ── 2. 上游最新提交 ────────────────────────────────────────────────
 // 用仓库自己的 origin（本机是 SSH；https 在这里不通）。
 const remoteUrl = capture('git', ['remote', 'get-url', 'origin'], { cwd: root })
@@ -129,7 +147,7 @@ if (updated === undefined) fail('pnpm update 失败，profile 未被改动（或
 
 // ── 5. 复核：绝不只信 pnpm 的退出码 ────────────────────────────────
 const afterLock = existsSync(lockPath) ? readFileSync(lockPath, 'utf8') : ''
-const afterCommit = /dsh-pixel-dashboard:[\s\S]{0,200}?version:\s*\S*#([0-9a-f]{40})/.exec(afterLock)?.[1]
+const afterCommit = pinnedCommitOf(afterLock)
 const afterVersion = existsSync(installedPkg)
   ? JSON.parse(readFileSync(installedPkg, 'utf8')).version
   : undefined
