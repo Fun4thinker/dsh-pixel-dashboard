@@ -46,8 +46,8 @@ import {
   permissionOf,
   quotaAlerts,
   shouldStayQuiet,
+  playSound,
   soundPlan,
-  SOUND_TONES,
 } from './notify.js'
 import { fetchPlans } from './plans.js'
 
@@ -320,6 +320,8 @@ export class NotifierRuntime {
     this.sessions = sessions
     this.layout = layout
     this.workspace = workspace
+    /** AudioContext 复用一个，避免每次发声都新建（浏览器对实例数有限制）。 */
+    this.soundCache = {}
     this.scope = scope
     this.seen = new SeenTracker()
     this.latch = new AlertLatch()
@@ -791,48 +793,8 @@ export class NotifierRuntime {
    * @param {{play:'chime'|'soft'|'deep'|'custom'|undefined, url:string}} plan - 发声口径。
    */
   #playSound(plan) {
-    const mode = plan?.play
-    if (mode === undefined) return
-    try {
-      if (mode === 'custom') {
-        const AudioCtor = this.scope?.Audio
-        if (typeof AudioCtor !== 'function' || plan.url === '') return
-        const audio = new AudioCtor(plan.url)
-        const played = audio.play?.()
-        // play() 返回 Promise：拒绝（自动播放策略）时静默吞掉，只留一句 warn。
-        if (played !== undefined && typeof played.catch === 'function') {
-          played.catch(() => {})
-        }
-        return
-      }
-      const tones = SOUND_TONES[mode]
-      if (tones === undefined) return
-      const Ctx = this.scope?.AudioContext ?? this.scope?.webkitAudioContext
-      if (typeof Ctx !== 'function') return
-      this.audioCtx ??= new Ctx()
-      const ctx = this.audioCtx
-      if (ctx?.state === 'suspended') void ctx.resume?.()
-      let cursor = 0
-      for (const tone of tones) {
-        const start = ctx.currentTime + cursor
-        const end = start + tone.ms / 1000
-        const osc = ctx.createOscillator()
-        const gain = ctx.createGain()
-        osc.type = 'sine'
-        osc.frequency.value = tone.hz
-        // 简单的包络：直接开关会有爆音，两头各留一小段淡入淡出。
-        gain.gain.setValueAtTime(0, start)
-        gain.gain.linearRampToValueAtTime(0.18, start + 0.012)
-        gain.gain.linearRampToValueAtTime(0, end)
-        osc.connect(gain)
-        gain.connect(ctx.destination)
-        osc.start(start)
-        osc.stop(end)
-        cursor += tone.ms / 1000 + 0.02
-      }
-    } catch {
-      // 声音是附加体验：放不出来不影响通知已经送达的事实。
-    }
+    // 与面板的「试听」共用同一个函数，避免两处发出的声音不一致。
+    playSound(plan, this.scope, this.soundCache)
   }
 
   /**

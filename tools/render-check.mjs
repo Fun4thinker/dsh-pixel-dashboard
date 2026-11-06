@@ -1077,6 +1077,46 @@ must(
   must(notifyModule.composeRecentLine(broken.recent[0]).includes('未弹出'),
     '面板那一行必须把「未弹出」显示出来')
 
+  // (f) 提示音口径：自己发声时必须同时静音系统通知，否则双响。
+  //     这条是**成对**约束，两边任一改动都可能让它失配。
+  const { soundPlan, playSound, SOUND_TONES } = notifyModule
+  must(JSON.stringify(soundPlan({ notifySound: 'system' })) === JSON.stringify({ silent: false, play: undefined, url: '' }),
+    '跟随系统时既不发声也不静音')
+  must(JSON.stringify(soundPlan({ notifySound: 'off' })) === JSON.stringify({ silent: true, play: undefined, url: '' }),
+    '关闭时应静音系统通知且不发声')
+  for (const mode of ['chime', 'soft', 'deep']) {
+    const plan = soundPlan({ notifySound: mode })
+    must(plan.silent === true, `${mode} 由插件发声，系统通知必须静音（否则双响）`)
+    must(plan.play === mode, `${mode} 应选择对应的内置音`)
+    must(Array.isArray(SOUND_TONES[mode]) && SOUND_TONES[mode].length > 0, `${mode} 必须有音效定义`)
+  }
+  must(JSON.stringify(soundPlan({ notifySound: 'custom', notifySoundUrl: 'https://a/b.mp3' }))
+    === JSON.stringify({ silent: true, play: 'custom', url: 'https://a/b.mp3' }),
+  '自定义音效应自己发声并静音系统')
+  // 选了自定义却没填地址：必须退回「跟随系统」，而不是静音——否则用户会彻底没声音。
+  must(JSON.stringify(soundPlan({ notifySound: 'custom', notifySoundUrl: '' }))
+    === JSON.stringify({ silent: false, play: undefined, url: '' }),
+  '自定义但没填地址时应退回跟随系统，不能变成全静音')
+
+  // 试听与真实通知必须共用同一发声函数（面板调的就是它）。
+  // 这条钉住的是「试听是这个声、真实通知是另一个声」那种最难解释的不一致。
+  {
+    const started = []
+    const fakeScope = {
+      AudioContext: class {
+        constructor() { this.currentTime = 0; this.state = 'running'; this.destination = {} }
+        createOscillator() { return { type: '', frequency: { value: 0 }, connect() {}, start() { started.push('start') }, stop() {} } }
+        createGain() { return { gain: { setValueAtTime() {}, linearRampToValueAtTime() {} }, connect() {} } }
+        resume() {}
+      },
+    }
+    playSound({ play: 'chime', url: '' }, fakeScope, {})
+    must(started.length > 0, '试听与真实通知共用的 playSound 必须真的发声')
+    started.length = 0
+    playSound({ play: undefined, url: '' }, fakeScope, {})
+    must(started.length === 0, 'play=none（跟随系统 / 关闭）时不该自己发声')
+  }
+
   // (e) 系统通知的 tag 必须**短**——这是桌面端「一条都弹不出来」的真因。
   //
   // Chromium 交给 Windows 的最终 tag 是 `n#<origin>#<tag>`；桌面端 origin 是

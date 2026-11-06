@@ -23,6 +23,8 @@ import {
   NOTIFY_FLAGS,
   NOTIFY_SOUND_OPTIONS,
   PERMISSION_TEXT,
+  playSound,
+  soundPlan,
   balanceAlerts,
   composeRecentLine,
   permissionOf,
@@ -1555,6 +1557,34 @@ function clockOf(at) {
  * @param {object} props - balance / plans。
  * @returns {object} React 元素。
  */
+/**
+ * 面板里的试听：用**与真实通知完全相同的发声函数**播一次。
+ *
+ * 为什么必须共用：如果试听另写一套，用户会听到「试听是这个声、真实通知是另一个声」
+ * ——那是最难解释的一类不一致，而且只在真跑完一轮时才会暴露。
+ *
+ * 组件外的时间戳做去重：换选项时 `click` 与 `change` 会先后触发，不去重就会连响两声。
+ * 400ms 足够覆盖这两个事件的间隔，又短到不会挡住用户「再点一次再听一次」。
+ * @param {string} mode - 下拉框选项值。
+ * @param {string} [url] - 自定义音频地址。
+ */
+let lastPreviewAt = 0
+function previewOnce(mode) {
+  if (mode === 'system' || mode === 'off') return
+  const now = Date.now()
+  if (now - lastPreviewAt < 400) return
+  lastPreviewAt = now
+  try {
+    // 自定义音效的地址存在配置里，点击时读**最新**值（ref 由调用方更新）。
+    playSound(soundPlan({ notifySound: mode, notifySoundUrl: previewUrl }))
+  } catch {
+    // 试听失败不影响任何设置：用户还能通过下一次真实通知确认。
+  }
+}
+
+/** 最近一次渲染看到的自定义音频地址，供试听读取（避免把整份 config 传进模块级函数）。 */
+let previewUrl = ''
+
 function NotifyPanel(props) {
   const { balance, plans } = props
   const store = useMemo(() => notifyStore(), [])
@@ -1613,6 +1643,8 @@ function NotifyPanel(props) {
   const rows = Array.isArray(balance?.balances) ? balance.balances : []
   const thresholds = config.warnBalance ?? {}
   const soundMode = typeof config.notifySound === 'string' ? config.notifySound : 'system'
+  // 试听函数是模块级的（不进组件闭包），自定义音频地址在这里同步给它。
+  previewUrl = typeof config.notifySoundUrl === 'string' ? config.notifySoundUrl : ''
   const active = balanceAlerts(balance, thresholds)
   const quotaHit = quotaAlerts(plans, config.warnQuotaPercent)
 
@@ -1695,13 +1727,30 @@ function NotifyPanel(props) {
           className: 'px-input px-notify-sound-select',
           value: soundMode,
           disabled: saving,
-          onChange: (event) => { save({ notifySound: event.target.value === 'system' ? 'system' : event.target.value }) },
+          // 点开下拉就先响一声当前选项。
+          // 原生 <select> 在「重复选中同一项」时**不触发 change**，只靠 onChange 的话
+          // 「再点一次听一遍」会没声音；而加个试听按钮又多余。两个入口都接上，
+          // 再用 400ms 去重，避免换选项时连响两次。
+          onClick: () => { previewOnce(soundMode) },
+          onChange: (event) => {
+            const next = event.target.value
+            save({ notifySound: next })
+            // 切到能自己发声的音效就**当场试听一遍**：否则用户只能等下一次
+            // 通知才知道自己选的是什么声音，选错了也无从发现。
+            previewOnce(next)
+          },
         },
         NOTIFY_SOUND_OPTIONS.map((option) => h('option', {
           key: option.value,
           value: option.value,
           title: option.hint,
         }, option.label))))),
+    soundMode === 'system' || soundMode === 'off'
+      ? null
+      : h('p', { className: 'px-muted px-note px-notify-sound-note' },
+        soundMode === 'system'
+          ? ''
+          : '「跟随系统」和「关闭」没有可试听的声音——前者交给系统，后者就是不响。'),
     soundMode === 'custom'
       ? h('div', { className: 'px-notify-flags' },
         h('label', { className: 'px-notify-flag px-notify-sound', title: 'http(s) 音频链接，或 data:audio/… 内联音频' },
