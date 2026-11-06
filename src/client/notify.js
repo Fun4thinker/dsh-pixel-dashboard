@@ -30,6 +30,57 @@ export const NOTIFY_URL = '/dsh-pixel/notify'
 const REQUEST_TIMEOUT_MS = 15_000
 
 /**
+ * 系统通知 `tag` 的长度上限。
+ *
+ * ## 为什么不是「随便拼一个可读字符串」（实测踩过，代价极高）
+ *
+ * 原来 tag 拼成 `dsh-pixel-<sessionId>-<turn>`，实测 56–57 个字符。在浏览器里
+ * 一切正常；而在 **DSH 桌面端**（Electron，页面 origin 是自定义协议
+ * `dsh-app://app`）里，通知**一条都弹不出来**——而且完全没有报错：
+ * `new Notification()` 不抛异常、「最近通知」里也照常留下记录。
+ *
+ * 根因在 tag 长度：Chromium 交给 Windows 平台的最终 tag 是
+ * `n#<origin>#<tag>`，`dsh-app://app` 这段 origin 先占掉十几个字符，剩下的预算
+ * 只够 tag 本身约 34 个字符（Electron 的 issue #40433 记的正是「Windows 11 下
+ * tag 超过 34 个字符，web 通知就不工作」，他们用 37 字符的 UUID 当 tag 时全丢）。
+ * `ToastNotification.Tag` 本身的上限是 16（Creators Update 后 64），但账是连着
+ * origin 一起算的。超长不会报错，只会被静默丢弃——这正是最难查的那一类。
+ *
+ * 所以 tag 一律由 {@link noticeTag} 生成：短前缀 + 哈希，总长压在 24 以内，
+ * 留足 origin 的预算。可读性由面板里的「最近通知」负责，tag 只需要**能区分、
+ * 能替换**。
+ */
+export const TAG_MAX = 24
+
+/**
+ * 32 位 FNV-1a → base36。
+ *
+ * 只为了把「会话 id + 轮次」这类长种子压成稳定短串：同一个种子永远得到同一个
+ * tag（替换语义成立），不同种子几乎必然不同（36^7 的空间）。
+ * @param {string} text - 种子。
+ * @returns {string} 6–7 个字符的 base36 串。
+ */
+export function hash36(text) {
+  let hash = 2166136261
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36).padStart(6, '0')
+}
+
+/**
+ * 生成一条系统通知的 tag。
+ * @param {string} kind - 类别短码（`n` 会话结束 / `i` 待办 / `q` 额度 / `b` 余额 / 其他）。
+ * @param {string} seed - 决定「是否同一条」的种子；同种子 → 同 tag（替换旧通知）。
+ * @returns {string} 不超过 {@link TAG_MAX} 的 tag。
+ */
+export function noticeTag(kind, seed) {
+  const prefix = `dsh-px-${String(kind ?? 'x').slice(0, 1)}-`
+  return `${prefix}${hash36(String(seed ?? ''))}`
+}
+
+/**
  * 通知配置的默认值，与宿主 lib/notify.js 的 `NOTIFY_DEFAULTS` 一致。
  *
  * 两侧各留一份是刻意的：宿主那份是**权威**（每次读取都会带上），这份只在
@@ -77,6 +128,23 @@ export const PERMISSION_TEXT = {
 export const QUIET_MARK = '（已静默，未弹窗）'
 
 /**
+ * 「最近通知」里给**弹窗失败**那条加的尾注。
+ *
+ * 与 {@link QUIET_MARK} 同一套理由：一条记进了列表却没有任何气泡的提醒，和
+ * 「功能漏了」在界面上完全一样。区别是它**不是设计行为**，所以这里直接写出
+ * 失败原因，用户才能区分「环境不支持系统通知」与「这一条弹不出来」。
+ *
+ * 这条尾注的由来是实测：桌面端同一个进程里，控制台 `new Notification()` 能弹，
+ * 插件里同样的调用却弹不出，而 `catch` 当时把原因吞了——只剩「有记录、没气泡」
+ * 这个无从解释的现象。失败必须可归因。
+ * @param {string} reason - 失败原因。
+ * @returns {string} 尾注文本。
+ */
+export function failedMark(reason) {
+  return `〔未弹出：${String(reason ?? '原因未知')}〕`
+}
+
+/**
  * 「最近通知」里某一行的正文。
  *
  * 抽成纯函数是为了让闸门能直接断言它——面板把「最近通知」默认收起，
@@ -90,7 +158,10 @@ export function composeRecentLine(item) {
   const body = item?.body === undefined || item.body === '' ? '' : ` — ${String(item.body)}`
   // 被「当前会话不打扰」静默的那条照样列出来，并明说它没弹：否则用户看到的是
   // 「有个会话完成了却什么都没发生」，只会以为功能漏了提醒。
-  return `${title}${body}${item?.quiet === true ? QUIET_MARK : ''}`
+  // 弹窗失败的那条同理，但尾注不同——那是 bug，不是设计。
+  const quiet = item?.quiet === true ? QUIET_MARK : ''
+  const failed = typeof item?.failed === 'string' && item.failed !== '' ? failedMark(item.failed) : ''
+  return `${title}${body}${quiet}${failed}`
 }
 
 /**
@@ -363,7 +434,7 @@ export function composeNotice(notice) {
     title: `${workspace} · ${label}`,
     body: parts.join(' · '),
     // tag 让同一条会话的新通知替换旧的那条，而不是在通知中心堆成一列
-    tag: `dsh-pixel-${String(notice?.sessionId ?? '')}-${turn}`,
+    tag: noticeTag('n', `${String(notice?.sessionId ?? '')}:${turn}`),
     level: typeof notice?.level === 'string' ? notice.level : 'ok',
     // 会话 id 单独带一份（**不**去解析 tag）：点击通知要能切到那条会话。
     // 从 tag 反解析看似可行，但 tag 是人可读的拼接串，格式一变就静默失效。
@@ -400,7 +471,7 @@ export function composeInteraction(interaction) {
     return {
       title: '需要你的授权',
       body: `${tool} 请求执行授权${reason}`,
-      tag: `dsh-pixel-approval-${key}`,
+      tag: noticeTag('i', `approval:${key}`),
       level: 'warn',
       sessionId,
     }
@@ -416,7 +487,7 @@ export function composeInteraction(interaction) {
     return {
       title: kind === 'plan-review' ? '有一份计划等你确认' : 'AI 在等你回答',
       body: `${text === '' ? '有一个问题需要你回复' : text}${more}`,
-      tag: `dsh-pixel-question-${key}`,
+      tag: noticeTag('i', `${kind}:${key}`),
       level: 'warn',
       sessionId,
     }
@@ -424,7 +495,7 @@ export function composeInteraction(interaction) {
   return {
     title: '需要你处理',
     body: '有一个待办需要你的输入',
-    tag: `dsh-pixel-interaction-${key}`,
+    tag: noticeTag('i', `interaction:${key}`),
     level: 'warn',
     sessionId,
   }
@@ -504,7 +575,7 @@ export function composeQuotaAlert(alerts) {
   return {
     title: '套餐额度接近上限',
     body: `${summary}${more}`,
-    tag: `dsh-pixel-quota-${String(first.provider ?? '')}-${String(first.window ?? '')}`,
+    tag: noticeTag('q', `${String(first.provider ?? '')}:${String(first.window ?? '')}`),
     level: 'warn',
   }
 }
@@ -524,7 +595,7 @@ export function composeBalanceAlert(alerts, formatMoney) {
   return {
     title: '账户余额低于预警阈值',
     body: `${summary}${more}`,
-    tag: `dsh-pixel-balance-${alerts.map((item) => item.currency).join('-')}`,
+    tag: noticeTag('b', alerts.map((item) => item.currency).join('-')),
     level: 'error',
   }
 }

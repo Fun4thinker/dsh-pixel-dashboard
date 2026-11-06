@@ -648,8 +648,12 @@ must(
   `运行时应按宿主增量发出系统通知，实际发出 ${JSON.stringify(notifications)}`,
 )
 must(
-  notifications.every((item) => typeof item.tag === 'string' && item.tag.startsWith('dsh-pixel-')),
+  notifications.every((item) => typeof item.tag === 'string' && item.tag.startsWith('dsh-px-')),
   `通知应带上用于替换同一条提醒的 tag，实际 ${JSON.stringify(notifications)}`,
+)
+must(
+  notifications.every((item) => item.tag.length <= 24),
+  `tag 必须短：桌面端 origin 会再占十几个字符，超预算的通知在 Windows 上会被静默丢弃，实际 ${JSON.stringify(notifications.map((item) => item.tag))}`,
 )
 
 // 9) 回落通道：系统通知**不可用**时（没授权 / 非安全上下文），页面内提示条是
@@ -956,11 +960,12 @@ must(
   const doneB = { id: 2, at: Date.now(), sessionId: 'session-B', workspace: 'demo', turn: 1, category: 'done', level: 'ok', label: '已完成' }
 
   // (a) 正在看 A（会话界面在屏幕上）：A 不弹，B 照弹
+  const tagOf = (notice) => notifyModule.noticeTag('n', `${notice.sessionId}:${notice.turn ?? 0}`)
   const watching = await runQuiet({ current: 'session-A', anchor: true, events: [doneA, doneB] })
   const watchingTags = watching.fired.map((item) => item.tag)
-  must(!watchingTags.includes('dsh-pixel-session-A-1'),
+  must(!watchingTags.includes(tagOf(doneA)),
     `正在看的那条会话完成时不应弹通知，实际弹了 ${JSON.stringify(watchingTags)}`)
-  must(watchingTags.includes('dsh-pixel-session-B-1'),
+  must(watchingTags.includes(tagOf(doneB)),
     `别的会话完成时**必须**弹通知（用户报的就是这条漏了），实际弹了 ${JSON.stringify(watchingTags)}`)
   must(watching.recent.some((item) => item.sessionId === 'session-A' && item.quiet === true),
     '被静默的提醒仍必须记进「最近通知」并标 quiet——悄悄消失的提醒与从未产生的提醒在界面上无法区分')
@@ -970,7 +975,7 @@ must(
   // (b) **回归本体**：还是选中 A，但主区停在看板上（会话界面没挂载）→ A 也必须弹。
   //     旧实现只比 current，这一条会失败，而它正是用户感受到的「漏提醒」。
   const onPanel = await runQuiet({ current: 'session-A', anchor: false, events: [doneA] })
-  must(onPanel.fired.some((item) => item.tag === 'dsh-pixel-session-A-1'),
+  must(onPanel.fired.some((item) => item.tag === tagOf(doneA)),
     '停在「用量看板」时，选中的那条会话完成必须弹通知——'
     + '会话界面这时根本没挂在屏幕上，静默它就是用户报的漏提醒')
   must(onPanel.recent.every((item) => item.quiet !== true),
@@ -980,7 +985,7 @@ must(
   //      别的应用很久了（页面没有任何输入）→ 必须照样弹。
   //      旧实现在这一例上会静默，用户看到的就是「主会话跑完一声不响」。
   const away = await runQuiet({ current: 'session-A', anchor: true, events: [doneA], idleMs: QUIET_IDLE_MS + 60_000 })
-  must(away.fired.some((item) => item.tag === 'dsh-pixel-session-A-1'),
+  must(away.fired.some((item) => item.tag === tagOf(doneA)),
     '人已经不在页面里（5 分钟无任何输入）时，当前会话完成**必须**弹通知——'
     + ' Electron 的 hasFocus 会一直返回 true，不能拿它当唯一判据')
   must(away.recent.every((item) => item.quiet !== true),
@@ -988,7 +993,7 @@ must(
 
   // (b3) 页面被隐藏（最小化 / 被遮挡）时同理不得静默。
   const hidden = await runQuiet({ current: 'session-A', anchor: true, events: [doneA], visible: false })
-  must(hidden.fired.some((item) => item.tag === 'dsh-pixel-session-A-1'),
+  must(hidden.fired.some((item) => item.tag === tagOf(doneA)),
     '页面不可见时当前会话完成必须弹通知')
 
   // (c) 被静默的那条必须在面板里**看得出来**。
@@ -1006,6 +1011,78 @@ must(
     `行文案必须同时带标题与正文：${loudLine}`)
   must(notifyModule.composeRecentLine({ title: 'x' }) === 'x',
     '没有正文时不该留下多余的分隔符')
+
+  // (d) 系统通知**构造失败**时必须可归因。
+  //
+  // 实测踩过：桌面端「最近通知」里有记录、系统却一条气泡都没有，而 #fire 的 catch
+  // 把构造异常吞了，只剩「有记录、没气泡」这个无从解释的现象——最后是靠读 Windows
+  // 的 LastNotificationAddedTime 一步步反推的。归因还错在「构造失败一定是环境问题」
+  // 这个假定上：同一个进程里控制台 new Notification() 能弹，插件里同样的调用弹不出。
+  const failedLine = notifyModule.composeRecentLine({ title: 'demo · 已完成', body: '第 1 轮', failed: 'TypeError: boom' })
+  must(failedLine.includes('TypeError: boom'),
+    `弹窗失败的那条必须把原因写出来，否则用户无法区分「环境不支持」与「这条弹不出」：${failedLine}`)
+  must(!failedLine.includes(notifyModule.QUIET_MARK),
+    '失败不是「已静默」，两者尾注不能混用')
+  must(notifyModule.composeRecentLine({ title: 'x' }) === 'x',
+    '没失败的行不该被加上失败尾注')
+
+  // 派发路径本身：构造函数抛错时，那条最近通知必须带上 failed，且不能打断派发。
+  const broken = await (async () => {
+    const fired = []
+    function BrokenNotification() { throw new TypeError('boom-construct') }
+    BrokenNotification.permission = 'granted'
+    const store = new NotifyStore()
+    const runtime = new NotifierRuntime({
+      store,
+      uiSession: () => undefined,
+      sessions: () => ({ list: { getSnapshot: () => ({ current: 'session-A' }) } }),
+      scope: { Notification: BrokenNotification, document: { hasFocus: () => true } },
+    })
+    store.setConfig({ ...NOTIFY_CONFIG_STUB })
+    runtime.seen.cursor = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ config: NOTIFY_CONFIG_STUB, cursor: 2, events: [doneA], dropped: false }),
+      text: async () => '',
+    })
+    try {
+      await runtime.pollNotices()
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    runtime.dispose()
+    return { fired, recent: store.recent }
+  })()
+  must(broken.recent.some((item) => typeof item.failed === 'string' && item.failed.includes('boom-construct')),
+    '构造抛错时，那条记录必须带上 failed 原因——否则「有记录却没气泡」又变成无从解释的现象')
+  must(notifyModule.composeRecentLine(broken.recent[0]).includes('未弹出'),
+    '面板那一行必须把「未弹出」显示出来')
+
+  // (e) 系统通知的 tag 必须**短**——这是桌面端「一条都弹不出来」的真因。
+  //
+  // Chromium 交给 Windows 的最终 tag 是 `n#<origin>#<tag>`；桌面端 origin 是
+  // dsh-app://app，先占掉十几个字符，留给 tag 的预算只剩约 34（electron#40433：
+  // Windows 11 下 tag >34 就不再工作）。旧实现拼 `dsh-pixel-<sessionId>-<turn>`，
+  // 实测 56–57 个字符 → 全部被静默丢弃，且**不抛错**，只能靠注册表反推。
+  const sampleNotice = { sessionId: 'session-2fa724e2-564a-46c1-b6c1-30172694f366', workspace: 'my-blog', turn: 12, label: '已完成', level: 'ok', body: '第 12 轮' }
+  const tags = [
+    ['会话结束', notifyModule.composeNotice(sampleNotice).tag],
+    ['待办', notifyModule.composeInteraction({ kind: 'question', key: 'question:1', sessionId: 'session-x' }).tag],
+    ['额度', notifyModule.composeQuotaAlert([{ provider: 'AVeryLongProviderName', window: 'monthly-window', label: '月度', percent: 91 }]).tag],
+    ['余额', notifyModule.composeBalanceAlert([{ currency: 'CNY', total: 3, threshold: 5 }], (v) => String(v)).tag],
+  ]
+  for (const [label, tag] of tags) {
+    must(typeof tag === 'string' && tag.length > 0, `${label}通知必须有 tag`)
+    must(tag.length <= notifyModule.TAG_MAX,
+      `${label}通知的 tag 太长（${tag.length} > ${notifyModule.TAG_MAX}）：${tag}`
+      + ' —— 桌面端 origin 会再占十几个字符，超过预算的通知在 Windows 上会被静默丢弃')
+  }
+  must(notifyModule.composeNotice(sampleNotice).tag === notifyModule.composeNotice(sampleNotice).tag,
+    '同一个种子的 tag 必须稳定，否则「替换旧通知」的语义就没了')
+  must(notifyModule.composeNotice(sampleNotice).tag !== notifyModule.composeNotice({ ...sampleNotice, turn: 13 }).tag,
+    '不同轮次必须是不同 tag，否则新通知会顶掉上一条')
 }
 
 // 9b) 授权行的**三种状态必须措辞不同**，且各自的下一步动作不同。

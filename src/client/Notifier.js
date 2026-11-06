@@ -337,7 +337,7 @@ export class NotifierRuntime {
       this.#fire({
         title: '测试通知',
         body: '看到这一条就说明通知链路是通的。',
-        tag: 'dsh-pixel-test',
+        tag: 'dsh-px-test',
         level: 'ok',
       }, 'test')
     }
@@ -540,7 +540,7 @@ export class NotifierRuntime {
         this.#push({
           title: '有通知在断连期间丢失',
           body: '浏览器与宿主断开了一段时间，期间的提醒已被裁剪。',
-          tag: 'dsh-pixel-dropped',
+          tag: 'dsh-px-drop',
           level: 'warn',
         }, 'system')
       }
@@ -710,14 +710,38 @@ export class NotifierRuntime {
 
   /**
    * 派发一条通知：系统通知优先，不可用时回落页面内提示条。
+   *
+   * ## 先尝试、后记账（踩过的坑）
+   *
+   * 这里的顺序是「先弹、再把结果记进最近通知」，而不是先记账再弹。早先是反的，
+   * 后果是一次真实的排障灾难：用户在桌面端看到「最近通知」里明明有记录、系统却
+   * 一条气泡都没有，而 `catch` 把构造失败**静默吞掉**，于是既没有气泡、也没有
+   * 任何线索——只能靠对着 `LastNotificationAddedTime` 这类外部读数一步步反推。
+   *
+   * 归因就错在 catch 的注释上：它假定「构造失败一定是环境问题（未授权 / 非安全
+   * 上下文）」，可实测存在**同一个进程里控制台 `new Notification()` 能弹、插件里
+   * 同样的调用却弹不出**的情况——失败可能与这一条通知的内容有关，而不是环境。
+   * 既然这种失败是**可归因到单条通知**的事实，就必须让它可见。
    * @param {object} spec - 文案（可带 sessionId）。
    * @param {string} category - 类别（面板展示与统计用）。
    */
   #fire(spec, category) {
-    this.#push(spec, category)
-    if (this.permission !== 'granted') return
+    const failure = this.#deliver(spec)
+    this.#push(spec, category, failure)
+  }
+
+  /**
+   * 尝试弹系统通知。
+   *
+   * 返回值刻意区分三种「没弹」：**undefined = 正常**（含「没授权，按设计回落提示条」）、
+   * 字符串 = 本可以弹却失败了，原因要写进最近通知给用户看。
+   * @param {object} spec - 文案。
+   * @returns {string|undefined} 失败原因；正常返回 undefined。
+   */
+  #deliver(spec) {
+    if (this.permission !== 'granted') return undefined
     const Notification = this.scope?.Notification
-    if (typeof Notification !== 'function') return
+    if (typeof Notification !== 'function') return '环境里没有 Notification，无法弹系统通知'
     try {
       // tag 让同一条会话/同一条预警的新通知**替换**旧的那条，
       // 而不是在通知中心堆成一列——预警持续期间尤其明显。
@@ -749,15 +773,26 @@ export class NotifierRuntime {
           }
         }
       }
-    } catch {
-      // 某些环境（如未授权的 Worker、非安全上下文）构造会抛错：已经落进
-      // 最近通知与页面内提示了，这里不再重复报错。
+      return undefined
+    } catch (error) {
+      // **绝不静默**：把原因带出去写进最近通知。用户看到的「有记录却没气泡」
+      // 与「构造时抛错」之间必须有可见的因果，而不是靠注册表反推。
+      const detail = error instanceof Error ? error.message : String(error)
+      const name = error instanceof Error && error.name !== '' ? `${error.name}: ` : ''
+      return `系统通知没有弹出来（${name}${detail}）`
     }
   }
 
-  /** 记一条派发记录，并刷新页面内提示。 */
-  #push(spec, category) {
+  /**
+   * 记一条派发记录，并刷新页面内提示。
+   * @param {object} spec - 文案。
+   * @param {string} category - 类别。
+   * @param {string} [failure] - 系统通知未能弹出的原因；有值时记进这一条记录。
+   */
+  #push(spec, category, failure) {
     const entry = { at: Date.now(), category, ...spec }
+    // 失败原因跟着这一条走：面板据此在行尾标出来，用户不必再猜。
+    if (typeof failure === 'string' && failure !== '') entry.failed = failure
     this.store.pushRecent(entry)
     // 系统通知不可用时，页面内提示条是**唯一**的可见通道，必须亮出来。
     // 可用时不再叠加：系统通知已经弹过一次，页面里再来一条是重复打扰。
