@@ -136,13 +136,55 @@ if (args.check) {
 }
 
 // ── 4. 更新 ────────────────────────────────────────────────────────
-const pnpm = capture('pnpm', ['--version']) === undefined
-  ? undefined
-  : (process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm')
-if (pnpm === undefined) fail('找不到 pnpm。桌面端的插件管理器用它，但当前 PATH 上没有。')
+const runner = pnpmRunner()
+if (runner === undefined) {
+  fail(
+    '找不到 pnpm（Windows 上试过 `where.exe pnpm`，其余平台试过 `pnpm --version`）。\n'
+    + '  桌面端的插件管理器用它，但当前 PATH 上确实没有可执行的 pnpm。',
+  )
+}
 
-console.log(`\n$ ${pnpm} update dsh-pixel-dashboard   (cwd: ${profileDir})`)
-const updated = capture(pnpm, ['update', 'dsh-pixel-dashboard'], { cwd: profileDir, stdio: ['ignore', 'pipe', 'inherit'] })
+/**
+ * 找到「怎么调用 pnpm」。
+ *
+ * ## Windows 上 npm 全局安装的 pnpm 没有 `.exe`
+ *
+ * 它只有 `pnpm.CMD` / `pnpm.ps1` / 一个 git-bash 用的无后缀垫片。而 Node 的
+ * `execFileSync` **两边都不认**：
+ *   - `execFileSync('pnpm')` 不按 PATHEXT 补后缀 → `ENOENT`；
+ *   - `execFileSync('pnpm.cmd')` 不能直接 spawn `.cmd` → `EINVAL`。
+ *
+ * 早先的写法「先试 `pnpm`，再退回 `pnpm.cmd`」因此在**每台标准 Windows 机器上都必定
+ * 失败**，并且把原因误报成「找不到 pnpm……当前 PATH 上没有」——这句话是**错的**
+ * （它就在 PATH 上），错误归因会把用户支去重装 pnpm，而他重装十次也不会好。
+ *
+ * 所以先 `where.exe pnpm` 取真实路径：`.exe` 直接调，`.cmd` 交给 `cmd.exe`。
+ * 刻意**不用** `shell: true`：那会触发 DEP0190（参数只拼接、不转义），而本脚本的
+ * 参数是固定字面量；真要让 shell 介入，就给一条明确的命令，而不是放任它重切参数。
+ * POSIX 上仍然是裸 `pnpm`。
+ * @returns {{command:string,prefix:string[]}|undefined} 调用方式；undefined = 真的没有。
+ */
+function pnpmRunner() {
+  if (process.platform !== 'win32') {
+    return capture('pnpm', ['--version']) === undefined ? undefined : { command: 'pnpm', prefix: [] }
+  }
+  const found = capture('where.exe', ['pnpm'])
+  if (found === undefined) return undefined
+  const paths = found.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '')
+  const exe = paths.find((item) => /\.exe$/i.test(item))
+  if (exe !== undefined) return { command: exe, prefix: [] }
+  const shim = paths.find((item) => /\.cmd$/i.test(item))
+  if (shim === undefined) return undefined
+  const comspec = process.env.ComSpec ?? 'cmd.exe'
+  return { command: comspec, prefix: ['/d', '/s', '/c', shim] }
+}
+
+const how = [runner.command, ...runner.prefix].join(' ')
+console.log(`\n$ ${how} update dsh-pixel-dashboard   (cwd: ${profileDir})`)
+const updated = capture(runner.command, [...runner.prefix, 'update', 'dsh-pixel-dashboard'], {
+  cwd: profileDir,
+  stdio: ['ignore', 'pipe', 'inherit'],
+})
 if (updated === undefined) fail('pnpm update 失败，profile 未被改动（或改动不完整）。')
 
 // ── 5. 复核：绝不只信 pnpm 的退出码 ────────────────────────────────
