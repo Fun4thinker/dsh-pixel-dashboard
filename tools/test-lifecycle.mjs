@@ -68,7 +68,7 @@ const { default: plugin } = await import(pathToFileURL(join(root, 'lib', 'host.j
  * 钉死条数是有意的：它逼你确认「新路由有没有走 `route()` 助手」——裸调
  * `ctx.webServer.register` 会让这一关在第二轮 apply 时炸掉。
  */
-const ROUTE_COUNT = 9
+const ROUTE_COUNT = 10
 
 check('插件声明了 inject: [webServer]（否则 apply 时机不确定）', () => {
   assert.deepEqual(plugin.inject, ['webServer'])

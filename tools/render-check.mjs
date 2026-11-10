@@ -267,7 +267,7 @@ function periodStubBody() {
   }
 }
 const NOTIFY_CONFIG_STUB = {
-  notifyEnabled: true, notifyDone: true, notifyError: true, notifyBalance: true, notifyQuota: true,
+  notifyEnabled: true, notifyDone: true, notifySubagent: true, notifyError: true, notifyBalance: true, notifyQuota: true,
   notifyQuietFocused: true, warnBalance: {}, warnQuotaPercent: 90,
 }
 sandbox.globalThis = sandbox
@@ -456,6 +456,79 @@ const composed = composeNotice({ workspace: 'blog', label: '失败', detail: 'ra
 must(composed.title.includes('blog') && composed.title.includes('失败'), `标题应含目录名与结论：${composed.title}`)
 must(composed.body.includes('RATE_LIMIT') && composed.body.includes('第 3 轮'), `正文应含错误码与轮次：${composed.body}`)
 
+// 1b) 子智能体：必须**自称子智能体**，且结论词是「有新进展」而不是「已完成」
+//
+// 用户报的正是这条：桌面通知在子智能体完成时也会弹，而内容里没有任何一个字
+// 说明它是子智能体——读起来就像自己的会话跑完了，于是「我可以继续推进了」这个
+// 判断被错误地触发。主会话的文案**保持不变**（用户明确要求），只把子智能体
+// 那一档降级成进展；失败不降级（那属于需要你看一眼的事）。
+{
+  const subDone = composeNotice({
+    workspace: 'blog', label: '已完成', turn: 2, sessionId: 'session-sub', level: 'ok',
+    category: 'done', subagent: true, agentName: 'alice', agentLabel: '审查通知文案',
+  })
+  must(subDone.title.includes('子智能体'), `子智能体的通知必须自称子智能体：${subDone.title}`)
+  must(subDone.title.includes('有新进展'), `子智能体的结论词应是「有新进展」：${subDone.title}`)
+  must(!subDone.title.includes('已完成'),
+    `子智能体不得复用「已完成」——那句话会被读成「你的会话跑完了，可以继续推进」：${subDone.title}`)
+  must(subDone.title.includes('alice'), `团队里常有好几个成员，必须写出是哪一个：${subDone.title}`)
+  must(subDone.body.includes('进展同步') && subDone.body.includes('审查通知文案'),
+    `正文应先说性质、再说细节：${subDone.body}`)
+  must(subDone.level === 'progress', `子智能体进展应落弱一档的等级（progress），实际 ${subDone.level}`)
+  must(!JSON.stringify(subDone).includes('undefined'), `子智能体文案里不该出现 undefined：${JSON.stringify(subDone)}`)
+
+  // 名字拿不到时退回「子智能体」三个字，**绝不编名字**——编一个「子智能体 1」
+  // 会让用户去侧栏里找一个永远找不到的名字。
+  const anonymous = composeNotice({
+    workspace: 'blog', label: '已完成', turn: 1, sessionId: 'session-sub', level: 'ok',
+    category: 'done', subagent: true,
+  })
+  must(anonymous.title === 'blog · 子智能体有新进展', `没有名字时的标题：${anonymous.title}`)
+
+  // 失败**也要能区分开**（用户追加要求）：子智能体失败仍按失败等级提醒（红框、
+  // 有声音），但结论词不能与主会话共用「失败」——那会被读成「我的任务失败了」，
+  // 而实际上 lead 可能重试、换人，或带着这个空洞继续往下走。
+  const subFail = composeNotice({
+    workspace: 'blog', label: '失败', detail: 'boom', turn: 1, sessionId: 'session-sub',
+    outcome: 'error', level: 'error', category: 'error', subagent: true, agentName: 'alice',
+  })
+  must(subFail.title.includes('子智能体') && subFail.title.includes('alice'),
+    `子智能体失败必须说清是哪个成员：${subFail.title}`)
+  must(subFail.title.includes('未完成'), `子智能体的 error 应写作「未完成」：${subFail.title}`)
+  must(!subFail.title.includes('失败'),
+    `子智能体的 error 不得复用「失败」——那是主会话「你的事没成」的说法：${subFail.title}`)
+  must(!subFail.body.includes('进展同步'), `失败不是「进展同步」：${subFail.body}`)
+  must(subFail.body.includes('boom'), `失败仍要带上原因：${subFail.body}`)
+  // 严重程度**不降级**：结论词换了，等级仍是 error（红框 + 声音）。
+  must(subFail.level === 'error', `子智能体失败仍应是 error 等级，实际 ${subFail.level}`)
+
+  // 其余「没跑完」的原因保留宿主原词：它们本来就不是「失败」这个词，
+  // 换成笼统的「未完成」会把「为什么没跑完」这条信息弄丢。
+  const subAborted = composeNotice({
+    workspace: 'blog', label: '已中断', detail: '被上级会话取消', turn: 1, sessionId: 'session-sub',
+    outcome: 'aborted', level: 'warn', category: 'error', subagent: true, agentName: 'bob',
+  })
+  must(subAborted.title.includes('已中断'),
+    `子智能体被中断时应保留具体原因，而不是笼统写成「未完成」：${subAborted.title}`)
+  must(subAborted.level === 'warn', `被中断仍是 warn 等级，实际 ${subAborted.level}`)
+
+  // 主会话文案**一位都不许变**（用户：主会话文案不用变）
+  const mainDone = composeNotice({ workspace: 'blog', label: '已完成', turn: 1, sessionId: 's1', level: 'ok' })
+  must(mainDone.title === 'blog · 已完成', `主会话完成文案应保持原样：${mainDone.title}`)
+  const mainFail = composeNotice({
+    workspace: 'blog', label: '失败', detail: 'boom', turn: 1, sessionId: 's1',
+    outcome: 'error', level: 'error', category: 'error',
+  })
+  must(mainFail.title === 'blog · 失败', `主会话失败文案应保持原样：${mainFail.title}`)
+
+  // 两条通知的 tag 不能互相顶掉：子智能体与主会话是两件不同的事
+  const sameSeed = { workspace: 'blog', label: '已完成', turn: 5, sessionId: 'session-x', level: 'ok', category: 'done' }
+  must(
+    composeNotice({ ...sameSeed, subagent: true }).tag !== composeNotice(sameSeed).tag,
+    '子智能体通知与主会话通知即使落在同一条会话同一轮次，也不该共用一个 tag（会互相替换掉）',
+  )
+}
+
 // 2) 待办通知：授权看 toolName、提问看 questions（两者字段不同，不能猜一个共同字段）
 const approvalNotice = composeInteraction({ kind: 'approval', key: 'approval:1', toolName: 'shell' })
 must(approvalNotice.title.includes('授权'), `授权通知标题应说明需要授权：${approvalNotice.title}`)
@@ -633,6 +706,13 @@ must(permissionOf({ Notification: Object.assign(() => {}, { permission: 'granted
 must(permissionOf({ Notification: Object.assign(() => {}, { permission: 'weird' }) }) === 'default', '未知权限值应归为 default')
 must(typeof PERM_TEXT.unsupported === 'string' && PERM_TEXT.unsupported !== '', 'unsupported 必须有可读文案')
 must(CLIENT_DEFAULTS.warnQuotaPercent === 90, '客户端默认阈值应与宿主一致（90 与看板红色档相同）')
+// 「子智能体进展」默认开着：关掉的默认值会让团队成员收工这件事静默消失，而用户
+// 打开面板看到的是「这个开关是关的」，只会以为插件默认不想提醒他。
+must(CLIENT_DEFAULTS.notifySubagent === true, '「子智能体进展」的客户端兜底默认值应为开')
+must(
+  notifyModule.NOTIFY_FLAGS.some((flag) => flag.key === 'notifySubagent'),
+  '面板的开关表里必须有「子智能体进展」，否则这个开关根本无处可关',
+)
 
 // 8) 端到端：首轮只学游标（不重播历史），第二轮才派发新事件。
 //    这一条同时钉住两件事：运行时确实在跑，且**刷新页面不会重播旧提醒**。
@@ -919,7 +999,7 @@ must(
 
   // ── 运行时层：同一个判定必须真的作用在派发路径上 ──────────────────
   /** 造一个运行时并驱动一轮日志轮询，返回弹了哪些通知、记了哪些最近通知。 */
-  async function runQuiet({ current, anchor, events, idleMs = 0, visible = true }) {
+  async function runQuiet({ current, anchor, events, idleMs = 0, visible = true, config = NOTIFY_CONFIG_STUB }) {
     const fired = []
     function QuietNotification(title, options) { fired.push({ title, ...options }) }
     QuietNotification.permission = 'granted'
@@ -954,14 +1034,14 @@ must(
     })
     // 「用户最近一次动页面」的时间戳：0 表示刚刚动过，大值表示人早就走了。
     runtime.presence.lastInputAt = Date.now() - idleMs
-    store.setConfig({ ...NOTIFY_CONFIG_STUB })
+    store.setConfig({ ...config })
     // 游标记为已知，这样首轮不会走「只学游标」的分支，事件会真的被派发。
     runtime.seen.cursor = 0
     const realFetch = globalThis.fetch
     globalThis.fetch = async () => ({
       ok: true,
       status: 200,
-      json: async () => ({ config: NOTIFY_CONFIG_STUB, cursor: 2, events, dropped: false }),
+      json: async () => ({ config, cursor: 2, events, dropped: false }),
       text: async () => '',
     })
     try {
@@ -1012,6 +1092,43 @@ must(
   const hidden = await runQuiet({ current: 'session-A', anchor: true, events: [doneA], visible: false })
   must(hidden.fired.some((item) => item.tag === tagOf(doneA)),
     '页面不可见时当前会话完成必须弹通知')
+
+  // (b4) 子智能体「完成」走**它自己的开关**（notifySubagent），而主会话完成仍走
+  //      notifyDone。两条断言是双向的：关掉时不能弹，且**不能顺带把主会话也关掉**。
+  //      用户的要求是「子智能体的通知标志从完成改为有新进展，并且新增开关可以关掉
+  //      子智能体的通知」——主会话的行为与文案都不变。
+  const subDone = {
+    id: 3, at: Date.now(), sessionId: 'session-sub', workspace: 'demo', turn: 1,
+    category: 'done', level: 'ok', label: '已完成', subagent: true, agentName: 'alice',
+  }
+  const subOff = await runQuiet({
+    current: undefined,
+    anchor: false,
+    events: [subDone],
+    config: { ...NOTIFY_CONFIG_STUB, notifySubagent: false },
+  })
+  must(subOff.fired.length === 0,
+    `关掉「子智能体进展」后不该再弹子智能体的完成通知，实际弹了 ${JSON.stringify(subOff.fired)}`)
+  const subOn = await runQuiet({ current: undefined, anchor: false, events: [subDone] })
+  must(subOn.fired.length === 1 && String(subOn.fired[0].title).includes('有新进展'),
+    `开着时应弹一条「有新进展」：${JSON.stringify(subOn.fired)}`)
+  const mainWithSubOff = await runQuiet({
+    current: undefined,
+    anchor: false,
+    events: [doneA],
+    config: { ...NOTIFY_CONFIG_STUB, notifySubagent: false },
+  })
+  must(mainWithSubOff.fired.length === 1,
+    '关掉「子智能体进展」不得影响主会话完成的提醒（那是两个开关）')
+  // 失败不受这个开关影响：子智能体报错仍要提醒（那是需要你看一眼的事）。
+  const subFailOff = await runQuiet({
+    current: undefined,
+    anchor: false,
+    events: [{ ...subDone, id: 4, category: 'error', level: 'error', label: '失败', detail: 'boom' }],
+    config: { ...NOTIFY_CONFIG_STUB, notifySubagent: false },
+  })
+  must(subFailOff.fired.length === 1,
+    '子智能体的失败必须照常提醒——关掉「进展」不等于关掉「出错」')
 
   // (c) 被静默的那条必须在面板里**看得出来**。
   //     「最近通知」默认收起（收起时内容不渲染），整页静态渲染到不了这里，
@@ -2523,8 +2640,10 @@ must(
   /\.px-toast-host\s*\{[^}]*z-index\s*:/.test(css),
   '提示条容器必须带 z-index，否则会被产品面板盖住',
 )
-// 三种等级各有一支左边框色，否则「失败」与「完成」看起来一模一样
-for (const level of ['ok', 'warn', 'error']) {
+// 三种等级各有一支左边框色，否则「失败」与「完成」看起来一模一样。
+// `progress` 是子智能体进展那一档：它**有意的**不用语义色（绿/黄/红），
+// 只借描边色，于是「主会话完成」与「某个成员收工」在页面上不会混成同一类事。
+for (const level of ['ok', 'warn', 'error', 'progress']) {
   must(css.includes(`.px-toast-${level}`), `提示条缺少 ${level} 等级样式`)
 }
 
@@ -3235,7 +3354,7 @@ const required = [
   // 通知与预警面板：开关、授权状态、阈值输入都在这里，缺一块就是功能没落地
   '通知与预警', 'px-notify-permission', 'px-notify-flags', 'px-notify-threshold',
   'px-notify-inputs', 'px-notify-recent', '余额预警阈值', '套餐额度预警',
-  '任务完成', '失败 / 中断', '等待授权 / 回答', '当前会话不打扰',
+  '任务完成', '子智能体进展', '失败 / 中断', '等待授权 / 回答', '当前会话不打扰',
   // 阈值并排：两项同处一个容器（原来各占一整行，白吃两倍高度）
   'px-notify-thresholds',
   // 两张趋势卡片同行 + 维度切换器

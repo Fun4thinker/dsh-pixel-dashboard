@@ -1713,7 +1713,7 @@ assert.equal(pricingOf('glm-4.6v').tiered, true, 'GLM-4.6V 应标记为分档定
 // ── 通知与预警：宿主侧的结束事实 + 阈值配置读写 ──────────────────
 const notifyModule = await import(pathToFileURL(join(root, 'lib', 'notify.js')).href)
 const {
-  NOTIFY_DEFAULTS, NotifyJournal, normalizeNotify, noticeOf, truncate,
+  MAX_AGENT_LABEL_CHARS, NOTIFY_DEFAULTS, NotifyJournal, isSubagentHeader, normalizeNotify, noticeOf, truncate,
 } = notifyModule
 
 // 1) `turn/end` 的五种原因各自归类；**认不出的必须落到 error 一侧**，
@@ -1739,6 +1739,53 @@ assert.equal(
   undefined,
   '非 turn/end 事件不应产生通知',
 )
+
+// 1b) 子智能体：身份由**会话头**判定，文案由客户端区分
+//
+// 用户报的正是这条：「桌面通知在子智能体完成时会触发，但内容里没有标识这只是
+// 子智能体完成了任务」。子代理的 turn/end 与主会话是**同一条事件**，区别只在
+// 会话头的 `origin` / `parentSession` 上——宿主必须在这里标出来，客户端才可能
+// 说出「有新进展」而不是「已完成」。
+const subHeader = {
+  id: 'session-sub',
+  cwd: 'D:\\blog',
+  origin: 'subagent',
+  parentSession: 'session-lead',
+  delegationDepth: 1,
+}
+const subNotice = noticeOf(
+  { id: 'session-sub', header: subHeader },
+  { type: 'turn/end', time: 1, data: { turn: 2, reason: { kind: 'completed' } } },
+  'blog',
+  { name: 'alice', label: 'x'.repeat(400) },
+)
+assert.equal(subNotice.subagent, true, '子智能体的 turn/end 必须被标成 subagent')
+assert.equal(subNotice.agentName, 'alice', '应带上团队名册里的名字')
+assert.ok(
+  typeof subNotice.agentLabel === 'string' && subNotice.agentLabel.length <= MAX_AGENT_LABEL_CHARS,
+  `子智能体描述必须截断到 ${MAX_AGENT_LABEL_CHARS} 以内，实际 ${subNotice.agentLabel?.length}`,
+)
+assert.equal(subNotice.category, 'done', '子智能体的正常结束仍归 done 一侧（由客户端换措辞，不是换成失败）')
+
+// 两个字段各自成立都要认得出来：`origin` 是语义标记，`parentSession` 是关系事实。
+// 只看一个会在真实数据里漏判——链断了的子会话只有 origin，而老会话可能没写 origin。
+assert.equal(isSubagentHeader({ parentSession: 'p' }), true, '只有 parentSession 时也应认作子智能体')
+assert.equal(isSubagentHeader({ origin: 'subagent' }), true, '只有 origin 时也应认作子智能体')
+assert.equal(isSubagentHeader({ id: 'x', cwd: 'D:\\w' }), false, '普通会话不是子智能体')
+assert.equal(isSubagentHeader(undefined), false, '读不到会话头时不能猜成子智能体')
+assert.equal(isSubagentHeader({ origin: 'other', parentSession: '' }), false, '认不出的取值不能当成子智能体')
+
+// **主会话不得出现 subagent 字段**：客户端拿「有这个字段」当唯一判据，
+// 多写一个 `subagent: false` 会让「只在是的时候写」这条契约失效（将来谁改一行
+// 就静默改了全部主会话的文案）。
+const mainNotice = noticeOf(
+  { id: 'session-main', header: { id: 'session-main', cwd: 'D:\\blog' } },
+  { type: 'turn/end', time: 1, data: { turn: 1, reason: { kind: 'completed' } } },
+  'blog',
+)
+assert.ok(!Object.hasOwn(mainNotice, 'subagent'), '主会话的通知里不该有 subagent 字段')
+assert.equal(mainNotice.label, '已完成', '主会话的结论词仍是宿主给的那一份（客户端不改它）')
+
 // 失败要带原因；且必须截断（错误信息可能很长，而它要进系统通知）
 const failedNotice = noticeOf(
   { id: 's' },
@@ -1859,6 +1906,85 @@ assert.equal(
 for (const entry of afterBad.events.slice(1)) {
   assert.equal(entry.category, 'error', `读不懂的 reason 必须归到 error 一侧，而不是假装完成：${JSON.stringify(entry)}`)
 }
+
+// 6) 子智能体的**名字**：两个来源都在日志里，而判定发生在 turn/end 那一刻
+//
+//    名字只写在 Lead 的日志里（`team/member`），一句话描述只写在子会话自己的
+//    日志里（`subagent/descriptor`）——两者都不可能从 turn/end 时的活 Session
+//    对象上读到。所以监听器必须顺着事件流抄一份小表。这条用例钉住的是
+//    「抄下来了没有」与「键有没有张冠李戴」（team/member 的键是**成员自己的**
+//    会话 id，不是 Lead 的；写错就会给 A 的通知安上 B 的名字）。
+const subSubject = { id: 'session-sub-x', header: { cwd: 'D:\\blog', origin: 'subagent', parentSession: 'session-lead', delegationDepth: 1 } }
+const leadSubject = { id: 'session-lead', header: { cwd: 'D:\\blog' } }
+sessionEventHandlers[0](leadSubject, {
+  type: 'team/member',
+  time: 1,
+  data: {
+    version: 2,
+    teamId: 'team-1',
+    member: { id: 'session-sub-x', name: 'alice', description: '审查通知文案', provider: 'deepseek', context: 'fresh', phase: 'active' },
+  },
+})
+sessionEventHandlers[0](subSubject, { type: 'subagent/descriptor', time: 2, data: { mode: 'one-shot', label: '审查通知文案' } })
+sessionEventHandlers[0](subSubject, {
+  type: 'turn/end',
+  time: 3,
+  data: { turn: 1, reason: { kind: 'completed' } },
+})
+// 名字在 Lead 的日志里、描述在子会话自己的日志里；两边都不在 turn/end 上。
+const subEvents = JSON.parse((await call(notifyRoute, 'GET', '/dsh-pixel/notify?since=0')).body).events
+const subEntry = subEvents.at(-1)
+assert.equal(subEntry.subagent, true, '子智能体的 turn/end 必须标成 subagent')
+assert.equal(subEntry.agentName, 'alice', `通知里应写出是哪一个子智能体，实际 ${JSON.stringify(subEntry)}`)
+assert.equal(subEntry.agentLabel, '审查通知文案', '应带上 spawn 时那句职责说明')
+
+// 名册里的名字**不能张冠李戴**：Lead 自己的 turn/end 不该被安上成员的名字。
+sessionEventHandlers[0](leadSubject, {
+  type: 'turn/end',
+  time: 4,
+  data: { turn: 1, reason: { kind: 'completed' } },
+})
+const leadEntry = JSON.parse((await call(notifyRoute, 'GET', '/dsh-pixel/notify?since=0')).body).events.at(-1)
+assert.ok(!Object.hasOwn(leadEntry, 'subagent'), 'Lead 自己的 turn/end 不是子智能体，不该带 subagent 字段')
+assert.ok(!Object.hasOwn(leadEntry, 'agentName'), 'Lead 的通知不该继承某个成员的名字')
+
+// 7) 「子智能体进展」开关的默认值：开着（否则团队成员的进展会被静默吞掉）
+assert.equal(NOTIFY_DEFAULTS.notifySubagent, true, '「子智能体进展」默认应开着')
+assert.equal(
+  normalizeNotify({ notifySubagent: false }).notifySubagent,
+  false,
+  '关掉这个开关必须能存下来（否则面板上点了没反应）',
+)
+
+// 8) 名字表必须有界，且淘汰的是**最旧**的
+//
+// 它是常驻内存：一台长跑的机器上会话数没有上限。没有上限时这份表会随会话数
+// 线性增长——而且症状是「用久了内存慢慢涨」，最难归因的那一类。反过来，若淘汰
+// 方向写错（丢最新的），名字就会永远只剩最早那批。
+const SUBAGENT_FACT_LIMIT = 500
+for (let i = 0; i < SUBAGENT_FACT_LIMIT + 20; i += 1) {
+  sessionEventHandlers[0](leadSubject, {
+    type: 'team/member',
+    time: 10 + i,
+    data: { version: 2, teamId: 'team-flood', member: { id: `session-flood-${i}`, name: `m${i}`, description: '', provider: 'p', context: 'fresh', phase: 'active' } },
+  })
+}
+/** 让某条（可能已被淘汰的）会话报一个 turn/end，返回它拿到的通知。 */
+const noticeFor = async (sessionId) => {
+  sessionEventHandlers[0](
+    { id: sessionId, header: { cwd: 'D:\\w', origin: 'subagent', parentSession: 'session-lead' } },
+    { type: 'turn/end', time: 99, data: { turn: 1, reason: { kind: 'completed' } } },
+  )
+  const body = JSON.parse((await call(notifyRoute, 'GET', '/dsh-pixel/notify?since=0')).body)
+  return body.events.at(-1)
+}
+assert.equal((await noticeFor('session-flood-519')).agentName, 'm519', '最新的名字必须留在表里')
+const evicted = await noticeFor('session-flood-0')
+assert.ok(
+  !Object.hasOwn(evicted, 'agentName'),
+  `超出上限后最旧的名字应被淘汰（否则这张表会随会话数线性增长），实际 ${JSON.stringify(evicted)}`,
+)
+assert.equal(evicted.subagent, true, '名字被淘汰不影响「这是个员工」这个事实')
 
 const notifyWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', { warnBalance: { CNY: 20 } })
 assert.equal(notifyWrite.statusCode, 200, `POST 应返回 200，实际 ${notifyWrite.statusCode}`)
