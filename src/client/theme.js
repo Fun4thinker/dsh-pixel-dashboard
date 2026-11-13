@@ -401,11 +401,12 @@ const DASHBOARD = `
 .px-inline-toggle input { margin: 0; accent-color: var(--px-pink-deep); }
 .px-inline-toggle:hover { color: var(--px-ink-2); }
 /* ── 顶行的「用户卡」：官方账号头像 + 余额 + 官网入口 ────────────────
-   它是概览行里的第五格，所以尺寸/圆角/阴影与 .px-stat 同族（不是又一种卡片）：
-   同一行里出现两种卡片语言，读起来就像两块不同的东西。
-   横向三段：头像 / 名称+金额 / 入口。金额与 .px-stat-value 同字号，形成一条基线。 */
+   布局按用户要求：**头像占左侧主区域、余额占右侧主区域**，官网入口固定在右上角，
+   赠送金 / 累计消费与钱放在同一列（它们是钱的注脚，不该散落到别处）。
+   尺寸/圆角/阴影与 .px-stat 同族：同一行里出现两种卡片语言，读起来像两块不同的东西。 */
 .px-user {
-  display: flex; align-items: center; gap: 10px;
+  position: relative;
+  display: flex; align-items: center; gap: 12px;
   padding: 12px 14px 11px;
   background: var(--px-surface);
   border: 1px solid var(--px-line);
@@ -414,16 +415,18 @@ const DASHBOARD = `
   transition: box-shadow var(--px-dur) var(--px-ease), border-color var(--px-dur) var(--px-ease);
 }
 .px-user:hover { box-shadow: var(--px-elev-2); border-color: var(--px-line-2); }
+/* 左侧主区域：头像（主视觉）+ 名字（小字，不显示手机号） */
+.px-user-who { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 0 1 auto; }
 .px-user-avatar {
   flex: none;
   position: relative;
-  width: 34px; height: 34px;
+  width: 40px; height: 40px;
   display: grid; place-items: center;
-  border-radius: 10px;
+  border-radius: 12px;
   overflow: hidden;
   background: var(--px-whale-soft);
 }
-/* 真实头像：铺满底板，裁成同一圆角；失败时（img 被 display:none）下面的鲸鱼露出来。 */
+/* 真实头像：铺满底板并裁成同一圆角；失败时（img 被 display:none）露出鲸鱼。 */
 .px-user-avatar > img {
   position: absolute; inset: 0;
   width: 100%; height: 100%;
@@ -433,33 +436,31 @@ const DASHBOARD = `
 /* 未登录：底板退成中性层让「这是占位」可读，但**鲸鱼保持彩色**（用户要求不置灰）。 */
 .px-user.off .px-user-avatar { background: var(--px-layer-2); }
 .px-whale { display: block; }
-.px-user-main { display: grid; gap: 2px; min-width: 0; flex: 1 1 auto; }
 .px-user-name {
   font-size: 11px; font-weight: 560; color: var(--px-muted); letter-spacing: 0.06em;
+  max-width: 110px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.px-user-contact { font-size: 10.5px; color: var(--px-muted); letter-spacing: 0.02em; }
-/* 总余额：一个数字，与概览卡数值同字号同字重（同一条视觉基线）。 */
-.px-user-amount { display: inline-flex; align-items: baseline; gap: 3px; font-variant-numeric: tabular-nums; min-width: 0; }
-.px-user-amount > b {
+/* 右侧主区域：总余额（大）+ 赠送 / 累计消费（小），右对齐成一块 */
+.px-user-money {
+  display: grid; gap: 3px; justify-items: end;
+  margin-left: auto; min-width: 0; padding-right: 52px;
+}
+.px-user-total {
   font-size: 24px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.1;
-  color: var(--px-ink);
+  color: var(--px-ink); font-variant-numeric: tabular-nums;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* 右侧一列：链接在上，角落小字（赠送金 · 累计消费）在下，右对齐。 */
-.px-user-side {
-  flex: none; display: grid; gap: 4px; justify-items: end; align-content: space-between;
-  min-width: 0;
-}
-.px-user-corner {
+.px-user-sub {
   font-size: 10px; color: var(--px-muted); line-height: 1.3;
   text-align: right; font-variant-numeric: tabular-nums;
-  max-width: 130px;
+  max-width: 160px;
 }
-.px-user-state { font-size: 11.5px; color: var(--px-muted); line-height: 1.45; min-width: 0; }
+.px-user-state { font-size: 11.5px; color: var(--px-muted); line-height: 1.45; text-align: right; }
 .px-user-state.warn { color: var(--px-tone-red); }
+/* 官网入口：固定右上角，不参与左右两个主区域的排布 */
 .px-user-link {
-  flex: none; align-self: flex-start;
+  position: absolute; top: 9px; right: 12px;
   font-size: 11.5px; color: var(--px-ink-2);
   text-decoration: none;
   border-bottom: 1px solid transparent;

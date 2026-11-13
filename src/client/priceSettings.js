@@ -81,6 +81,15 @@ const PRICE_FIELDS = [
 ]
 
 /**
+ * 空表单的初值。
+ *
+ * 浮层打开时若推不出当前价（价目表里没有、也没有覆盖），**仍然要显示空表单**：
+ * 用户点开就是为了填这一条。早先因为 `draft === null` 直接不渲染浮层，症状是
+ * 「点了没反应、按钮却显示收起」。
+ */
+const EMPTY_DRAFT = { cacheHit: '', cacheMiss: '', output: '', currency: 'CNY' }
+
+/**
  * 用「元 / 百万 token」显示一个数字：去掉多余的零，但不四舍五入到两位（小额会变成 0）。
  * @param {*} value - 任意值。
  * @returns {string} 文本；读不出数字时写「未知」（不写「—」：那不是一句人话）。
@@ -649,14 +658,19 @@ export function PriceSettingsView(props) {
             },
             h('span', { className: 'px-price-provider-label' }, provider.label),
             h('span', { className: 'px-price-provider-meta' },
-              provider.models.length + ' 个模型',
-              changed > 0 ? ' · ' + changed + ' 条已改' : ''))
+              // **不再按提供商显示「M 条已改」**：单价是按**模型**存的，跨提供商共用，
+              // 所以同一个模型在每家下面都会被标成「已改」。按家报数字会让用户以为
+              // 「我只改了一家，怎么每家都说改过」——实测被当成 bug 报上来。
+              // 这里只报模型数；「改过几条」统一在右栏标题里说一次，并写明口径。
+              provider.models.length + ' 个模型'))
           })),
         h('section', { className: 'px-price-pane' },
           h('div', { className: 'px-price-pane-head' },
             h('b', { className: 'px-price-pane-title' }, active.label),
-            h('span', { className: 'px-muted px-note' },
-              mineCount > 0 ? `${mineCount} 条是你改过的价` : '还没改过这家的价'),
+            h('span', { className: 'px-muted px-note', title: '单价按模型保存：同一个模型被多家提供商共用时，改一次对所有家生效' },
+              mineCount > 0
+                ? `${mineCount} 条已改（按模型共用，改一次对所有提供商生效）`
+                : '还没改过这里的价'),
             h('div', { className: 'px-price-filters' },
               h('label', { className: 'px-rate-field' },
                 h('span', { className: 'px-rate-field-label' }, '搜索'),
@@ -848,14 +862,21 @@ export function PriceSettingsButton(props) {
    * 本函数体执行时 `submit` 还在暂时性死区 → 抛 ReferenceError → 整个看板白屏。
    * 实测：点了「补价」后整页变空白。
    * 包成函数后，构造发生在 `return` 那一句（`submit` 已初始化），因此安全。
+   *
+   * ## 判据只看 `open`，不看 `draft`
+   *
+   * 早先要求 `draft !== null` 才渲染。而 `draft` 是由「当前生效价」推出来的，
+   * 某些模型（价目表里没有、且没有覆盖）推出来是空的，于是**按钮已经变成「收起」、
+   * 浮层却一个节点都没渲染**——用户报的「点改单价没反应，直接显示收起」就是这个。
+   * 现在只要打开就渲染，字段为空就显示空表单（用户自己填，正是「新增一条」的用途）。
    */
-  const popoverOf = () => (open && draft !== null && typeof document !== 'undefined'
+  const popoverOf = () => (open && typeof document !== 'undefined'
     ? ReactDOM.createPortal(
       h('div', {
         className: 'px-price-pop px-price-editor px-price-pop-fixed',
         ref: popRef,
         role: 'dialog',
-        'aria-label': `补价：${rollup}`,
+        'aria-label': `改单价：${rollup}`,
         style: pos === null
           ? { visibility: 'hidden' }
           : { left: `${pos.left}px`, top: `${pos.top}px`, width: `${pos.width}px` },
@@ -863,7 +884,7 @@ export function PriceSettingsButton(props) {
       h('p', { className: 'px-price-pop-title' },
         h('b', null, label ?? rollup),
         h('code', { className: 'px-muted' }, rollup)),
-      h(PriceFields, { draft, onChange: setDraft }),
+      h(PriceFields, { draft: draft ?? EMPTY_DRAFT, onChange: setDraft }),
       errors.length > 0
         ? h('ul', { className: 'px-price-errors' }, errors.map((line) => h('li', { key: line }, line)))
         : null,
@@ -875,18 +896,39 @@ export function PriceSettingsButton(props) {
       document.body)
     : null)
 
-  const toggle = () => {
+  /**
+   * 开关浮层。
+   *
+   * **打开时立刻量一次锚点**（用事件目标，而不是等 effect）：effect 要等这一帧画完，
+   * 期间浮层是 `visibility: hidden`；万一测量失败（父级未挂载、容器 0 宽等），
+   * 它会**一直**不可见。点击时同步拿到矩形，至少保证可见且落在按钮附近。
+   * @param {object} [event] - 点击事件（可选，测试里可能不给）。
+   */
+  const toggle = (event) => {
     const next = !open
     setOpen(next)
     setErrors([])
     setNotice('')
     if (!next) return
+    // 同步定位：拿按钮矩形算一次，作为 effect 之前的兜底。
+    const target = event?.currentTarget ?? wrapRef.current
+    if (target !== null && target !== undefined && typeof window !== 'undefined') {
+      const rect = target.getBoundingClientRect()
+      if (rect.width > 0 || rect.height > 0) {
+        const width = Math.min(360, Math.max(260, window.innerWidth - 32))
+        const left = Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12))
+        const room = window.innerHeight - rect.bottom
+        const top = room < 320 ? Math.max(12, rect.top - 312) : rect.bottom + 6
+        setPos({ left, top, width })
+      }
+    }
     // 打开时按**当前生效价**预填，并把宿主里的覆盖值叠上去（有的话）。
-    setDraft(draftOf(editableRate(props?.rate)))
+    // `draftOf` 可能给出空值，那也要能打开（空表单可编辑，不是不显示）。
+    setDraft(draftOf(editableRate(props?.rate)) ?? EMPTY_DRAFT)
     fetchRates()
       .then((status) => {
         const mine = status?.rates?.[rollup]
-        if (mine !== undefined) setDraft(draftOf(editableRate(mine)))
+        if (mine !== undefined) setDraft(draftOf(editableRate(mine)) ?? EMPTY_DRAFT)
       })
       .catch(() => { /* 老宿主没有这条路由：就用生效价预填 */ })
   }
