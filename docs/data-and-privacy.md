@@ -16,7 +16,7 @@ $DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl
 | 文件 | 内容 | 覆盖用的环境变量 |
 |---|---|---|
 | `balance-prefs.json` | 余额 / 套餐开关、通知开关 | `DSH_PIXEL_BALANCE_PREFS` |
-| `custom-rates.json` | 你补充的单价、提供商倍率、美元折算汇率 | `DSH_PIXEL_RATES` |
+| `custom-rates.json` | 你补充的单价、美元折算汇率（提供商倍率仍可手填，界面不提供） | `DSH_PIXEL_RATES` |
 | `session-cache.json` | 会话日志的**派生结果**缓存（只为加速，删掉会自动重建） | 跟账本同目录 |
 
 `DSH_PIXEL_LEDGER` 可以覆盖账本路径。
@@ -54,7 +54,7 @@ $DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl
 | `/dsh-pixel/version` | GET | 在线实现版本 |
 | `/dsh-pixel/notify` | GET / POST | 通知日志（增量）与开关 |
 | `/dsh-pixel/toggle` | POST | 余额 / 套餐查询开关 |
-| `/dsh-pixel/rates` | GET / POST | 单价、倍率与汇率的读写 |
+| `/dsh-pixel/rates` | GET / POST | 单价与汇率的读写（提供商倍率仅配置文件支持） |
 | `/dsh-pixel/plan-credentials` | GET / POST | 各家凭据现状 / 按勾选移除 |
 | `/dsh-pixel/focus` | POST | 桌面端把窗口拉到前台（尽力而为） |
 

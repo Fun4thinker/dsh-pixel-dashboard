@@ -2996,24 +2996,48 @@ const costTable = glmHtml.slice(
     },
     onSaved: () => {},
   }))
-  // 结构：这一页要能回答四个问题——汇率是多少、每家倍率多少、有哪些模型、怎么批量导入。
+  // 结构（v3.2）：左栏「用户实际拥有的 provider」+ 右栏「该家的模型单价」。
+  // 这一页只回答四件事：汇率多少、我接了哪几家、每家有哪些模型、怎么批量导入。
   must(priceHtml.includes('px-price-settings'), '单价设置页应有自己的根容器')
   must(priceHtml.includes('px-price-fx'), '应能改美元折算汇率')
   must(priceHtml.includes('汇率'), '汇率那一行要写明它是什么')
-  must(priceHtml.includes('px-price-markup'), '应能改提供商加价倍率（第三方中转按 token 收的价与官方不同）')
-  must(/倍率/.test(priceHtml), '倍率那一节要写明它是什么')
+  // **倍率已按用户要求从界面移除**（宿主能力保留）。反向断言，防止悄悄加回来。
+  must(!priceHtml.includes('px-price-markup'), '倍率已从界面移除，不得再加回面板')
+  must(!/倍率/.test(priceHtml), '界面不允许再出现「倍率」字样（用户明确说「这个功能也没用」）')
   must(priceHtml.includes('px-price-filters'), '模型很多时要能搜索')
-  must(priceHtml.includes('px-price-groups'), '应按厂商分组列出模型')
+  must(priceHtml.includes('px-price-console') && priceHtml.includes('px-price-nav'),
+    '应按提供商分栏：左栏是用户接的那几家')
   must(priceHtml.includes('px-price-io'), '应能整份导入 / 导出（一次补一批，或放进版本管理）')
-  must(priceHtml.includes('px-price-group'), '分组标题应真的渲染出来')
-  // 每个模型一行，且带「编辑」入口——否则用户看得到价、改不了价。
-  // 数目与 fixture 里的价目条数一致（这份 fixture 是 3 个模型），**不能**写成一个
-  // 与数据无关的常数：那样要么永远为真（没验到东西），要么换个 fixture 就红。
-  const fixtureRates = Object.keys(payload.pricing?.rates ?? {}).length
-  must((priceHtml.match(/px-price-item-head/g) ?? []).length >= fixtureRates,
-    `价目表应逐模型成一行的清单（fixture 里 ${fixtureRates} 个模型），而不是一团文字`)
-  // 编辑表单**默认不展开**：一进设置页就把几十个输入框全铺开，等于把清单淹掉。
-  // 「点开后六个价框齐全」属于交互，由 dom-check（jsdom 真点）验，见那边的用例。
+  // 左栏必须**真的选中了一家**（否则右栏没有内容，用户一进来就是空页），
+  // 且右栏要写出当前是哪一家——否则两个栏之间没有对应关系。
+  must(/px-price-provider[^"]*\bon\b/.test(priceHtml), '左栏应有且已选中一个提供商')
+  must(priceHtml.includes('px-price-pane-title'), '右栏应写出当前提供商的名字')
+  // 当前选中那一家下面的模型行数：从**数据**算出期望值，不能写成与数据无关的常量
+  // （写常量要么永远为真、要么换个 fixture 就红）。
+  {
+    const firstProvider = payload.models?.[0]?.provider ?? ''
+    const firstRows = new Set(
+      (payload.models ?? [])
+        .filter((model) => (model.provider ?? '') === firstProvider)
+        .map((model) => model.rollup),
+    ).size
+    must((priceHtml.match(/px-price-item-head/g) ?? []).length >= Math.max(1, firstRows),
+      `选中那一家应有 ${firstRows} 个模型行（而不是把整张价目表平铺出来）`)
+    // 反向：右栏不该出现别家的模型行。fixture 里第二家是 workbuddy-cn，
+    // 它的模型键不应出现在「只显示当前 provider」的清单里。
+    const secondProvider = (payload.models ?? []).find((model) => (model.provider ?? '') !== firstProvider)
+    if (secondProvider !== undefined) {
+      const otherKeys = (payload.models ?? [])
+        .filter((model) => model.provider === secondProvider.provider
+          && (payload.models ?? []).filter((m) => m.provider === firstProvider).every((m) => m.rollup !== model.rollup))
+        .map((model) => model.rollup)
+      for (const key of otherKeys) {
+        must(!priceHtml.includes(`>${key}<`),
+          `右栏不该出现别家的模型「${key}」——分页的意义就是只看当前那一家`)
+      }
+    }
+  }
+  // 编辑表单 / 新增表单**默认不展开**：一进设置页就把输入框全铺开，等于把清单淹掉。
   must(!priceHtml.includes('px-price-form'), '编辑表单默认不该展开（点某一行的编辑才出现）')
   // 六个数字框挤在三列里，**必须**允许收缩，否则会横向溢出到面板外面。
   // 两个 min-width 缺一不可：flex 项默认 min-width:auto，会被输入框的固有宽度
