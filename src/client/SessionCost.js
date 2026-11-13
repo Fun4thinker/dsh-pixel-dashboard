@@ -56,7 +56,7 @@
 import React from 'react'
 import { createPortal } from 'react-dom'
 import { resolveAccount } from './account.js'
-import { fetchBalance } from './balance.js'
+import { balanceDetail, fetchBalance } from './balance.js'
 import { costDetailModel } from './costDetail.js'
 import { formatCny, formatTokens } from './format.js'
 import { fetchPlans } from './plans.js'
@@ -696,13 +696,14 @@ function AccountPill(props) {
   if (account === undefined || account === null) return null
 
   if (account.kind === 'balance') {
+    // 悬停给出完整说明（各币种 / 赠送金 / 账号名），徽标上只留**一个总余额**。
+    const detail = balanceDetail(account.payload)
     return h(Pill, {
       tone: 'green',
       label: '余额',
       value: account.text,
-      title: '账户余额来自官方 /user/balance 接口，由本地宿主用 DSH 自己的 API Key 查询；'
-        + `Key 不会离开本机${account.payload?.official === false ? '（当前端点不是官方公网地址）' : ''}`
-        + '。当前会话走的是 DeepSeek 官方 API，因此显示它。',
+      title: (detail.length > 0 ? `${detail.join('\n')}\n` : '')
+        + '余额来自官方账户接口（当前登录的 DeepSeek 账号）；当前会话走官方 API，因此显示它。',
     })
   }
 

@@ -20,7 +20,8 @@ import { AccountPanel } from './accountPanel.js'
 import { PriceSettingsButton, PriceSettingsView } from './priceSettings.js'
 // 「消费 Top 会话」点开时要在原地取这条会话的明细，因此复用会话标签页那条取数口
 // （同一个 `/dsh-pixel/session`，同一套错误分类）。不复制一份 fetch：两份迟早漂移。
-import { cacheRatio, fetchSession, usageBuckets } from './sessionView.js'
+// 看板不再直接取会话明细：展开用的是 `/data` 里已有的会话行（含 timing/toolCalls），
+// 会话标签页那边自己带 60 秒内存缓存。
 // 「图二」那套彩色详情视图（hero 卡 / 耗时堆叠条 / 明细行）从本文件抽到
 // sessionDetailView.js：会话标签页的费用页也要用同一份实现，两处共用才不会漂移。
 // 这里保留 `export { SessionDetail }` 是为了不破坏既有 import（渲染闸门就按它取）。
@@ -532,7 +533,7 @@ function UserBalanceCard(props) {
   if (spend !== undefined && spend > 0) extra.push(`累计消费 ${formatCny(spend)}`)
 
   return h('div', { className: `px-user${signedIn ? '' : ' off'}`, 'aria-label': 'DeepSeek 官方账户' },
-    // 右上角：官网入口（用户要求放这里，而不是跟钱挤在一列）
+    // 右上角：官网入口（用户要求固定在这里）
     h('a', {
       className: 'px-user-link',
       href: typeof links.topUpUrl === 'string' && links.topUpUrl !== ''
@@ -542,20 +543,15 @@ function UserBalanceCard(props) {
       rel: 'noreferrer',
       title: '在 DeepSeek 官网查看余额、用量与充值',
     }, signedIn ? '更多 ↗' : '去登录 ↗'),
-    // 左侧主区域：头像（主视觉）+ 名字（小字，不显示手机号）
-    h('div', { className: 'px-user-who' },
-      h('span', { className: 'px-user-avatar' },
-        avatarUrl !== '' ? h('img', {
-          src: avatarUrl,
-          alt: '',
-          loading: 'lazy',
-          referrerPolicy: 'no-referrer',
-          onError: (event) => { event.currentTarget.style.display = 'none' },
-        }) : null,
-        h(WhaleAvatar, { size: 40 })),
-      h('span', { className: 'px-user-name', title: nameText }, nameText)),
-    // 右侧主区域：钱与「钱相关的注脚」放在一起（总余额 / 赠送 / 累计消费）
-    h('div', { className: 'px-user-money' },
+    /**
+     * 左主区 = 钱的读数，右主区 = 头像。
+     *
+     * 用户要求「头像放右边、余额放左边，跟同一行的其他卡片布局类似」——
+     * 其他卡都是「小标签 / 大数字 / 脚注」的三层结构，所以这里也是三层：
+     * 名称 → 总余额 → 「赠送 · 累计消费」。头像退到右侧做一个身份标记。
+     */
+    h('div', { className: 'px-user-main' },
+      h('span', { className: 'px-user-label', title: nameText }, nameText),
       state === undefined
         ? h('b', { className: 'px-user-total' }, formatMoney(primary.total, primary.currency))
         : h('span', {
@@ -567,7 +563,16 @@ function UserBalanceCard(props) {
         : h('span', {
           className: 'px-user-sub',
           title: '赠送金来自官方钱包；累计消费是本机按各模型官方单价估算的合计，不是实际账单',
-        }, extra.join(' · '))))
+        }, extra.join(' · '))),
+    h('span', { className: 'px-user-avatar' },
+      avatarUrl !== '' ? h('img', {
+        src: avatarUrl,
+        alt: '',
+        loading: 'lazy',
+        referrerPolicy: 'no-referrer',
+        onError: (event) => { event.currentTarget.style.display = 'none' },
+      }) : null,
+      h(WhaleAvatar, { size: 40 })))
 }
 
 /** 键值行。 */
@@ -1431,33 +1436,19 @@ function TopSessions(props) {
    * 跳走会把人从"比较"拽进"单条"，反而丢上下文。
    */
   const [expanded, setExpanded] = useState('')
-  /** 会话 id → { status, payload, error }：同一条反复点开不该反复取数。 */
-  const [details, setDetails] = useState({})
 
-  const load = useCallback((sessionId) => {
-    if (typeof sessionId !== 'string' || sessionId === '') return
-    setDetails((prev) => (prev[sessionId] === undefined || prev[sessionId].status === 'failed'
-      ? { ...prev, [sessionId]: { status: 'loading' } }
-      : prev))
-    fetchSession(sessionId)
-      .then((payload) => {
-        setDetails((prev) => ({ ...prev, [sessionId]: { status: 'ready', payload } }))
-      })
-      .catch((error) => {
-        setDetails((prev) => ({
-          ...prev,
-          [sessionId]: { status: 'failed', error: String(error?.message ?? error) },
-        }))
-      })
-  }, [])
-
+  /**
+   * 展开/收起。**不再额外取数**：
+   *
+   * 早先这里为每条会话再拉一次 `/dsh-pixel/session`，用来画一张「逐模型金额」小表。
+   * 那张表与上面 `SessionDetail` 里的合计、逐日、请求分布**重复**（用户明确问
+   * 「底部为啥会有同样的数据重复显示」），于是整块去掉：`SessionDetail` 需要的
+   * 数据 `/data` 的会话行里全都有（totals / cost / timing / toolCalls / models）。
+   * 顺带的好处：展开是**瞬时**的，不再有「点开等半天」。
+   */
   const toggle = (sessionId) => {
     if (typeof sessionId !== 'string' || sessionId === '') return
-    setExpanded((prev) => {
-      if (prev === sessionId) return ''
-      load(sessionId)
-      return sessionId
-    })
+    setExpanded((prev) => (prev === sessionId ? '' : sessionId))
   }
 
   /**
@@ -1540,115 +1531,20 @@ function TopSessions(props) {
             isOpen
               ? h('tr', { key: `${id}-detail`, className: 'px-top-session-detail-row' },
                 h('td', { colSpan: 4 },
-                  // 「图二」那一套：四枚彩色 hero + 三色耗时堆叠条 + 峰/闲明细。
-                  // 用户明确要它回来（「之前那种版本都挺好看的」），所以这里用完整版，
-                  // 而不是前一轮被做稀的紧凑版。
+                  // 「图二」那一套：四枚彩色 hero + 三色耗时堆叠条 + 峰/闲明细 + 请求分布。
+                  // 用户明确要它回来（「之前那种版本都挺好看的」），所以这里用完整版。
+                  // 下面**不再**追加逐模型金额小表：那块与这里的合计/逐日/请求分布重复
+                  // （用户问「底部为啥会有同样的数据重复显示」），已整块删除。
                   h(SessionDetail, {
                     key: 'rich',
                     lead: session,
                     members: membersOfSession(session),
                     timezone,
-                  }),
-                  // 下面是**逐模型金额**小表（来自 `/dsh-pixel/session` 的 entries）：
-                  // 它回答「这条会话的钱具体花在哪几款模型上」，是 SessionDetail 没有的一层。
-                  // 用户要的是「更丰富」，不是「替换」，因此两块都留。
-                  h(SessionDetailInline, { key: 'models', state: details[id], timezone })))
+                  })))
               : null,
           ]
         }))))
 }
-
-/**
- * Top 会话里展开的那块明细：**紧凑版**，不是把整个会话标签页搬过来。
- *
- * 这里只回答「这条会话贵在哪」：峰谷拆分 + 逐模型金额（最多 6 行）。
- * 要看逐日、缓存命中率、余额绑定，去会话里的「费用」标签页——两处职责不同，
- * 都铺满会让这张表从"比较"退化成"第二份报表"。
- * @param {object} props - state（loading/ready/failed）/ timezone。
- * @returns {object} React 元素。
- */
-function SessionDetailInline(props) {
-  const { state } = props
-  if (state === undefined || state.status === 'loading') {
-    return h('p', { className: 'px-muted px-top-detail-state' }, '读取这条会话的明细…')
-  }
-  if (state.status === 'failed') {
-    return h('p', { className: 'px-muted px-top-detail-state' }, `取不到明细：${state.error}`)
-  }
-  const payload = state.payload ?? {}
-  const entries = Array.isArray(payload.entries) ? payload.entries : []
-  const days = Array.isArray(payload.days) ? payload.days : []
-  const total = payload.cost ?? {}
-  if (entries.length === 0 && days.length === 0) {
-    return h('p', { className: 'px-muted px-top-detail-state' }, '这条会话没有按模型的用量记录（可能是旧宿主或其它设备的历史）。')
-  }
-  const shown = entries.slice(0, 6)
-  const rest = entries.length - shown.length
-  // 缓存命中率的分母是**计费输入**（命中 + 未命中 + 写入）；没有输入时整项省略，
-  // 写成 0% 会把「还没有输入」显示成「缓存完全没命中」，是两种处境。
-  const totals = payload.session?.totals
-  const ratio = totals === undefined ? undefined : cacheRatio(totals)
-  const buckets = totals === undefined ? undefined : usageBuckets(totals)
-  const team = payload.team
-  const teamMembers = Array.isArray(team?.members) ? team.members : []
-
-  return h('div', { className: 'px-top-detail' },
-    // 第一行：四项事实并排（峰/谷/可省/命中率）。命中率缺就不渲染那一项。
-    h('div', { className: 'px-top-detail-sum' },
-      h('span', null, '高峰 ', h('b', null, formatCny(total.peak ?? 0))),
-      h('span', null, '空闲 ', h('b', null, formatCny(total.idle ?? 0))),
-      h('span', null, '若全走空闲可省 ', h('b', null, formatCny(total.saved ?? 0))),
-      ratio === undefined
-        ? null
-        : h('span', null, '缓存命中率 ', h('b', null, `${(ratio * 100).toFixed(1)}%`)),
-      buckets === undefined
-        ? null
-        : h('span', null, '计费输入 ', h('b', null, formatTokens(buckets.billed)))),
-
-    // 团队：这条会话若是某个多成员团队的一员，把「整队花了多少、谁花得多」说清楚。
-    // 少这一块，用户会以为这一行的金额就是全部（而团队口径本来就不一样）。
-    team === null || team === undefined
-      ? null
-      : h('div', { className: 'px-top-detail-team' },
-        h('span', { className: 'px-top-detail-team-title' },
-          `团队成员 ${team.memberCount ?? teamMembers.length} 位 · 合计 `,
-          h('b', null, formatCny(team.cost?.standard ?? 0))),
-        h('ul', { className: 'px-top-detail-members' },
-          teamMembers.slice(0, 4).map((member) => h('li', { key: member.id },
-            h('span', { className: 'px-top-detail-model', title: member.name }, member.name ?? member.id),
-            h('span', { className: 'px-num' }, formatTokens(member.totals?.local)),
-            h('span', { className: 'px-num px-top-detail-cost' }, formatCny(member.cost?.standard ?? 0))))),
-        teamMembers.length > 4
-          ? h('p', { className: 'px-muted px-top-detail-state' }, `另有 ${teamMembers.length - 4} 位成员未列出。`)
-          : null),
-
-    h('ul', { className: 'px-top-detail-models' },
-      shown.map((entry) => h('li', { key: entry.key },
-        h('span', { className: 'px-top-detail-model', title: entry.key }, entry.label ?? entry.rollup ?? entry.key),
-        h('span', { className: 'px-num' }, formatTokens(entry.totals?.local)),
-        h('span', { className: 'px-num px-top-detail-cost' }, formatCny(entry.cost?.standard ?? 0)),
-        entry.priced === false ? h('span', { className: 'px-badge' }, '估算价') : null))),
-    rest > 0
-      ? h('p', { className: 'px-muted px-top-detail-state' }, `另有 ${rest} 款模型未列出（去会话的「费用」标签页看全部）。`)
-      : null,
-
-    // 逐日：最多 6 天，做成一行紧凑的「日期 · 金额」而不是又一张表。
-    days.length === 0
-      ? null
-      : h('div', { className: 'px-top-detail-days' },
-        days.slice(-6).map((day) => h('span', { key: day.key, className: 'px-top-detail-day' },
-          h('i', null, day.key.slice(5)),
-          h('b', null, formatCny(day.cost?.standard ?? 0))))))
-}
-
-/** 设置弹层的页签：通知 / 模型单价 / 显示。 */
-const SETTINGS_TABS = [
-  { id: 'notify', label: '通知' },
-  // 「单价」页按**提供商**分栏（左栏是你接的那几家，右栏是那一家下面的模型），
-  // 因此页签名字写全「模型单价」：它不再是价目表的总览，而是逐家的价格设置。
-  { id: 'pricing', label: '模型单价' },
-  { id: 'display', label: '显示' },
-]
 
 /**
  * 设置弹层。

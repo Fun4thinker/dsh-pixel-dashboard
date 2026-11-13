@@ -1534,7 +1534,7 @@ must(!partial.includes('undefined'), `费用条不应渲染出 undefined：${par
 
 // ── 账户余额：费用条旁那一枚 + 看板卡片 ──────────────────────────
 // SessionCostView 已在上面的费用条一节里取过，这里只补拿余额相关的模块。
-const { balanceStatus, formatMoney, balanceSummary } = await import(pathToFileURL(join(root, 'lib', 'client', 'balance.js')).href)
+const { balanceStatus, formatMoney, balanceSummary, balanceDetail } = await import(pathToFileURL(join(root, 'lib', 'client', 'balance.js')).href)
 // 币种与符号：官方两种币都认识，未知币种显示代码而不是瞎猜符号
 must(formatMoney(12.34, 'CNY') === '¥12.34', `CNY 应显示 ¥，实际 ${formatMoney(12.34, 'CNY')}`)
 must(formatMoney(3, 'USD') === '$3.00', `USD 应显示 $，实际 ${formatMoney(3, 'USD')}`)
@@ -1544,11 +1544,23 @@ must(formatMoney(-0.79, 'CNY') === '-¥0.79', `负余额符号应在最前，实
 // 读不懂的金额绝不能显示成 0——那会让人以为余额真的空了
 must(formatMoney(undefined, 'CNY') === '—', `缺失金额应显示 —，实际 ${formatMoney(undefined, 'CNY')}`)
 
-// 多币种摘要
+// 余额摘要：**只给一个总额**（用户要求「只显示一个总余额」）。
+// 多币种不再并排；完整明细走 balanceDetail（悬停时展示）。
 must(
-  balanceSummary({ balances: [{ currency: 'CNY', total: 12.34 }, { currency: 'USD', total: 3 }] }) === '¥12.34 / $3.00',
-  '多币种摘要应逐个列出',
+  balanceSummary({ balances: [{ currency: 'USD', total: 3 }, { currency: 'CNY', total: 12.34 }] }) === '¥12.34',
+  '余额摘要应只给一个总数，且优先人民币（主账户）',
 )
+{
+  const detail = balanceDetail({
+    balances: [{ currency: 'CNY', total: 12.34 }],
+    wallets: [{ currency: 'CNY', total: 12.34 }],
+    bonusWallets: [{ currency: 'CNY', total: 1 }],
+    account: { name: 'Fun_thinker' },
+  })
+  must(detail.some((line) => line.includes('可用余额') && line.includes('12.34')), '明细应写出可用余额')
+  must(detail.some((line) => line.includes('赠送金')), '明细应写出赠送金（如果有）')
+  must(detail.some((line) => line.includes('Fun_thinker')), '明细应写出账号名')
+}
 must(balanceSummary({ balances: [] }) === undefined, '没有余额时摘要应为 undefined，调用方据此不渲染')
 
 // 状态归一：每种降级都要有能读懂的原因，不能留白

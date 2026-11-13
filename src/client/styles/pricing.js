@@ -287,7 +287,10 @@ export const PRICING_CSS = `
   top: auto;
   right: auto;
   bottom: auto;
-  z-index: 60;
+  /* **必须压过设置弹层**：.px-modal-mask 用的是 2147482000 那一档，
+     而这里原来写 60 —— 浮层确实渲染了，但整个被弹层盖在下面，用户看到的就是
+     「点了没反应」。这一层比弹层高一档（与 .px-detail-anchor 同族）。 */
+  z-index: 2147483200;
 }
 /* 浮层必须脱离文档流：它出现在表格行里，撑开行高会把整张表的行距打乱。
    宽度用 min() 兜住窄栏，max-height + 滚动保证在矮屏上也够用。 */
