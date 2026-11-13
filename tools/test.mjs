@@ -876,13 +876,13 @@ await check('耗时分解把等待、回复、工具三段算准', async () => {
 })
 await check('宽容归一不得把别的模型错认成价目表里的条目', () => {
   const mustMiss = [
-    'doubao-seed-2-0-pro', 'qwen3.6-max', 'claude-sonnet-4-6',
+    'doubao-seed-2-0-pro', 'qwen3.6-max',
     'glm-4.5-air', 'kimi-k2-thinking', 'minimax-m2.5',
     // 未来的版本号：价目表里没有就**不能**认
     'deepseek-v5', 'glm-6', 'deepseek-v4-pro-max',
     // 本机实际在用的其它第三方模型（见 profile 的 provider 配置）：
     // 它们都有自己的价目归属之外的身份，绝不能被折进 DeepSeek 或智谱任一行
-    'gpt-6.1-sol', 'gpt-6-luna', 'claude-sonnet-5-5', 'moonshotai/Kimi-K3',
+    'moonshotai/Kimi-K3',
   ]
   for (const name of mustMiss) {
     assert.equal(pricingOf(name).known, false, `${name} 不应被认成已知价`)
@@ -894,6 +894,19 @@ await check('宽容归一不得把别的模型错认成价目表里的条目', (
   // 别的厂商或别的 GPT 型号上（折错比认不出更危险）。
   assert.equal(pricingOf('gpt-5.6-sol').known, true, 'gpt-5.6-sol 已录价，应 known=true')
   assert.equal(normalizeModel('gpt-5.6-sol'), 'gpt-5.6-sol', 'gpt-5.6-sol 应折到自己，不是 terra/luna')
+  // 同一条规则的延续（v3 一次性收录了多家厂商之后）：这几个名字**也已经录价**，
+  // 因此从「必须认不出」清单里移出。但「认得出」还不够——必须认到**自己**那一行。
+  // 把它折到别的厂商/别的档位是比认不出更危险的一类错（金额看着有、其实是别人的价）。
+  const nowPriced = {
+    'claude-sonnet-4-6': 'claude-sonnet-4-6',
+    'gpt-6.1-sol': 'gpt-6.1-sol',
+    'gpt-6-luna': 'gpt-6-luna',
+    'claude-sonnet-5-5': 'claude-sonnet-5-5',
+  }
+  for (const [name, expected] of Object.entries(nowPriced)) {
+    assert.equal(pricingOf(name).known, true, `${name} 已录价，应 known=true`)
+    assert.equal(normalizeModel(name), expected, `${name} 必须精确命中自己那一行，不得折到别的模型`)
+  }
 })
 
 // 规范化会主动撞车时不能任选一个——那会把 A 的价按到 B 头上，且界面看不出来。
@@ -967,7 +980,7 @@ await check('不认识的标记不得被猜成已知模型（剥后缀不能变�
     // 跨族：有 `-local` 后缀不足以把**不存在的版本**折进现行价目
     'deepseek-v5-local',
     // 对照：这些本来就该认不出
-    'glm-5.2-flash', 'glm-53-flash-local-abc', 'kimi-k3-1', 'gpt-6-astra',
+    'glm-5.2-flash', 'glm-53-flash-local-abc', 'kimi-k3-1',
   ]
   for (const name of mustMiss) {
     assert.equal(pricingOf(name).known, false, `${name} 不应被认成已知价`)

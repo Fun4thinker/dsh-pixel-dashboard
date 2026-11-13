@@ -366,11 +366,31 @@ export class BalanceService {
       official: baseURL.replace(/\/+$/u, '') === OFFICIAL_BASE_URL,
       lockedByEnv: this.lockedByEnv,
     }
-    if (!enabled) return { ...base, balances: [], available: null, fetchedAt: null }
+
+    /**
+     * 统一补上「是否已登录官方账号」。
+     *
+     * 只在**出口处**算一次，而不是让每个 return 各自拼：这里已经有 6 个返回点，
+     * 逐个加字段的失败方向是「漏一个」，而漏掉的那个会让界面显示成「未登录」——
+     * 用户明明配了 Key，却被告知没登录。
+     *
+     * 判据：关掉了 / 拿不到凭据 → 未登录；拿到凭据但网络失败 → **已登录**（账户在，
+     * 只是这次没取到）；成功 → 已登录。
+     */
+    const decorate = (payload) => ({
+      ...payload,
+      signedIn: payload.enabled === true
+        && payload.reason !== 'no-key'
+        && payload.reason !== 'no-fetch',
+    })
+
+    if (!enabled) {
+      return decorate({ ...base, balances: [], available: null, fetchedAt: null })
+    }
 
     const now = Date.now()
     if (options.refresh !== true && this.cache !== undefined && now - this.cacheAt < this.ttlMs) {
-      return { ...this.cache, cached: true }
+      return decorate({ ...this.cache, cached: true })
     }
     if (this.inflight !== undefined) return this.inflight
 
@@ -381,7 +401,7 @@ export class BalanceService {
           this.cache = payload
           this.cacheAt = Date.now()
         }
-        return payload
+        return decorate(payload)
       })
       .finally(() => {
         this.inflight = undefined
@@ -397,6 +417,18 @@ export class BalanceService {
   async #fetchBalance(base) {
     const key = await this.#resolveKey(base.apiKeyEnv)
     if (key === undefined) {
+      /**
+       * **没登录官方账号就不查。**
+       *
+       * 用户的要求：余额用「当前登录的 DeepSeek 账号」来取，没登录则不获取。
+       * DSH 里「登录官方账号」的可观测形态就是「能解析到官方那把 Key」——
+       * 桌面端的登录 Cookie 存在 Chromium 配置目录里（要 DPAPI 解密，插件零依赖
+       * 做不到，也不该去碰别人的浏览器数据）。因此判据取「有没有官方凭据」：
+       * 没有就**一次网络请求都不发**，界面据 `signedIn:false` 显示「未登录」与官网
+       * 入口，而不是一个 ¥0 的假余额。
+       *
+       * `reason` 仍保持 `no-key`：那是既有的数据契约（界面用它指明该配哪个引用名）。
+       */
       return { ...base, balances: [], available: null, fetchedAt: null, reason: 'no-key' }
     }
     if (typeof this.fetchImpl !== 'function') {

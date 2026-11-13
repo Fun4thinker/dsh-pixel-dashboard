@@ -222,7 +222,209 @@ export function TrendChart(props) {
           h('span', null, line.label),
           h('b', { className: `px-legend-value${hover === null ? '' : ' on'}` },
             hover === null ? '' : (formatValue ? formatValue(points[hover][line.key]) : '')))),
-      h('span', { className: 'px-legend-tip' }, hover === null ? '悬停曲线查看当日明细' : hoverLabel),
+      // 说明小字已删除（用户要求）：悬停读数本来就在浮层里。
+    ),
+  )
+}
+
+/**
+ * 柱状图：逐日金额 / 逐日构成。
+ *
+ * 两种模式，对应两类**完全不同**的问题：
+ *   - `stacked`（堆叠）：一根柱子由几段构成，回答「这一天里各段各占多少」。
+ *     段与段之和就是那一天的合计，因此柱高与卡片上的合计数必须相等。
+ *     用于「Token 趋势 · 构成」（缓存命中 / 未命中 / 写入 / 输出）。
+ *   - 默认（分组）：每天并列几根独立的柱子，回答「同一天的几个口径各是多少」。
+ *     用于「消费趋势」——官方价与我的价是同一个问题的两个答案，**不能叠加**
+ *     （叠起来的高度没有任何含义）。
+ *
+ * 与 {@link TrendChart} 共用同一套度量方式与视觉语言（渐变不参与、坐标轴 5 档、
+ * 悬停读数浮层），这样两张卡片并排时横轴刻度能落在同一列上。
+ * @param {object} props - points / series / stacked / formatAxis / formatValue / height。
+ * @returns {object} React 元素。
+ */
+export function BarChart(props) {
+  const {
+    points, series, stacked = false, formatAxis, formatValue, height = 240, ariaLabel,
+  } = props
+  const [hover, setHover] = useState(null)
+  const [wrapRef, width] = useMeasuredWidth(720)
+
+  const pad = { top: 16, right: 14, bottom: 26, left: 58 }
+  const innerW = Math.max(60, width - pad.left - pad.right)
+  const innerH = Math.max(60, height - pad.top - pad.bottom)
+  const list = Array.isArray(points) ? points : []
+  const lines = Array.isArray(series) ? series : []
+
+  /** 一根柱（或一组柱）要用到的数值：脏值一律当 0，绝不让 NaN 进坐标。 */
+  const valueOf = (point, key) => {
+    const value = Number(point?.[key] ?? 0)
+    return Number.isFinite(value) && value > 0 ? value : 0
+  }
+
+  const max = useMemo(() => {
+    let peak = 0
+    for (const point of list) {
+      if (stacked) {
+        let sum = 0
+        for (const line of lines) sum += Number(point?.[line.key] ?? 0) > 0 ? Number(point[line.key]) : 0
+        peak = Math.max(peak, sum)
+      } else {
+        for (const line of lines) peak = Math.max(peak, Math.max(0, Number(point?.[line.key] ?? 0)))
+      }
+    }
+    return peak === 0 ? 1 : peak * 1.08
+  }, [list, lines, stacked])
+
+  const slot = list.length > 0 ? innerW / list.length : innerW
+  /**
+   * 柱宽：堆叠时一根占住大半格（要能看出段与段的比例），
+   * 分组时按根数均分同一格（两根柱并列时各自留一点间隙）。
+   */
+  const barW = stacked
+    ? Math.max(3, Math.min(30, slot * 0.62))
+    : Math.max(2, Math.min(18, (slot * 0.72) / Math.max(1, lines.length)))
+  const gap = stacked ? 0 : Math.max(1, Math.min(4, barW * 0.18))
+  const yOf = (value) => pad.top + innerH - (Math.max(0, Number(value) || 0) / max) * innerH
+  const centerOf = (index) => pad.left + index * slot + slot / 2
+
+  const ticks = useMemo(
+    () => Array.from({ length: 5 }, (_, index) => ({ value: (max / 4) * index, y: yOf((max / 4) * index) })),
+    [max, yOf],
+  )
+
+  const onMove = (event) => {
+    const rect = event.currentTarget.getBoundingClientRect()
+    const ratio = (event.clientX - rect.left) / Math.max(1, rect.width)
+    const index = Math.min(list.length - 1, Math.max(0, Math.floor(ratio * list.length)))
+    setHover(index)
+  }
+
+  const labelEvery = Math.max(1, Math.ceil(list.length / Math.max(2, Math.floor(innerW / 68))))
+  const baseline = pad.top + innerH
+  const hoverLabel = hover === null ? '' : shortDate(list[hover]?.key)
+  /** 悬停那一格的合计（堆叠时就是柱高对应的数）。 */
+  const hoverTotal = hover === null
+    ? 0
+    : lines.reduce((sum, line) => sum + valueOf(list[hover], line.key), 0)
+
+  const bars = []
+  list.forEach((point, index) => {
+    const center = centerOf(index)
+    if (stacked) {
+      let acc = 0
+      for (const line of lines) {
+        const value = valueOf(point, line.key)
+        if (value <= 0) continue
+        const top = yOf(acc + value)
+        const bottom = yOf(acc)
+        acc += value
+        bars.push(h('rect', {
+          key: `${point?.key}-${line.key}`,
+          className: `px-bar px-tone-fill-${line.tone}`,
+          x: center - barW / 2,
+          y: top,
+          width: barW,
+          height: Math.max(0, bottom - top),
+          rx: 2,
+        }))
+      }
+      return
+    }
+    // 分组：以格子中心为中线，几根柱依次向两边排开
+    const groupW = barW * lines.length + gap * (lines.length - 1)
+    const left = center - groupW / 2
+    lines.forEach((line, lineIndex) => {
+      const value = valueOf(point, line.key)
+      const top = yOf(value)
+      bars.push(h('rect', {
+        key: `${point?.key}-${line.key}`,
+        className: `px-bar px-tone-fill-${line.tone}`,
+        x: left + lineIndex * (barW + gap),
+        y: top,
+        width: barW,
+        height: Math.max(0, baseline - top),
+        rx: 2,
+      }))
+    })
+  })
+
+  return h(
+    'div',
+    { className: 'px-chart-wrap', ref: wrapRef, style: { position: 'relative' } },
+    h(
+      'svg',
+      {
+        className: 'px-chart',
+        viewBox: `0 0 ${width} ${height}`,
+        width,
+        height,
+        role: 'img',
+        'aria-label': ariaLabel ?? '用量柱状图',
+      },
+      ticks.map((tick, index) =>
+        h('g', { key: `tick${index}` },
+          h('rect', { x: pad.left, y: tick.y, width: innerW, height: 1, className: 'px-grid-line' }),
+          h('text', { x: pad.left - 10, y: tick.y + 3.5, className: 'px-axis-text', textAnchor: 'end' },
+            formatAxis ? formatAxis(tick.value) : Math.round(tick.value)))),
+      // 悬停时把那一格整列压暗一点：柱子上直接加高亮会改掉柱高，
+      // 读到的数字就会与静止时不一致。
+      hover === null
+        ? null
+        : h('rect', {
+          className: 'px-hover-band',
+          x: pad.left + hover * slot,
+          y: pad.top,
+          width: slot,
+          height: innerH,
+        }),
+      bars,
+      list.map((point, index) =>
+        index % labelEvery === 0 || index === list.length - 1
+          ? h('text', {
+            key: `x${index}`,
+            x: centerOf(index),
+            y: height - 7,
+            className: 'px-axis-text',
+            textAnchor: 'middle',
+          }, shortDate(point?.key))
+          : null),
+      h('rect', {
+        x: pad.left,
+        y: pad.top,
+        width: innerW,
+        height: innerH,
+        fill: 'transparent',
+        onMouseMove: onMove,
+        onMouseLeave: () => { setHover(null) },
+      }),
+    ),
+    hover === null ? null : h(
+      'div',
+      { className: 'px-tip', style: { left: `${Math.min(78, Math.max(22, (centerOf(hover) / width) * 100))}%` } },
+      h('div', { className: 'px-tip-head' }, hoverLabel),
+      lines.map((line) =>
+        h('div', { key: line.key, className: 'px-tip-row' },
+          h('i', { className: `px-legend-swatch px-tone-${line.tone}` }),
+          h('span', null, line.label),
+          h('b', null, formatValue ? formatValue(valueOf(list[hover], line.key)) : valueOf(list[hover], line.key)))),
+      // 堆叠柱的柱高对应「合计」，悬停时把这条数也说出来——否则读者得自己加。
+      stacked && lines.length > 1
+        ? h('div', { className: 'px-tip-row px-tip-total' },
+          h('span', null, '合计'),
+          h('b', null, formatValue ? formatValue(hoverTotal) : hoverTotal))
+        : null,
+    ),
+    h(
+      'div',
+      { className: 'px-legend' },
+      lines.map((line) =>
+        h('span', { key: line.key, className: 'px-legend-item' },
+          h('i', { className: `px-legend-swatch px-tone-${line.tone}` }),
+          h('span', null, line.label),
+          h('b', { className: `px-legend-value${hover === null ? '' : ' on'}` },
+            hover === null ? '' : (formatValue ? formatValue(valueOf(list[hover], line.key)) : '')))),
+      // 说明小字已删除（用户要求），理由同 TrendChart。
     ),
   )
 }

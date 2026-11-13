@@ -1,23 +1,29 @@
 /**
  * 第三方订阅套餐（Coding Plan）额度查询。
  *
- * 目前支持两家：
+ * 目前支持六家，分两批接入：
  *
  *   1) **智谱 GLM Coding Plan** — 5 小时积分 + 每周积分（官方**没有**月度额度）。
  *   2) **Command Code** — 5 小时 / 每周 / 每月三个滚动窗口。
+ *   3) **火山方舟** — 控制面 OpenAPI，Agent Plan（绝对值）/ Coding Plan（百分比）。
+ *   4) **Codex（ChatGPT 套餐）** — 只有百分比，主/次两个滚动窗口。
+ *   5) **Cursor** — 只有百分比，一个计费周期（**社区核验**，见 CURSOR_USAGE_URL）。
+ *   6) **Opencode** — Go 套餐百分比 ×3 ＋ Console 预算（美元绝对值）。
+ *
+ * 现金余额**只有 DeepSeek 官方**（见 lib/balance.js）：套餐额度换不成金额，
+ * 不同厂商之间也不做换算或汇总——它们回答的是不同的问题。
  *
  * ## 关于这些接口的诚实说明（改动前务必读完）
  *
- * **两家都没有公开文档化的额度 API。** 这里用的是它们**前端自己在用**的内部接口：
+ * **六家都没有公开文档化的「个人套餐额度」API。** 这里用的是它们**前端 / CLI 自己
+ * 在调**的内部接口，因此**可能随时失效**。本模块全程 fail-soft：任何一家取不到都
+ * 只把那一家标成错误，绝不影响其余各家、也绝不影响看板其余部分。
  *
- *   - 智谱：`GET open.bigmodel.cn/api/monitor/usage/quota/limit`，
- *     鉴权是 **裸 API Key（不带 `Bearer ` 前缀）**；
- *     失败时 **HTTP 仍是 200**，必须看响应体里的 `success` 字段。
- *   - Command Code：`GET api.commandcode.ai/alpha/billing/credits`，
- *     鉴权是 `Authorization: Bearer <key>`；失败走真实的 401。
- *
- * 因此这些接口**可能随时变更**，本模块全程 fail-soft：任何一家取不到都只把
- * 那一家标成错误，绝不影响另一家、也绝不影响看板其余部分。
+ * 每一家的结果都带三样元信息，界面据此如实交代可信度：
+ *   - `verification`：`first-party`（有一方来源可核验：开源代码或官方文档）或
+ *     `community`（只有社区逆向实现，Cursor 就是这一档）；
+ *   - `shape`：`percent` / `absolute` / `remaining` / `mixed`，见 {@link SHAPE_LABELS}；
+ *   - `evidence`：核验出处的链接。
  *
  * ## 凭据（隐私相关，别放宽）
  *
@@ -27,13 +33,19 @@
  *   |---|---|---|
  *   | 智谱 | `ZHIPU_CODING_API_KEY` | —（智谱没有官方 CLI 凭据文件） |
  *   | Command Code | `COMMAND_CODE_API_KEY` | `~/.commandcode/auth.json` 的 `apiKey` |
+ *   | 火山方舟 | `VOLC_ACCESS_KEY_ID` + `VOLC_SECRET_ACCESS_KEY` | —（两把都要配） |
+ *   | Codex | `CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID` | `$CODEX_HOME/auth.json`（默认 `~/.codex`） |
+ *   | Cursor | `CURSOR_ACCESS_TOKEN` | `~/.cursor/auth.json` / `%APPDATA%\Cursor\auth.json` |
+ *   | Opencode | `OPENCODE_API_KEY` + `OPENCODE_WORKSPACE_ID` | `$XDG_DATA_HOME/opencode/auth.json` |
  *
- * 两条硬约束：
+ * 三条硬约束：
  *   - **Key 只在宿主进程内使用**，绝不写进响应、日志或落盘。响应里只回报来源
  *     （`credentials` / `env` / `cli-file`）与一个**打码后的尾部片段**，便于用户
  *     确认「用的是哪一把」，而不足以还原出密钥。
  *   - **端点固定为官方域名，不接受任何形式的改写**（无环境变量、无配置项）。
  *     与余额那一套同样的理由：端点决定 Key 发给谁。
+ *   - **别人的凭据文件只读不写**（Codex / Cursor / Opencode / Command Code CLI）。
+ *     也**不做 token refresh**：刷新要写回那些文件，越权了。
  *
  * 智谱的 Coding Plan Key 与平台普通 API Key **不通用**，必须是「个人编程套餐」
  * 里单独新建的那把；用错会在两个阶段暴露——标准 API 能过、quota 接口报
@@ -170,7 +182,13 @@ export const COMMAND_CODE_KEY_URL = 'https://commandcode.ai/studio'
  * 真正能写进去的只有两处，界面上必须把这两处都写出来：
  *   1. 凭据文件 `<DSH_HOME>/.credentials.yaml` 的 `refs:` 段；
  *   2. 同名环境变量（含 `<DSH_HOME>/.env`、项目 `.env`，或启动前 export）。
- * @param {object} spec - keyURL / keyURLName / acquire / refs / where。
+ *
+ * 除了「怎么配」，这一块还要诚实交代三件事（都是用户判断可信度时必须知道的）：
+ *   - `verification`：这个端点是不是有**一方来源**（开源代码 / 官方文档）可核验；
+ *     `community` 表示只有社区逆向实现，界面必须说出来，不能让用户以为它是官方的；
+ *   - `shape`：这家给的是**百分比**、**绝对值**还是**只有剩余额**；
+ *   - `evidence`：核验出处链接（点开就能自己核对）。
+ * @param {object} spec - keyURL / keyURLName / acquire / refs / where / files / verification / shape / evidence。
  * @returns {object} 说明块（纯数据，供界面直接渲染）。
  */
 export function setupOf(spec) {
@@ -183,8 +201,30 @@ export function setupOf(spec) {
       example: String(item.example ?? ''),
       note: String(item.note ?? ''),
     })),
+    // 自动发现路径：写出来用户才知道「为什么我没配它也能查到」。
+    files: (Array.isArray(spec.files) ? spec.files : []).map((item) => ({
+      path: String(item.path ?? ''),
+      note: String(item.note ?? ''),
+    })),
+    // 数据形状：`percent`（只有百分比）/ `absolute`（绝对值）/ `remaining`（只有剩余额）。
+    shape: SHAPE_LABELS[spec.shape] === undefined ? '' : String(spec.shape),
+    verification: spec.verification === 'community' ? 'community' : 'first-party',
+    evidence: String(spec.evidence ?? ''),
   }
 }
+
+/**
+ * 数据形状 → 给用户看的说法。
+ *
+ * 这一张表是「不把不同厂商的额度换算成金额」那条铁律的落地：三家给的东西
+ * 单位互不相通（百分比 / 美元 / 积分），界面上照实说形状，不做跨厂商比较。
+ */
+export const SHAPE_LABELS = Object.freeze({
+  percent: '官方只给百分比',
+  absolute: '官方给绝对值（已用 + 上限）',
+  remaining: '官方只给剩余额',
+  mixed: '套餐给百分比，预算给金额',
+})
 
 /**
  * 解析 DSH 凭据文件路径，供界面告诉用户「这两行写进哪个文件」。
@@ -275,6 +315,18 @@ export const ZHIPU_ROUTES = ['zhipu-coding', 'zai-coding-cn', 'zhipu', 'bigmodel
 /** 火山方舟常见的自定义 provider 路由名。 */
 export const VOLC_ROUTES = ['fangzhou', 'volcengine', 'ark', 'volces', 'doubao']
 
+/**
+ * Codex / Cursor / Opencode 常见的自定义 provider 路由名。
+ *
+ * 与 `ZHIPU_ROUTES` 等同一个用途：用户用「自定义提供商」接这三家时，DSH 会按路由名
+ * 派生凭据引用名。**这一组在客户端 `client/plans.js` 里有一份镜像**
+ * （`EXTRA_PLAN_ROUTES`），用于「当前会话用的是哪一家 → 该显示哪家的额度」。
+ * 两份漂移的表现是「套餐卡片里有这一家、费用条旁边却始终不显示」——没有报错。
+ */
+export const CODEX_ROUTES = ['codex', 'codex-cli', 'openai-codex', 'chatgpt-codex']
+export const CURSOR_ROUTES = ['cursor', 'cursor-agent']
+export const OPENCODE_ROUTES = ['opencode', 'opencode-zen', 'zen']
+
 /** 智谱 Coding Plan 的候选凭据引用名（按优先级）。 */
 export const ZHIPU_KEY_ENVS = candidateRefs(
   ['ZHIPU_CODING_API_KEY', 'ZHIPU_API_KEY', 'BIGMODEL_API_KEY'],
@@ -312,6 +364,337 @@ export const VOLC_AK_ENV = VOLC_AK_ENVS[0]
 /** 火山 SK 的第一候选。 */
 export const VOLC_SK_ENV = VOLC_SK_ENVS[0]
 
+/* ══════════════════════════════════════════════════════════════════
+ * 新增三家：Codex / Cursor / Opencode
+ *
+ * 每一家的端点、鉴权头与凭据文件格式都来自**可核验的来源**，注释里给出链接：
+ * 优先是它们自己 CLI / 客户端的开源代码（Codex、Opencode 都是开源的），
+ * 官方文档只在代码不可读时才算数。**核验不到的字段一个都不编**：
+ * 解析器只读代码里真实出现过的字段名，读不到就留 undefined（界面显示 `—`）。
+ *
+ * 三家的数据形状**互不相同**，这正是不能「统一成金额」的理由：
+ *
+ *   | 厂商 | 形状 | 窗口 |
+ *   |---|---|---|
+ *   | Codex | **只有百分比**（`used_percent`）+ 重置时刻 | 主/次两个滚动窗口 |
+ *   | Cursor | **只有百分比**（`totalPercentUsed`）+ 计费周期 | 一个计费周期 |
+ *   | Opencode | Go 套餐**百分比** ×3；Console 预算**绝对值**（美元） | rolling/weekly/monthly + 预算 |
+ *
+ * 所有端点都是**未文档化的内部接口**（官方没有把它们写进公开 API 文档），
+ * 因此与前三家同样按「随时会失效」写：单家失败只标那一家。
+ * ══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Codex（OpenAI Codex CLI）的额度接口。
+ *
+ * **核验来源（可点开对照）**：
+ *   `codex-rs/backend-client/src/client/rate_limit_resets.rs` 里
+ *   `rate_limit_status_url()`：ChatGPT 侧的 base 是 `chatgpt.com/backend-api`，
+ *   路径拼成 `/wham/usage`；API 风格 base（不含 `/backend-api`）则是 `/api/codex/usage`。
+ *   https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs
+ *
+ * 鉴权是 **ChatGPT 登录态的 access token**（`Authorization: Bearer …`）外加
+ * `chatgpt-account-id` 头（见同目录 `client.rs` 的 `headers_with()` 与
+ * `codex-rs/http-client/src/openai_headers.rs`）。**不是 API Key**：用 `sk-` 开头的
+ * 平台 Key 打这个端点只会得到 401，所以凭据候选里刻意不派生 `<route>_API_KEY`。
+ *
+ * 响应形状（`RateLimitStatusPayload`，测试用的线上样本在
+ * `codex-rs/app-server/tests/suite/v2/rate_limits.rs`）：
+ *
+ *     { "plan_type": "team",
+ *       "rate_limit": { "allowed": true, "limit_reached": false,
+ *                       "primary_window":   { "used_percent": 42, "limit_window_seconds": 3600,
+ *                                             "reset_after_seconds": 120, "reset_at": 2000000000 },
+ *                       "secondary_window": { … } },
+ *       "rate_limit_reset_credits": { "available_count": 0 } }
+ *
+ * 注意 `reset_at` 是**秒**，`limit_window_seconds` 才是窗口长度（分钟 = 秒/60）。
+ * 窗口身份**必须按 `limit_window_seconds` 判**，不能按 primary/secondary 的位置猜：
+ * 代码里 primary 既出现过 1 小时也出现过 5 小时。
+ */
+export const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
+
+/** Codex 额度接口路径，供界面标出来源。 */
+export const CODEX_USAGE_PATH = '/backend-api/wham/usage'
+
+/** Codex 登录与用量说明（官方文档站，`docs/authentication.md` 指向这里）。 */
+export const CODEX_KEY_URL = 'https://developers.openai.com/codex/auth'
+
+/** 端点的核验出处。 */
+export const CODEX_EVIDENCE_URL = 'https://github.com/openai/codex/blob/main/codex-rs/backend-client/src/client/rate_limit_resets.rs'
+
+/**
+ * Codex 的凭据引用名：ChatGPT 登录态 access token。
+ *
+ * 之所以叫 `CODEX_ACCESS_TOKEN` 而不是 `CODEX_API_KEY`：`~/.codex/auth.json` 里
+ * `tokens.access_token` 是 OAuth 令牌（JWT），与 `OPENAI_API_KEY` 是**两套东西**
+ * （见 `codex-rs/login/src/auth/storage.rs` 的 `AuthDotJson`，它同时有
+ * `OPENAI_API_KEY` 与 `tokens` 两个字段）。用户若把平台 Key 当这个用会一直 401。
+ */
+export const CODEX_TOKEN_ENVS = ['CODEX_ACCESS_TOKEN', 'OPENAI_CODEX_ACCESS_TOKEN']
+
+/**
+ * Codex 的 workspace / account id 引用名（`chatgpt-account-id` 头）。
+ *
+ * 大多数情况下从 `~/.codex/auth.json` 的 `tokens.account_id` 就能拿到；
+ * 这一组是给「只把 token 配进凭据文件」的人兜底的。
+ */
+export const CODEX_ACCOUNT_ENVS = ['CODEX_ACCOUNT_ID', 'CHATGPT_ACCOUNT_ID']
+
+/** 兼容旧名：第一候选。 */
+export const CODEX_TOKEN_ENV = CODEX_TOKEN_ENVS[0]
+
+/**
+ * 解析「本机主目录」，**并且尊重显式传入的空环境**。
+ *
+ * 这一条不是洁癖：`env` 是依赖注入的接缝，测试与预检会传 `{}` 表示
+ * 「这台机器上什么都没配」。若这里回落到 `os.homedir()`，那个「空环境」就会
+ * 去读**真实开发机**的 `~/.codex/auth.json` 之类文件并真的发网络请求——
+ * 于是闸门里的公共 fetch 替身被别的厂商的请求污染（实测踩过：
+ * 火山那条断言拿到的是 Cursor/Codex 的 URL）。
+ *
+ * 因此规则是：显式给了 env 但没有主目录变量 → **不猜**，返回 undefined，
+ * 自动发现整体跳过。实际运行时 `process.env` 一定带 USERPROFILE / HOME。
+ * @param {object|undefined} env - 环境变量来源。
+ * @returns {string|undefined} 主目录绝对路径；无法推导时 undefined。
+ */
+function homeOf(env) {
+  if (env === null || env === undefined) return homedir()
+  const raw = env.USERPROFILE ?? env.HOME
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined
+  return raw.trim()
+}
+
+/**
+ * Codex 凭据文件的默认目录名（`CODEX_HOME` 可覆盖）。
+ * @param {object} [env] - 环境变量来源。
+ * @returns {string} auth.json 的绝对路径；推不出主目录时是空串（表示「不自动发现」）。
+ */
+export function codexAuthPath(env = process.env) {
+  const configured = typeof env?.CODEX_HOME === 'string' && env.CODEX_HOME.trim() !== ''
+    ? env.CODEX_HOME.trim()
+    : undefined
+  const home = configured ?? homeOf(env)
+  if (home === undefined) return ''
+  return join(home, configured === undefined ? '.codex' : '', 'auth.json')
+}
+
+/**
+ * 从 Codex 的 `auth.json` 里读 access token 与 account id。
+ *
+ * 这是**另一个 App 的登录凭据文件**：只读不写，读失败一律安静当作「没配」。
+ * 只取两个字段（`tokens.access_token` / `tokens.account_id`），其余一概不碰。
+ * @param {string} path - auth.json 路径。
+ * @returns {{accessToken:string,accountId:string|undefined}|undefined} 读不到时 undefined。
+ */
+export function readCodexAuth(path) {
+  const parsed = readJsonFile(path)
+  const tokens = parsed?.tokens
+  if (tokens === undefined || tokens === null || typeof tokens !== 'object') return undefined
+  const accessToken = stringOrUndefined(tokens.access_token)
+  if (accessToken === undefined) return undefined
+  return { accessToken, accountId: stringOrUndefined(tokens.account_id) }
+}
+
+/**
+ * Opencode（sst/opencode）Go 套餐额度接口：**只有百分比**。
+ *
+ * **核验来源**：`packages/core/src/usage-limits.ts` 的 `readGo()` 里
+ * `HttpClientRequest.get(`${new URL(server).origin}/zen/go/v1/usage`)`，
+ * 头是 `bearerToken(credential.access|key)` + `x-opencode-org-id: <workspaceID>`。
+ * server 默认 `https://opencode.ai/console`（`packages/core/src/console-access.ts`
+ * 的 `defaultServer`），`new URL(...).origin` 因此是 `https://opencode.ai`。
+ * https://github.com/sst/opencode/blob/dev/packages/core/src/usage-limits.ts
+ *
+ * 响应形状（同文件 `GoUsage` / `GoMeter`）：
+ *
+ *     { "usage": { "rolling": { "status": "ok"|"rate-limited", "percent": 12.5, "resetsAt": "2026-11-20T…" },
+ *                  "weekly":  { … }, "monthly": { … } } }
+ *
+ * 403 有确定含义：**该 workspace 没订 Go**（代码里 `status === 403 → undefined`），
+ * 不是错误，因此调用方把它当作「没有这个窗口」而不是失败。
+ */
+export const OPENCODE_GO_USAGE_URL = 'https://opencode.ai/zen/go/v1/usage'
+
+/** Opencode Go 额度接口路径。 */
+export const OPENCODE_GO_USAGE_PATH = '/zen/go/v1/usage'
+
+/**
+ * Opencode Console 的预算接口：**绝对值**（美元上限与已花）。
+ *
+ * **核验来源**：`readBudgets()` → `GET ${server}/api/policies/current-budgets`，
+ * 头同 ConsoleAccess：`Authorization: Bearer <key|oauth access>` +
+ * `x-org-id: <workspaceID>`（`packages/core/src/console-access.ts`）。
+ * 403 是服务账号 Key 的正常情况（代码里 `403 → []`）。
+ *
+ * 响应是一个数组，每项 `{ ruleID, limitDollars, spentDollars, scope, per, coverage,
+ * models, vendors, resetsAt }`（见同文件 `ConsoleBudget`）。
+ */
+export const OPENCODE_BUDGETS_URL = 'https://opencode.ai/console/api/policies/current-budgets'
+
+/** Opencode 预算接口路径。 */
+export const OPENCODE_BUDGETS_PATH = '/console/api/policies/current-budgets'
+
+/** Opencode Console（登录、查看用量与充值）。 */
+export const OPENCODE_KEY_URL = 'https://opencode.ai/console'
+
+/** 端点的核验出处。 */
+export const OPENCODE_EVIDENCE_URL = 'https://github.com/sst/opencode/blob/dev/packages/core/src/usage-limits.ts'
+
+/**
+ * Opencode 的凭据引用名。
+ *
+ * 既可以是 Console 的 **API Key**（`ocgw_` 开头这类），也可以是 OAuth access
+ * （`Credential.OAuth` 的 `access`）——两者在 `ConsoleAccess.headers()` 里是同一个
+ * `Authorization: Bearer` 位置。这里只收显式名字 + provider 派生的
+ * `<route>_API_KEY`（这条路线在 DSH 里是用户真能填进去的地方）。
+ */
+export const OPENCODE_KEY_ENVS = candidateRefs(
+  ['OPENCODE_API_KEY', 'OPENCODE_ZEN_API_KEY', 'OPENCODE_CONSOLE_KEY'],
+  OPENCODE_ROUTES,
+)
+
+/**
+ * Opencode 的 workspace id（请求头 `x-opencode-org-id` / `x-org-id`）。
+ *
+ * **两个接口都要求它**：Go 额度用 `x-opencode-org-id`，Console 预算用 `x-org-id`。
+ * 没有它就只能回报「缺 workspace id」——现编一个只会得到 403，反而更难查。
+ */
+export const OPENCODE_WORKSPACE_ENVS = ['OPENCODE_WORKSPACE_ID', 'OPENCODE_ORG_ID']
+
+/** 兼容旧名：第一候选。 */
+export const OPENCODE_KEY_ENV = OPENCODE_KEY_ENVS[0]
+
+/** Opencode 的 workspace id 第一候选。 */
+export const OPENCODE_WORKSPACE_ENV = OPENCODE_WORKSPACE_ENVS[0]
+
+/**
+ * Opencode 的数据目录（`$XDG_DATA_HOME/opencode`，否则 `~/.local/share/opencode`）。
+ *
+ * 取自 `packages/util/src/global-roots.ts`：`data = XDG_DATA_HOME || ~/.local/share`，
+ * 再拼应用名。历史版本的登录凭据就是这里的 `auth.json`
+ * （`packages/core/src/database/migration/…_import_legacy_credentials.ts`）。
+ */
+export function opencodeAuthPath(env = process.env) {
+  const configured = typeof env?.XDG_DATA_HOME === 'string' && env.XDG_DATA_HOME.trim() !== ''
+    ? env.XDG_DATA_HOME.trim()
+    : undefined
+  const base = configured ?? (homeOf(env) === undefined ? undefined : join(homeOf(env), '.local', 'share'))
+  if (base === undefined) return ''
+  return join(base, 'opencode', 'auth.json')
+}
+
+/**
+ * 从 Opencode 的历史凭据文件里读 API Key 与 workspace id。
+ *
+ * 文件形状（V1 `auth.json`）是一个 `{ [providerID]: credential }` 映射，
+ * credential 形如 `{ type: 'api'|'oauth', key|access, metadata: { orgID, server } }`。
+ * 只认 `opencode` 这一条，并且**只读**。读不到返回 undefined（安静当作没配）。
+ * @param {string} path - auth.json 路径。
+ * @returns {{apiKey:string,workspaceId:string|undefined}|undefined} 读不到时 undefined。
+ */
+export function readOpencodeAuth(path) {
+  const parsed = readJsonFile(path)
+  const entry = parsed?.opencode
+  if (entry === undefined || entry === null || typeof entry !== 'object') return undefined
+  const apiKey = stringOrUndefined(entry.key) ?? stringOrUndefined(entry.access)
+  if (apiKey === undefined) return undefined
+  const workspaceId = stringOrUndefined(entry.metadata?.orgID)
+  return { apiKey, workspaceId }
+}
+
+/**
+ * Cursor 的当前计费周期用量接口（Connect RPC，POST 空对象）。
+ *
+ * ## 核验级别：**社区逆向，非一方来源**
+ *
+ * Cursor 的 CLI 与客户端**不是开源的**，官方文档只公开了团队/企业的 Admin API
+ * （`/teams/daily-usage-data` 一类，那是团队聚合用量，不是**个人套餐额度**），
+ * 因此这个端点没有「开源代码或官方文档」可依。
+ *
+ * 它的依据是两个**互相独立**的开源实现给出了一致的地址、鉴权头与响应字段：
+ *   1. `rarf/hermes-quota-plugin` 的 `quota_providers/cursor.py`（注释写明这是
+ *      `cursor-agent` CLI 自己在调的两个 Connect RPC，并附了观测到的响应样本）；
+ *   2. `PowerUserZ/OpenTokenUsage` 的 `docs/providers/cursor.md`（同一个
+ *      `aiserver.v1.DashboardService` 服务与 `GET/POST` 说明）。
+ * https://github.com/rarf/hermes-quota-plugin/blob/master/quota_providers/cursor.py
+ *
+ * **因此这条适配器的 `verification` 标成 `community`**，界面会明确写「未核验到
+ * 官方来源」。产品里只解析这两份实现都点到的字段，其余一律留 `—`。
+ */
+export const CURSOR_USAGE_URL = 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage'
+
+/** Cursor 用量接口路径（Connect RPC，POST `{}`）。 */
+export const CURSOR_USAGE_PATH = '/aiserver.v1.DashboardService/GetCurrentPeriodUsage'
+
+/** Cursor 控制台（查看用量与套餐）。 */
+export const CURSOR_KEY_URL = 'https://cursor.com/dashboard'
+
+/** 端点的核验出处（社区实现）。 */
+export const CURSOR_EVIDENCE_URL = 'https://github.com/rarf/hermes-quota-plugin/blob/master/quota_providers/cursor.py'
+
+/**
+ * Cursor 的凭据引用名：CLI/桌面端登录态 access token（短时 JWT）。
+ *
+ * 过期的表现是 401，需要用户在 Cursor 里重新登录（`cursor-agent login`）。
+ * 本插件**不做 refresh**：那要往另一个 App 的凭据存储里写，越权了。
+ */
+export const CURSOR_TOKEN_ENVS = ['CURSOR_ACCESS_TOKEN', 'CURSOR_SESSION_TOKEN']
+
+/** 兼容旧名：第一候选。 */
+export const CURSOR_TOKEN_ENV = CURSOR_TOKEN_ENVS[0]
+
+/**
+ * Cursor 登录凭据文件的**候选路径**（按平台，取自上面那两份实现）。
+ *
+ * CLI 把会话存在 `~/.cursor/auth.json`（macOS）、`$XDG_CONFIG_HOME/cursor/auth.json`
+ * （Linux）、`%APPDATA%\Cursor\auth.json`（Windows），键名 `accessToken`。
+ * 桌面端还存在 SQLite（`state.vscdb`）——**本插件不读它**：读 SQLite 要么引第三方
+ * 依赖、要么自己写二进制解析器，两者都不划算（本项目零依赖）。
+ * @param {object} [env] - 环境变量来源。
+ * @returns {string[]} 候选路径（去重、保持优先级）。
+ */
+export function cursorAuthPaths(env = process.env) {
+  const home = homeOf(env)
+  const out = []
+  const appdata = typeof env?.APPDATA === 'string' && env.APPDATA.trim() !== '' ? env.APPDATA.trim() : ''
+  const xdgConfig = typeof env?.XDG_CONFIG_HOME === 'string' && env.XDG_CONFIG_HOME.trim() !== ''
+    ? env.XDG_CONFIG_HOME.trim()
+    : ''
+  if (appdata !== '') out.push(join(appdata, 'Cursor', 'auth.json'))
+  if (home !== undefined) out.push(join(home, '.cursor', 'auth.json'))
+  if (xdgConfig !== '') out.push(join(xdgConfig, 'cursor', 'auth.json'))
+  return [...new Set(out)]
+}
+
+/**
+ * 从 Cursor 的 auth.json 里读 access token。只读，读失败安静当成没配。
+ * @param {string} path - auth.json 路径。
+ * @returns {string|undefined} token；读不到时 undefined。
+ */
+export function readCursorAuth(path) {
+  const parsed = readJsonFile(path)
+  return stringOrUndefined(parsed?.accessToken) ?? stringOrUndefined(parsed?.access_token)
+}
+
+/**
+ * 读一个 JSON 文件（**只读**，失败一律安静返回 undefined）。
+ *
+ * 三家的自动发现都走这里。刻意不抛错：这些文件属于**别的 App**，
+ * 读不到是常态（没装、没登录、权限不同），不该让一家厂商的卡片变成错误态。
+ * @param {string} path - 绝对路径。
+ * @returns {object|undefined} 解析结果；不存在或读不懂时 undefined。
+ */
+function readJsonFile(path) {
+  try {
+    if (!existsSync(path)) return undefined
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
+    return parsed !== null && typeof parsed === 'object' ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * 「移除凭据」的清单：每一家要动哪些引用名。
  *
@@ -331,6 +714,9 @@ const VENDOR_REF_NAMES = Object.freeze({
   zhipu: ZHIPU_KEY_ENVS,
   commandcode: COMMAND_CODE_KEY_ENVS,
   volcengine: Object.freeze([...VOLC_AK_ENVS, ...VOLC_SK_ENVS]),
+  codex: Object.freeze([...CODEX_TOKEN_ENVS, ...CODEX_ACCOUNT_ENVS]),
+  cursor: CURSOR_TOKEN_ENVS,
+  opencode: Object.freeze([...OPENCODE_KEY_ENVS, ...OPENCODE_WORKSPACE_ENVS]),
 })
 
 /**
@@ -354,6 +740,17 @@ function refPurposeOf(id, ref) {
     VOLCENGINE_ACCESS_KEY_ID: 'AccessKey ID 的另一种写法',
     VOLC_SECRET_ACCESS_KEY: 'Secret Access Key（与 AK 成对）',
     VOLCENGINE_SECRET_ACCESS_KEY: 'Secret Access Key 的另一种写法',
+    CODEX_ACCESS_TOKEN: 'Codex 的 ChatGPT 登录态 access token（JWT，不是 sk- 平台 Key）',
+    OPENAI_CODEX_ACCESS_TOKEN: '同一把 Codex access token 的另一种写法',
+    CODEX_ACCOUNT_ID: 'Codex 的 workspace / 账号 id（请求头 chatgpt-account-id）',
+    CHATGPT_ACCOUNT_ID: '同一个账号 id 的通用写法',
+    CURSOR_ACCESS_TOKEN: 'Cursor 登录态 access token（短时 JWT，过期需重新登录）',
+    CURSOR_SESSION_TOKEN: '同一把 Cursor token 的另一种写法',
+    OPENCODE_API_KEY: 'OpenCode Console 的 API Key（或 OAuth access token）',
+    OPENCODE_ZEN_API_KEY: 'OpenCode Zen 的 Key（与 Console Key 同一个鉴权位置）',
+    OPENCODE_CONSOLE_KEY: 'OpenCode Console Key 的另一种写法',
+    OPENCODE_WORKSPACE_ID: 'OpenCode Console 的 workspace id（请求头 x-opencode-org-id）',
+    OPENCODE_ORG_ID: '同一个 workspace id 的另一种写法（预算接口用 x-org-id）',
   }
   if (Object.hasOwn(known, ref)) return known[ref]
   // 派生名：`<路由名>_API_KEY`。反推回路由名比留空更有用。
@@ -368,7 +765,13 @@ const VENDOR_NAMES = Object.freeze({
   zhipu: '智谱 GLM Coding Plan',
   commandcode: 'Command Code',
   volcengine: '火山方舟 Coding Plan',
+  codex: 'Codex（ChatGPT 套餐）',
+  cursor: 'Cursor',
+  opencode: 'Opencode',
 })
+
+/** 全部厂商 id（顺序即界面默认顺序：先老三家，再新三家）。 */
+export const PLAN_VENDOR_IDS = Object.freeze(['zhipu', 'commandcode', 'volcengine', 'codex', 'cursor', 'opencode'])
 
 /**
  * 「移除凭据」要动哪些引用名——**由各家的候选名推导**，不手抄。
@@ -376,13 +779,18 @@ const VENDOR_NAMES = Object.freeze({
  * 移除功能最不能出的错是「漏掉一个候选名」：用户点了移除，那家照样能解析到 Key，
  * 界面却显示「已移除」。因此这里直接取各家解析时用的那份候选名列表
  * （{@link ZHIPU_KEY_ENVS} / {@link COMMAND_CODE_KEY_ENVS} / {@link VOLC_AK_ENVS}
- * + {@link VOLC_SK_ENVS}），于是「插件会试的名字」与「移除会删的名字」在构造上
- * 就是同一个集合，不存在只改一边的可能。
- * @returns {Array<{id:string,name:string,refs:Array<{name:string,purpose:string}>,cliFile:boolean}>} 清单。
+ * + {@link VOLC_SK_ENVS} / {@link CODEX_TOKEN_ENVS} 等），于是「插件会试的名字」
+ * 与「移除会删的名字」在构造上就是同一个集合，不存在只改一边的可能。
+ *
+ * `files` 是各家**本机凭据文件**的候选路径（只读、不删）：界面必须把它们列出来，
+ * 否则用户清完凭据文件里那把之后，插件照样能从别的 App 的文件里读到，界面上却是
+ * 「未配」——自相矛盾。只读不写，因此没有 `removable`。
+ * @param {object} [env] - 环境变量来源（路径推导用；缺省 process.env）。
+ * @returns {Array<{id:string,name:string,refs:Array<{name:string,purpose:string}>,cliFile:boolean,files:Array<{path:string,note:string}>}>} 清单。
  */
-export function planVendorInventory() {
+export function planVendorInventory(env = process.env) {
   const cliFileVendors = new Set(['commandcode'])
-  return ['zhipu', 'commandcode', 'volcengine'].map((id) => ({
+  return PLAN_VENDOR_IDS.map((id) => ({
     id,
     name: VENDOR_NAMES[id],
     refs: VENDOR_REF_NAMES[id].map((ref) => ({ name: ref, purpose: refPurposeOf(id, ref) })),
@@ -390,7 +798,42 @@ export function planVendorInventory() {
     // 不列出来，用户移除完文件里的那把之后插件照样读得到 CLI 那把，
     // 界面上却是「未配」——自相矛盾。
     cliFile: cliFileVendors.has(id),
+    files: credentialFilesOf(id, env),
   }))
+}
+
+/**
+ * 某一家**自动发现**会读的本机凭据文件（只读、不删）。
+ *
+ * Codex / Cursor / Opencode 都靠读它们自己 CLI 的登录态工作，所以这些路径是
+ * 「为什么没配凭据也能查到额度」的答案，必须能在界面上看到。
+ * @param {string} id - 厂商 id。
+ * @param {object} [env] - 环境变量来源。
+ * @returns {Array<{path:string,note:string}>} 文件说明（没有自动发现的家返回空数组）。
+ */
+function credentialFilesOf(id, env = process.env) {
+  const files = []
+  const add = (path, note) => {
+    // 推不出主目录时路径是空串：**不列出来**（列一个空路径只会让人困惑），
+    // 自动发现也随之跳过——见 homeOf 的注释。
+    if (typeof path === 'string' && path !== '') files.push({ path, note })
+  }
+  if (id === 'commandcode') {
+    add(commandCodeAuthPath(env),
+      'Command Code CLI 的登录文件（另一个 App 的密钥文件，插件只读不写、不会删除它）')
+  } else if (id === 'codex') {
+    add(codexAuthPath(env),
+      'Codex CLI 的登录文件；插件只读它的 tokens.access_token / tokens.account_id，不写、不删')
+  } else if (id === 'cursor') {
+    for (const path of cursorAuthPaths(env)) {
+      add(path, 'Cursor CLI 的登录文件（accessToken）；插件只读，不写、不删。桌面端的 SQLite 存储不读')
+    }
+  } else if (id === 'opencode') {
+    add(opencodeAuthPath(env),
+      'Opencode 历史版本的登录文件（auth.json）；插件只读 opencode 那一条，不写、不删')
+  }
+  // 智谱与火山没有官方 CLI 凭据文件：空数组如实表达「没有可自动发现的来源」。
+  return files
 }
 
 /**
@@ -470,12 +913,17 @@ const MAX_RESPONSE_BYTES = 128 * 1024
 
 /**
  * 窗口种类 → 中文名。
- * `fiveHour` / `weekly` / `monthly` 三家通用，智谱没有 `monthly`。
+ * `fiveHour` / `weekly` / `monthly` 各家通用，智谱没有 `monthly`。
+ *
+ * `budget` 是新增的一种：Opencode 的 Console 预算是**按模型集合划的月度金额上限**，
+ * 与 Go 套餐那三个滚动窗口是两笔不同的账，混成一个 `monthly` 会把两种口径叠在
+ * 同一个进度条上——因此单列一种，标签也由宿主按规则名给。
  */
 export const WINDOW_LABELS = {
   fiveHour: '5 小时',
   weekly: '每周',
   monthly: '每月',
+  budget: '预算',
 }
 
 /**
@@ -500,9 +948,11 @@ export function maskSecret(value) {
  * @returns {string} 绝对路径。
  */
 export function commandCodeAuthPath(env = process.env) {
-  const home = typeof env?.COMMANDCODE_HOME === 'string' && env.COMMANDCODE_HOME.trim() !== ''
+  const configured = typeof env?.COMMANDCODE_HOME === 'string' && env.COMMANDCODE_HOME.trim() !== ''
     ? env.COMMANDCODE_HOME.trim()
-    : join(env?.USERPROFILE ?? env?.HOME ?? homedir(), '.commandcode')
+    : undefined
+  const home = configured ?? (homeOf(env) === undefined ? undefined : join(homeOf(env), '.commandcode'))
+  if (home === undefined) return ''
   return join(home, 'auth.json')
 }
 
@@ -794,6 +1244,261 @@ function hasNumber(value) {
   return value !== null && value !== undefined && Number.isFinite(Number(value))
 }
 
+/**
+ * Codex 的窗口长度（秒）→ 本插件的窗口种类。
+ *
+ * **必须按长度判，不能按 primary/secondary 的位置判。** 上游代码里 primary 既出现过
+ * 3600 秒也出现过 18000 秒（`rate_limits` 的测试样本两种都有），按位置猜会把
+ * 「5 小时额度」标成「每小时」。
+ * @param {number|undefined} seconds - `limit_window_seconds`。
+ * @returns {{window:string,label:string}|undefined} 窗口种类与标签；读不出时 undefined。
+ */
+function codexWindowOf(seconds) {
+  const value = numberOrUndefined(seconds)
+  if (value === undefined || value <= 0) return undefined
+  const minutes = Math.round(value / 60)
+  if (minutes === 300) return { window: 'fiveHour', label: WINDOW_LABELS.fiveHour }
+  if (minutes === 10080) return { window: 'weekly', label: WINDOW_LABELS.weekly }
+  if (minutes === 60) return { window: 'hourly', label: '每小时' }
+  // 认不出的长度**照实显示长度本身**，不硬塞进某个已知窗口：
+  // 把它塞进「每周」会让用户按错误的窗口安排工作。
+  if (minutes % 1440 === 0) return { window: `window${minutes}`, label: `${minutes / 1440} 天` }
+  if (minutes % 60 === 0) return { window: `window${minutes}`, label: `${minutes / 60} 小时` }
+  return { window: `window${minutes}`, label: `${minutes} 分钟` }
+}
+
+/**
+ * 解析 Codex 的 `/wham/usage` 响应。
+ *
+ * 形状见 {@link CODEX_USAGE_URL} 的注释。三条硬规则：
+ *   1. 只有 `used_percent`，**没有绝对值**——因此窗口标 `percentOnly`，
+ *      界面说明「官方只给百分比」，不假装精确；
+ *   2. `reset_at` 是**秒**，其余时间戳语义都走 {@link normalizeEpoch}；
+ *   3. `rate_limit.limit_reached === true` 时标 `exceeded`（额度已耗尽），
+ *      这是官方给的最强信号，不能因为百分比没到 100 就不显示。
+ * @param {object} payload - 响应体。
+ * @returns {{windows:object[],unparsed:number,plan:string}} 归一结果。
+ */
+export function parseCodexUsage(payload) {
+  const limit = payload?.rate_limit ?? payload?.rateLimit ?? {}
+  const windows = []
+  let unparsed = 0
+  const limitReached = limit?.limit_reached === true || limit?.limitReached === true
+
+  for (const key of ['primary_window', 'secondary_window']) {
+    const raw = limit?.[key] ?? limit?.[key.replace(/_([a-z])/g, (_all, char) => char.toUpperCase())]
+    if (raw === null || raw === undefined) continue
+    if (typeof raw !== 'object') {
+      unparsed += 1
+      continue
+    }
+    const slot = codexWindowOf(raw.limit_window_seconds ?? raw.limitWindowSeconds)
+    if (slot === undefined) {
+      // 没有窗口长度就没法说清「这是多久的额度」：宁可少显示一个窗口，也不猜。
+      unparsed += 1
+      continue
+    }
+    windows.push(buildWindow({
+      window: slot.window,
+      label: slot.label,
+      usedPercent: numberOrUndefined(raw.used_percent ?? raw.usedPercent),
+      resetAt: normalizeEpoch(raw.reset_at ?? raw.resetAt),
+      exceeded: limitReached,
+      source: 'codex',
+    }))
+  }
+
+  const planType = stringOrUndefined(payload?.plan_type ?? payload?.planType) ?? ''
+  return { windows, unparsed, plan: codexPlanLabel(planType) }
+}
+
+/**
+ * Codex 的 `plan_type` → 展示名。
+ *
+ * 取值表来自 `codex-rs/backend-client/src/client.rs` 里 `map_plan_type()` 的分支
+ * （free/plus/pro/…/team/enterprise）。认不出的值**原样显示**，不猜档位。
+ * @param {string} planType - 原始取值。
+ * @returns {string} 展示名；空串表示上游没给。
+ */
+function codexPlanLabel(planType) {
+  const text = String(planType ?? '').trim().toLowerCase()
+  if (text === '') return ''
+  const known = {
+    free: 'Free',
+    go: 'Go',
+    plus: 'Plus',
+    pro: 'Pro',
+    prolite: 'Pro Lite',
+    promax: 'Pro Max',
+    team: 'Team',
+    business: 'Business',
+    enterprise: 'Enterprise',
+    edtech: 'Edu',
+    edu: 'Edu',
+    eduplus: 'Edu Plus',
+    edupro: 'Edu Pro',
+    sci: 'Sci',
+    sciplus: 'Sci Plus',
+  }
+  return known[text] ?? planType
+}
+
+/**
+ * 解析 Opencode 的 Go 套餐额度（`/zen/go/v1/usage`）。
+ *
+ * 三个窗口都只有 `percent`（0–100），因此标 `percentOnly`。
+ * `status === 'rate-limited'` 是官方「已拒绝新请求」的说法，换算成 `exceeded`——
+ * 它可能发生在百分比还没到 100 的时候，所以不能只看数字。
+ *
+ * 时间戳是 **ISO 日期串**（`Schema.DateFromString`），因此走 {@link normalizeEpoch}
+ * 的第二条分支；数字与串两种形状它都认。
+ * @param {object} payload - 响应体。
+ * @returns {{windows:object[],unparsed:number}} 归一结果。
+ */
+export function parseOpencodeGo(payload) {
+  const usage = payload?.usage ?? {}
+  const windows = []
+  let unparsed = 0
+  const slots = [
+    ['rolling', 'fiveHour', '5 小时滚动'],
+    ['weekly', 'weekly', WINDOW_LABELS.weekly],
+    ['monthly', 'monthly', WINDOW_LABELS.monthly],
+  ]
+  for (const [key, window, label] of slots) {
+    const meter = usage?.[key]
+    if (meter === null || meter === undefined) continue
+    if (typeof meter !== 'object') {
+      unparsed += 1
+      continue
+    }
+    const percent = numberOrUndefined(meter.percent)
+    if (percent === undefined) {
+      unparsed += 1
+      continue
+    }
+    windows.push(buildWindow({
+      window,
+      label,
+      usedPercent: percent,
+      resetAt: normalizeEpoch(meter.resetsAt),
+      exceeded: meter.status === 'rate-limited',
+      source: 'opencode',
+    }))
+  }
+  return { windows, unparsed }
+}
+
+/**
+ * 解析 Opencode 的 Console 预算（`/console/api/policies/current-budgets`）。
+ *
+ * 与 Go 那三个窗口是**两种口径**：这里是**绝对值**（美元上限与已花），
+ * 因此用过/上限算百分比，并在 `note` 里写清覆盖范围（全部模型 / 指定模型、
+ * 个人 / 全员共享）——只报一个百分比会让用户以为它和 Go 的额度是一回事。
+ *
+ * 字段名逐个来自 `packages/core/src/usage-limits.ts` 的 `ConsoleBudget`。
+ * @param {object} payload - 响应体（一个数组）。
+ * @returns {{windows:object[],unparsed:number}} 归一结果。
+ */
+export function parseOpencodeBudgets(payload) {
+  const list = Array.isArray(payload) ? payload : []
+  const windows = []
+  let unparsed = 0
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') {
+      unparsed += 1
+      continue
+    }
+    const total = numberOrUndefined(item.limitDollars)
+    const used = numberOrUndefined(item.spentDollars)
+    if (total === undefined && used === undefined) {
+      unparsed += 1
+      continue
+    }
+    const scope = item.scope === 'combined' ? '全员共享' : '每人各自'
+    const coverage = item.coverage === 'all' ? '全部模型' : '指定模型'
+    windows.push(buildWindow({
+      window: 'budget',
+      // 规则 id 由官方给，直接拿来区分多个预算；给不出就退回「预算」。
+      label: stringOrUndefined(item.ruleID) === undefined
+        ? WINDOW_LABELS.budget
+        : `${WINDOW_LABELS.budget} · ${stringOrUndefined(item.ruleID)}`,
+      used,
+      total,
+      resetAt: normalizeEpoch(item.resetsAt),
+      note: `${coverage} · ${scope}（Console 预算，单位美元）`,
+      source: 'opencode',
+    }))
+  }
+  return { windows, unparsed }
+}
+
+/**
+ * 解析 Cursor 的当前计费周期用量（`GetCurrentPeriodUsage`）。
+ *
+ * **只解析两份社区实现都点到的字段**（见 {@link CURSOR_USAGE_URL} 的核验说明）：
+ *   - `planUsage.totalPercentUsed`：本计费周期**已用百分比**（最权威的那一个）；
+ *   - `planUsage.limit` / `planUsage.remaining`：仅在官方没给百分比时用于反算；
+ *   - `billingCycleEnd`：**毫秒**时间戳（字符串或数字）；
+ *   - `spendLimitUsage.individualUsed` / `individualLimit`：按需付费的**自身上限**
+ *     （额度用尽后的第二道闸），有就给一条绝对值窗口。
+ *
+ * 刻意**不取** `autoPercentUsed` / `apiPercentUsed`：那是 Cursor 自己的两种模式细分，
+ * 与本插件「还剩多少」的口径不同，摆进来会变成第三个互相矛盾的百分比。
+ * @param {object} payload - 响应体。
+ * @returns {{windows:object[],unparsed:number,plan:string}} 归一结果。
+ */
+export function parseCursorUsage(payload) {
+  const planUsage = payload?.planUsage ?? {}
+  const windows = []
+  let unparsed = 0
+  const resetAt = normalizeEpoch(payload?.billingCycleEnd)
+
+  const totalPercent = numberOrUndefined(planUsage.totalPercentUsed)
+  const limit = numberOrUndefined(planUsage.limit)
+  const remaining = numberOrUndefined(planUsage.remaining)
+  let usedPercent = totalPercent
+  let note
+  if (usedPercent === undefined) {
+    // 没有百分比时只在**两者都在**的情况下反算；只有一半时留空（显示 —）。
+    if (limit !== undefined && remaining !== undefined && limit > 0) {
+      usedPercent = ((limit - remaining) / limit) * 100
+      note = '百分比按「上限 − 剩余」反算（官方没直接给）'
+    } else {
+      unparsed += 1
+    }
+  }
+  if (usedPercent !== undefined) {
+    windows.push(buildWindow({
+      window: 'monthly',
+      label: '本计费周期',
+      usedPercent,
+      resetAt,
+      note,
+      source: 'cursor',
+    }))
+  }
+
+  const spend = payload?.spendLimitUsage
+  if (spend !== null && spend !== undefined && typeof spend === 'object') {
+    const used = numberOrUndefined(spend.individualUsed)
+    const cap = numberOrUndefined(spend.individualLimit)
+    // 只在**上限 > 0** 时画：上限为 0 表示「没开按需付费」，那不是「已用满」。
+    if (cap !== undefined && cap > 0) {
+      windows.push(buildWindow({
+        window: 'budget',
+        label: '按需付费上限',
+        used,
+        total: cap,
+        resetAt,
+        note: '额度用尽后的按需上限（单位：美分，照官方口径显示）',
+        source: 'cursor',
+      }))
+    }
+  }
+
+  return { windows, unparsed, plan: '' }
+}
+
 /** 转成有限数字，否则 undefined（`null` 与空串不能变成 0）。 */
 function numberOrUndefined(value) {
   if (value === null || value === undefined) return undefined
@@ -900,7 +1605,9 @@ function buildWindow(input) {
     : (used !== undefined && total !== undefined ? total - used : undefined)
   return {
     window: input.window,
-    label: WINDOW_LABELS[input.window] ?? input.window,
+    // 标签可以显式给（Codex 的窗口按真实长度算出来、Opencode 的预算按规则区分），
+    // 缺省才退回窗口种类名。
+    label: stringOrUndefined(input.label) ?? WINDOW_LABELS[input.window] ?? input.window,
     used: used === undefined ? undefined : round2(used),
     total: total === undefined ? undefined : round2(total),
     remaining: remaining === undefined ? undefined : round2(remaining),
@@ -1034,6 +1741,9 @@ export class PlansService {
       this.#readZhipu(),
       this.#readCommandCode(),
       this.#readVolcengine(),
+      this.#readCodex(),
+      this.#readCursor(),
+      this.#readOpencode(),
     ])
       .then((providers) => {
         const payload = {
@@ -1152,7 +1862,7 @@ export class PlansService {
    * @returns {Promise<object>} 清单负载（**永不含凭据值**）。
    */
   async credentialInventory() {
-    const inventory = planVendorInventory()
+    const inventory = planVendorInventory(this.env)
     const cliPath = this.commandCodeAuthFile ?? commandCodeAuthPath(this.env)
     const providers = []
     for (const vendor of inventory) {
@@ -1175,10 +1885,18 @@ export class PlansService {
             + '不会删除它；要彻底移除请自己编辑该文件。',
         }
       }
+      // 全部家的**自动发现文件**都列出来（只读、不删）：这是「为什么我没配凭据
+      // 也能看到额度」的答案，也是「配了/没配」判断的另一半。
+      const files = vendor.files.map((item) => ({
+        path: item.path,
+        present: existsSync(item.path),
+        note: item.note,
+      }))
       providers.push({
         id: vendor.id,
         name: vendor.name,
         refs,
+        files,
         ...(cliFile === undefined ? {} : { cliFile }),
       })
     }
@@ -1266,6 +1984,10 @@ export class PlansService {
       name: '智谱 GLM Coding Plan',
       docURL: ZHIPU_KEY_URL,
       endpoint: ZHIPU_QUOTA_PATH,
+      // 智谱的 quota 接口没有公开文档、也没有可读的开源实现：核验级别是社区。
+      shape: 'percent',
+      verification: 'community',
+      evidence: ZHIPU_KEY_URL,
       // 官方只有 5 小时与每周两个额度，没有月度——界面上要说明这点，
       // 否则用户会以为月度那一栏是坏的。
       supportedWindows: ['fiveHour', 'weekly'],
@@ -1278,6 +2000,8 @@ export class PlansService {
           '平台普通的 API Key **不通用**：标准模型调用能过，但额度查询会报 Authentication Failed。',
         ],
         refs: [{ name: 'ZHIPU_CODING_API_KEY', example: '...', note: '编程套餐专属 Key' }],
+        shape: 'percent',
+        evidence: ZHIPU_KEY_URL,
       }),
     }
     const key = await this.resolveKey(ZHIPU_KEY_ENVS)
@@ -1336,6 +2060,10 @@ export class PlansService {
       docURL: COMMAND_CODE_KEY_URL,
       endpoint: COMMAND_CODE_CREDITS_PATH,
       supportedWindows: ['fiveHour', 'weekly', 'monthly'],
+      // 三个接口拼出三个窗口：5h/周给绝对值，月度只有剩余额（百分比靠另两个接口补）。
+      shape: 'absolute',
+      verification: 'community',
+      evidence: COMMAND_CODE_KEY_URL,
       note: '',
       setup: setupOf({
         keyURL: COMMAND_CODE_KEY_URL,
@@ -1345,6 +2073,9 @@ export class PlansService {
           '已经装过 Command Code CLI 并登录过的话**不用手动配**：插件会自动读本机的凭据文件。',
         ],
         refs: [{ name: 'COMMAND_CODE_API_KEY', example: '...', note: '装过 CLI 时可留空' }],
+        files: credentialFilesOf('commandcode', this.env),
+        shape: 'absolute',
+        evidence: COMMAND_CODE_KEY_URL,
       }),
     }
     const authFile = this.commandCodeAuthFile ?? commandCodeAuthPath(this.env)
@@ -1410,6 +2141,10 @@ export class PlansService {
       docURL: VOLC_KEY_URL,
       endpoint: VOLC_QUOTA_PATH,
       supportedWindows: ['fiveHour', 'weekly', 'monthly'],
+      // Agent Plan 给绝对值，Coding Plan 只给百分比——两种形状并存，故标 mixed。
+      shape: 'mixed',
+      verification: 'community',
+      evidence: VOLC_KEY_URL,
       // 界面上必须说清楚这里要的是 AK/SK 而不是推理 Key——这是唯一容易配错的地方
       note: '用量接口在控制面，需火山账号的 AccessKey ID / Secret（与推理用的 ark- Key 是两套凭据）。',
       // 「去哪拿、配到哪」——见 setupOf 的注释：DSH 设置里没有能填这两个名字的输入框，
@@ -1426,6 +2161,8 @@ export class PlansService {
           { name: 'VOLC_ACCESS_KEY_ID', example: 'AKLT...', note: 'AccessKey ID' },
           { name: 'VOLC_SECRET_ACCESS_KEY', example: '...', note: 'Secret Access Key（两把都要配齐）' },
         ],
+        shape: 'mixed',
+        evidence: VOLC_KEY_URL,
       }),
     }
     const accessKeyId = await this.resolveKey(VOLC_AK_ENVS)
@@ -1501,6 +2238,365 @@ export class PlansService {
       keyRef: accessKeyId.ref,
       keySource: accessKeyId.source,
       keyHint: `AK ${maskSecret(accessKeyId.value)}`,
+      windows: [],
+    }
+  }
+
+  /**
+   * Codex（ChatGPT 套餐）额度。
+   *
+   * 端点的核验与形状见 {@link CODEX_USAGE_URL}。这里是**只读另一个 App 的登录态**：
+   * token 优先取凭据（`CODEX_ACCESS_TOKEN`），取不到才读 `$CODEX_HOME/auth.json`
+   * 的 `tokens.access_token`——绝不写回、绝不 refresh（refresh 要写那个文件，越权）。
+   *
+   * `chatgpt-account-id` 也是必需的（`codex-rs/model-provider/src/runtime_auth.rs`
+   * 的 `validate_runtime_selectors`：ChatGPT 身份的请求必须带它）。拿不到就不发请求，
+   * 直接说清缺什么——瞎发只会得到 401，用户会以为 token 不对。
+   * @returns {Promise<object>} 该家的结果。
+   */
+  async #readCodex() {
+    const authFile = codexAuthPath(this.env)
+    const base = {
+      id: 'codex',
+      name: VENDOR_NAMES.codex,
+      docURL: CODEX_KEY_URL,
+      endpoint: CODEX_USAGE_PATH,
+      // Codex 的窗口不是「5 小时 + 每周」两种固定档：上游按 limit_window_seconds
+      // 给，实测出现过 1 小时与 5 小时两种主窗口。这里只声明**认得的**两种，
+      // 其余长度会以自身长度做标签显示（见 codexWindowOf）。
+      supportedWindows: ['fiveHour', 'weekly'],
+      shape: 'percent',
+      verification: 'first-party',
+      evidence: CODEX_EVIDENCE_URL,
+      note: '官方只给「已用百分比」与重置时刻，没有绝对值。未文档化接口。',
+      authFile,
+      setup: setupOf({
+        keyURL: CODEX_KEY_URL,
+        keyURLName: 'Codex 登录与用量说明',
+        acquire: [
+          '装过 Codex CLI 并 `codex login` 登录过的话**不用手动配**：插件会自动读本机的 auth.json。',
+          '手动配置要的是**登录态 access token**（auth.json 里的 tokens.access_token），不是 sk- 开头的平台 API Key——后者打这个端点只会 401。',
+          '同时需要 workspace / 账号 id（auth.json 的 tokens.account_id），它要放进 chatgpt-account-id 请求头。',
+        ],
+        refs: [
+          { name: 'CODEX_ACCESS_TOKEN', example: '(登录态 JWT)', note: 'ChatGPT 登录态 access token' },
+          { name: 'CODEX_ACCOUNT_ID', example: '…', note: '仅当 auth.json 里读不到 account_id 时才需要' },
+        ],
+        files: credentialFilesOf('codex', this.env),
+        shape: 'percent',
+        evidence: CODEX_EVIDENCE_URL,
+      }),
+    }
+
+    const token = await this.resolveKey(CODEX_TOKEN_ENVS)
+    const fromFile = token === undefined ? readCodexAuth(authFile) : undefined
+    const accessToken = token?.value ?? fromFile?.accessToken
+    if (accessToken === undefined) {
+      return {
+        ...base,
+        ok: false,
+        reason: 'no-key',
+        keyRef: CODEX_TOKEN_ENV,
+        keyRefs: CODEX_TOKEN_ENVS,
+        hint: '需要 Codex CLI 的登录态（本机 auth.json 或 CODEX_ACCESS_TOKEN）。'
+          + '注意那不是 sk- 平台 Key。',
+        windows: [],
+      }
+    }
+    const configuredAccount = await this.resolveKey(CODEX_ACCOUNT_ENVS)
+    const accountId = configuredAccount?.value ?? fromFile?.accountId
+    if (accountId === undefined) {
+      return {
+        ...base,
+        ok: false,
+        reason: 'no-key',
+        keyRef: CODEX_ACCOUNT_ENVS[0],
+        keyRefs: CODEX_ACCOUNT_ENVS,
+        keySource: token?.source ?? 'cli-file',
+        keyHint: maskSecret(accessToken),
+        hint: '拿到了 access token，但缺 workspace / 账号 id（auth.json 的 tokens.account_id 或 CODEX_ACCOUNT_ID）；'
+          + '这个请求头不带会被上游拒掉。',
+        windows: [],
+      }
+    }
+
+    const response = await this.#requestJson(CODEX_USAGE_URL, {
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${accessToken}`,
+        'chatgpt-account-id': accountId,
+        // 与 Codex CLI 自己发的 UA 对齐（上游会看 UA 的客户端族）。
+        'user-agent': 'codex-cli',
+      },
+    })
+    const keyFields = {
+      keyRef: token?.ref ?? '(auth.json)',
+      keySource: token?.source ?? 'cli-file',
+      keyHint: maskSecret(accessToken),
+    }
+    if (response.error !== undefined) {
+      const rejected = response.status === 401 || response.status === 403
+      return {
+        ...base,
+        ...keyFields,
+        ok: false,
+        reason: rejected ? 'rejected' : 'request-failed',
+        error: response.error,
+        ...(rejected
+          ? { hint: 'Codex 的登录态过期或被拒：在终端里重新 `codex login`（或更新 CODEX_ACCESS_TOKEN）。' }
+          : {}),
+        windows: [],
+      }
+    }
+    const parsed = parseCodexUsage(response.body)
+    return {
+      ...base,
+      ...keyFields,
+      ok: true,
+      plan: parsed.plan,
+      windows: parsed.windows,
+      ...(parsed.unparsed > 0 ? { warning: `有 ${parsed.unparsed} 条额度记录无法识别（接口可能已变更）` } : {}),
+    }
+  }
+
+  /**
+   * Cursor 的套餐额度（**社区核验**，见 {@link CURSOR_USAGE_URL}）。
+   *
+   * 发的是 Connect RPC：`POST` 一个空对象 `{}`，`connect-protocol-version: 1`。
+   * 401/403 表示登录态过期——Cursor 的 access token 是短时 JWT，只能由用户重新登录，
+   * 本插件**不做 refresh**（那要写另一个 App 的凭据存储）。
+   * @returns {Promise<object>} 该家的结果。
+   */
+  async #readCursor() {
+    const paths = cursorAuthPaths(this.env)
+    const base = {
+      id: 'cursor',
+      name: VENDOR_NAMES.cursor,
+      docURL: CURSOR_KEY_URL,
+      endpoint: CURSOR_USAGE_PATH,
+      supportedWindows: ['monthly'],
+      shape: 'percent',
+      // 关键：Cursor 的 CLI/客户端不开源、官方也没有文档化这个接口，
+      // 因此核验级别只能是 community，界面必须把这件事说出来。
+      verification: 'community',
+      evidence: CURSOR_EVIDENCE_URL,
+      note: '官方只给「本计费周期已用百分比」；接口未文档化且未核验到一方来源（社区逆向），随时可能失效。',
+      authFiles: paths,
+      setup: setupOf({
+        keyURL: CURSOR_KEY_URL,
+        keyURLName: 'Cursor 控制台（用量与套餐）',
+        acquire: [
+          '装过 Cursor CLI 并登录过的话**不用手动配**：插件会读本机的 auth.json。',
+          '手动配置要的是登录态 access token（JWT），不是 Cursor 控制台里的 API Key。',
+          '这个接口是社区逆向出来的，官方没有公开文档；读不到或报 401 时先去 Cursor 里重新登录。',
+        ],
+        refs: [{ name: 'CURSOR_ACCESS_TOKEN', example: '(登录态 JWT)', note: 'Cursor 登录态 access token' }],
+        files: credentialFilesOf('cursor', this.env),
+        shape: 'percent',
+        evidence: CURSOR_EVIDENCE_URL,
+      }),
+    }
+
+    const token = await this.resolveKey(CURSOR_TOKEN_ENVS)
+    let accessToken = token?.value
+    let tokenSource = token?.source
+    if (accessToken === undefined) {
+      for (const path of paths) {
+        const fromFile = readCursorAuth(path)
+        if (fromFile !== undefined) {
+          accessToken = fromFile
+          tokenSource = 'cli-file'
+          break
+        }
+      }
+    }
+    if (accessToken === undefined) {
+      return {
+        ...base,
+        ok: false,
+        reason: 'no-key',
+        keyRef: CURSOR_TOKEN_ENV,
+        keyRefs: CURSOR_TOKEN_ENVS,
+        hint: '需要 Cursor 的登录态 access token（本机 auth.json 或 CURSOR_ACCESS_TOKEN）。'
+          + '桌面端只把登录态放在 SQLite 里，插件不读它。',
+        windows: [],
+      }
+    }
+
+    const response = await this.#requestJson(CURSOR_USAGE_URL, {
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        authorization: `Bearer ${accessToken}`,
+        'connect-protocol-version': '1',
+      },
+      body: '{}',
+    }, 'POST')
+    const keyFields = {
+      keyRef: token?.ref ?? '(auth.json)',
+      keySource: tokenSource ?? 'cli-file',
+      keyHint: maskSecret(accessToken),
+    }
+    if (response.error !== undefined) {
+      const rejected = response.status === 401 || response.status === 403
+      return {
+        ...base,
+        ...keyFields,
+        ok: false,
+        reason: rejected ? 'rejected' : 'request-failed',
+        error: response.error,
+        ...(rejected
+          ? { hint: 'Cursor 的登录态过期了：在 Cursor 里重新登录（cursor-agent login）后重试。' }
+          : {}),
+        windows: [],
+      }
+    }
+    const parsed = parseCursorUsage(response.body)
+    return {
+      ...base,
+      ...keyFields,
+      ok: true,
+      plan: parsed.plan,
+      windows: parsed.windows,
+      ...(parsed.unparsed > 0 ? { warning: `${parsed.unparsed} 个字段读不懂（接口可能已变更）` } : {}),
+    }
+  }
+
+  /**
+   * Opencode 的额度：Go 套餐（百分比 ×3）＋ Console 预算（美元绝对值）。
+   *
+   * 端点的核验与形状见 {@link OPENCODE_GO_USAGE_URL} 与 {@link OPENCODE_BUDGETS_URL}。
+   * 两个接口**都要 workspace id**（分别是 `x-opencode-org-id` 与 `x-org-id`），
+   * 没有它只能回报「缺 workspace id」。
+   *
+   * 两个接口各自 fail-soft：Go 返回 403 = 没订 Go（正常，不是错误）；
+   * Console 预算返回 403 = 服务账号 Key（正常，返回空数组）。任一成功即可显示。
+   * @returns {Promise<object>} 该家的结果。
+   */
+  async #readOpencode() {
+    const authFile = opencodeAuthPath(this.env)
+    const base = {
+      id: 'opencode',
+      name: VENDOR_NAMES.opencode,
+      docURL: OPENCODE_KEY_URL,
+      endpoint: OPENCODE_GO_USAGE_PATH,
+      supportedWindows: ['fiveHour', 'weekly', 'monthly'],
+      shape: 'mixed',
+      verification: 'first-party',
+      evidence: OPENCODE_EVIDENCE_URL,
+      note: 'Go 套餐只有百分比；Console 预算是美元绝对值。两个接口都要 workspace id。未文档化接口（experimental）。',
+      authFile,
+      setup: setupOf({
+        keyURL: OPENCODE_KEY_URL,
+        keyURLName: 'OpenCode Console',
+        acquire: [
+          '在 OpenCode Console 里登录并（按需）订阅 Go；Key 在 Console 里创建。',
+          '还需要 workspace id：它在 Console 的地址里（https://opencode.ai/console/<workspace-id>/…）。',
+          '历史版本的 Opencode 会把登录态放在数据目录的 auth.json 里，插件会自动读（只读）。',
+        ],
+        refs: [
+          { name: 'OPENCODE_API_KEY', example: 'ocgw_…', note: 'Console 的 API Key（或 OAuth access token）' },
+          { name: 'OPENCODE_WORKSPACE_ID', example: 'wrk_…', note: 'Console 地址里的 workspace id' },
+        ],
+        files: credentialFilesOf('opencode', this.env),
+        shape: 'mixed',
+        evidence: OPENCODE_EVIDENCE_URL,
+      }),
+    }
+
+    const key = await this.resolveKey(OPENCODE_KEY_ENVS)
+    const fromFile = key === undefined ? readOpencodeAuth(authFile) : undefined
+    const apiKey = key?.value ?? fromFile?.apiKey
+    if (apiKey === undefined) {
+      return {
+        ...base,
+        ok: false,
+        reason: 'no-key',
+        keyRef: OPENCODE_KEY_ENV,
+        keyRefs: OPENCODE_KEY_ENVS,
+        hint: '需要 OpenCode Console 的 Key（或本机 auth.json 里的登录态），并且还要 workspace id。',
+        windows: [],
+      }
+    }
+    const workspaceHit = await this.resolveKey(OPENCODE_WORKSPACE_ENVS)
+    const workspaceId = workspaceHit?.value ?? fromFile?.workspaceId
+    if (workspaceId === undefined) {
+      return {
+        ...base,
+        ok: false,
+        reason: 'no-key',
+        keyRef: OPENCODE_WORKSPACE_ENV,
+        keyRefs: OPENCODE_WORKSPACE_ENVS,
+        keySource: key?.source ?? 'cli-file',
+        keyHint: maskSecret(apiKey),
+        hint: '拿到了 Key，但缺 workspace id（Console 地址里那一段，或 OPENCODE_WORKSPACE_ID）；'
+          + '两个接口都要求它，缺了会被上游拒。',
+        windows: [],
+      }
+    }
+
+    const headers = {
+      accept: 'application/json',
+      authorization: `Bearer ${apiKey}`,
+    }
+    // 两个接口并行：互不依赖，串行只会让卡片多等一个来回。
+    const [goResult, budgetResult] = await Promise.all([
+      this.#requestJson(OPENCODE_GO_USAGE_URL, {
+        headers: { ...headers, 'x-opencode-org-id': workspaceId },
+      }),
+      this.#requestJson(OPENCODE_BUDGETS_URL, {
+        headers: { ...headers, 'x-org-id': workspaceId },
+      }),
+    ])
+
+    // Go 的 403 = 该 workspace 没订 Go（上游代码里就是这么判的），不是失败。
+    const goNotSubscribed = goResult.status === 403
+    const go = goResult.error === undefined ? parseOpencodeGo(goResult.body) : { windows: [], unparsed: 0 }
+    // 预算的 403 = 服务账号 Key（没有预算），同样不是失败。
+    const budgets = budgetResult.error === undefined && Array.isArray(budgetResult.body)
+      ? parseOpencodeBudgets(budgetResult.body)
+      : { windows: [], unparsed: 0 }
+    const windows = [...go.windows, ...budgets.windows]
+    const keyFields = {
+      keyRef: key?.ref ?? '(auth.json)',
+      keySource: key?.source ?? 'cli-file',
+      keyHint: maskSecret(apiKey),
+    }
+
+    if (windows.length > 0) {
+      const parts = []
+      if (goNotSubscribed) parts.push('该 workspace 没有订阅 Go 套餐')
+      if (budgetResult.status === 403) parts.push('Console 预算对服务账号 Key 不开放')
+      return {
+        ...base,
+        ...keyFields,
+        ok: true,
+        plan: '',
+        windows,
+        ...(parts.length === 0 ? {} : { note: `${base.note}（${parts.join('；')}）` }),
+        ...(go.unparsed + budgets.unparsed > 0
+          ? { warning: `有 ${go.unparsed + budgets.unparsed} 条额度记录无法识别（接口可能已变更）` }
+          : {}),
+      }
+    }
+
+    // 一个窗口都没拿到：把两个接口的原因如实说出来，别只剩一个空卡片。
+    // 401 表示 Key 本身被拒；403 在这两个接口上各自有正常含义（没订 Go / 服务账号），
+    // 所以只有 401 归到「凭据被拒绝」。
+    const authFailed = goResult.status === 401 || budgetResult.status === 401
+    const reasons = []
+    if (goResult.error !== undefined && !goNotSubscribed) reasons.push(`Go：${goResult.error}`)
+    if (budgetResult.error !== undefined && budgetResult.status !== 403) reasons.push(`预算：${budgetResult.error}`)
+    if (goNotSubscribed) reasons.push('没有订阅 Go 套餐')
+    return {
+      ...base,
+      ...keyFields,
+      ok: false,
+      reason: authFailed ? 'rejected' : 'request-failed',
+      error: reasons.join('；') || '接口没有返回任何额度窗口',
+      hint: authFailed
+        ? 'Opencode 的 Key 被拒：在 Console 里确认 Key 仍然有效，并确认 workspace id 属于同一个 workspace。'
+        : '已通过鉴权但没有可显示的额度：确认该 workspace 订了 Go 或设置了 Console 预算。',
       windows: [],
     }
   }
@@ -1582,16 +2678,20 @@ export class PlansService {
    *
    * 只回报状态码与一句人话，**不回传响应体**——上游响应里可能回显凭据，
    * 而这条路径会直达浏览器。
+   *
+   * `method` 单独开一个参数而不是塞进 `init`：Cursor 那个 Connect RPC 是 `POST {}`，
+   * 而其余四家都是 GET。把方法显式传进来，读代码时一眼能看出「这一家发了什么」。
    * @param {string} url - 固定官方端点。
-   * @param {object} init - fetch 参数。
+   * @param {object} init - fetch 参数（headers / body）。
+   * @param {'GET'|'POST'} [method] - HTTP 方法，缺省 GET。
    * @returns {Promise<{body?:object,error?:string,status?:number}>} 结果。
    */
-  async #requestJson(url, init) {
+  async #requestJson(url, init, method = 'GET') {
     if (typeof this.fetchImpl !== 'function') return { error: '当前运行环境没有可用的 fetch' }
     const controller = new AbortController()
     const timer = setTimeout(() => { controller.abort() }, this.timeoutMs)
     try {
-      const response = await this.fetchImpl(url, { ...init, method: 'GET', signal: controller.signal })
+      const response = await this.fetchImpl(url, { ...init, method, signal: controller.signal })
       const text = await response.text()
       if (text.length > MAX_RESPONSE_BYTES) return { error: '响应过大', status: response.status }
       if (!response.ok) return { error: `HTTP ${response.status}`, status: response.status }

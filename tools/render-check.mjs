@@ -286,6 +286,31 @@ must(typeof clientExports.apply === 'function', '浏览器半边没有导出 app
 
 const registrations = []
 /**
+ * 偏好的 localStorage 桩。
+ *
+ * v3 起「模型分布 / 费用明细」有一个**消耗阈值**偏好（默认 1000 万 token）：
+ * 低于阈值的模型只在「另有 N 款未列出」里出现。本闸门下面那些 fixture 是按
+ * v2 造的（`mystery-model-x` 这类模型只有几百万 token，就是要它出现在表里，
+ * 好验证「估算价」「来源未知」的标注）。阈值一开，它们就被有意筛掉了。
+ *
+ * **改 fixture 而不是改实现**：默认阈值是有意的产品行为（用户要的就是
+ * 「先只看真正在用的那几款」），闸门不该为了迁就旧数据把它改小。因此这里把
+ * 阈值偏好种成 0，让下面所有与「逐模型明细」有关的断言仍然覆盖同一批数据。
+ */
+const prefStore = new Map([['px.pref.modelMinTokens', '0']])
+Object.defineProperty(globalThis, 'localStorage', {
+  configurable: true,
+  value: {
+    getItem: (key) => (prefStore.has(key) ? prefStore.get(key) : null),
+    setItem: (key, value) => { prefStore.set(key, String(value)) },
+    removeItem: (key) => { prefStore.delete(key) },
+    clear: () => { prefStore.clear() },
+    key: (index) => [...prefStore.keys()][index] ?? null,
+    get length() { return prefStore.size },
+  },
+})
+
+/**
  * 官方在 `conversation.composer.dock` 里占用的最大 `order`。
  *
  * 该槽位是横向 flex 行，`order` 决定左右。官方两代契约：
@@ -384,7 +409,15 @@ const ctx = {
       return {
         inject: (key, callback) => { callback(); void key },
         register: (options, component) => {
-          registrations.push({ slot: options.name, key: options.key ?? options.id, order: options.order, component })
+          registrations.push({
+            slot: options.name,
+            key: options.key ?? options.id,
+            order: options.order,
+            // 标签也要记下来：会话标签页在界面上就靠它显示（`费用`），
+            // 只断言 id 会漏掉「id 对了但用户看到的名字错了」。
+            label: options.label,
+            component,
+          })
           return () => {}
         },
       }
@@ -404,13 +437,36 @@ const layoutSelects = []
 const sessionOpens = []
 clientExports.apply(ctx)
 
-must(registrations.length === 3, `apply 应注册 3 个槽位（主区 + 侧栏 + 费用条），实际 ${registrations.length}`)
-// 两张：tokens（--px-* 变量，深浅两套）+ dashboard（全部 .px-* 实样式）。
-// 早先是三张，第三张 skin 是**全局元素选择器**（body 网格底纹、全局 button/input
-// 圆角与 transition、滚动条、选中色），等于替用户重绘整个产品界面。皮肤已按需求
-// 移除，因此这里从 3 改成 2——改回 3 就说明有人把那张表加回来了。
-must(mountedStyles.length === 2,
-  `应挂 2 张样式表（tokens + dashboard），实际 ${mountedStyles.length}`)
+must(registrations.length === 4,
+  `apply 应注册 4 个槽位（主区 + 侧栏 + 输入框费用条 + 会话标签页），实际 ${registrations.length}`)
+// 会话标签页：注册到 `conversation.view`（与 chat / trajectory / stats 并列）。
+// **位置必须 > stats 的 40**：那是产品自己的最后一个视图，排在它后面，
+// 用户才不会以为插件「插进了产品页面中间」。
+{
+  const view = registrations.find((item) => item.slot === 'conversation.view')
+  must(view !== undefined, '应把「费用」注册到 conversation.view 槽位')
+  must(view.key === 'pixel-cost', `会话标签页的 id 应为 pixel-cost，实际 ${view.key}`)
+  must(Number(view.order) > 40, `会话标签页应排在 stats(40) 之后，实际 order=${view.order}`)
+  must(view.label === '费用', `会话标签页的标签应为「费用」，实际 ${view.label}`)
+}
+// 样式表按功能一张一张分开（都是插件自己的 .px-* 局部样式，不碰产品配色）：
+//   tokens    --px-* 变量（:root 浅色 + body[data-ds-dark-theme] 深色）
+//   dashboard 看板整页 + 侧栏指示灯
+//   pricing   定价与「单价设置」界面
+//   accounts  「账户与套餐」标签页
+//   session   会话标签页（conversation.view 里的「费用」）
+// 早先还有第三张 skin 是**全局元素选择器**（body 网格底纹、全局 button/input 圆角、
+// 滚动条、选中色），等于替用户重绘整个产品界面，已按需求移除——**它不许回来**。
+// 因此这里钉住的是**清单本身**：多一张要显式改这张表，而不是悄悄多挂一张。
+const EXPECTED_STYLE_SHEETS = ['tokens', 'dashboard', 'pricing', 'accounts', 'session']
+must(mountedStyles.length === EXPECTED_STYLE_SHEETS.length,
+  `应挂 ${EXPECTED_STYLE_SHEETS.length} 张样式表（${EXPECTED_STYLE_SHEETS.join(' + ')}），实际 ${mountedStyles.length}`)
+for (const name of EXPECTED_STYLE_SHEETS) {
+  must(mountedStyles.includes(`dsh-pixel-dashboard/${name}`),
+    `应挂样式表 ${name}，实际挂了 ${mountedStyles.join(', ')}`)
+}
+must(!mountedStyles.some((name) => name.endsWith('/skin')),
+  '不得再挂 skin 样式表——它会改掉产品自己的界面配色')
 // 反向断言：这两样**都不许再出现**。皮肤功能（可选主题 + 令牌覆盖）已按需求移除——
 // 它会改掉**产品自己**的配色与背景，而用户打开的不止这个看板，还有整个窗口、
 // 侧栏与会话区。上面那个 themeStub 刻意留着当诱捕器：任何一次“把主题注册回来”
@@ -447,8 +503,8 @@ must(
 
 const notifyModule = await import(pathToFileURL(join(root, 'lib', 'client', 'notify.js')).href)
 const {
-  NOTIFY_DEFAULTS: CLIENT_DEFAULTS, PERMISSION_TEXT: PERM_TEXT, SeenTracker, AlertLatch,
-  balanceAlerts, composeInteraction, composeNotice, permissionOf, quotaAlerts,
+  NOTIFY_DEFAULTS: CLIENT_DEFAULTS, PERMISSION_TEXT: PERM_TEXT, SeenTracker,
+  composeInteraction, composeNotice, permissionOf,
 } = notifyModule
 
 // 1) 会话结束通知的文案：标题必须带工作目录名（同时跑几个会话时「已完成」本身无信息）
@@ -661,32 +717,34 @@ must(storeFactory() === storeFactory(), 'notifyStore() 必须返回同一个单�
   runtime.dispose()
 }
 
-// 3) 余额阈值：没有阈值的币种跳过；金额缺失绝不能被当成 0
-const balancePayload = { enabled: true, balances: [
-  { currency: 'CNY', total: 5 }, { currency: 'USD', total: 100 }, { currency: 'SGD' },
-] }
-must(balanceAlerts(balancePayload, { CNY: 10 }).length === 1, '只应对设了阈值且低于阈值的币种告警')
-must(balanceAlerts(balancePayload, { USD: 10 }).length === 0, '高于阈值不应告警')
-const missingAmount = balanceAlerts({ enabled: true, balances: [{ currency: 'CNY' }] }, { CNY: 10 })
-must(missingAmount.length === 0, '金额缺失时不得当成 0 而误报——「不知道」与「余额为 0」是两件事')
-must(balanceAlerts({ enabled: false, balances: [{ currency: 'CNY', total: 1 }] }, { CNY: 10 }).length === 0, '余额查询关闭时不应告警')
-
-// 4) 套餐阈值：只看 ok 的厂商，且拿不到百分比就跳过
-const quotaPayload = { enabled: true, providers: [
-  { id: 'a', name: '甲', ok: true, windows: [{ window: 'weekly', label: '每周', usedPercent: 95 }, { window: 'fiveHour', label: '5 小时' }] },
-  { id: 'b', name: '乙', ok: false, windows: [{ window: 'weekly', label: '每周', usedPercent: 99 }] },
-] }
-const quotaHit = quotaAlerts(quotaPayload, 90)
-must(quotaHit.length === 1 && quotaHit[0].provider === '甲', '只应对取数成功且达到阈值的窗口告警')
-must(quotaAlerts(quotaPayload, 0).length === 0, '阈值为 0 表示关闭套餐预警')
-must(quotaAlerts(quotaPayload, 96).length === 0, '未达阈值的窗口不应告警')
-
-// 5) 预警锁存器：持续告警期间只报一次，恢复后才重新武装
-const latch = new AlertLatch()
-must(latch.update(['balance:CNY']).length === 1, '首次进入告警应触发')
-must(latch.update(['balance:CNY']).length === 0, '告警持续期间不应重复触发——否则一分钟一条通知')
-must(latch.update([]).length === 0, '恢复不是告警')
-must(latch.update(['balance:CNY']).length === 1, '恢复后再次跌破应重新触发')
+// 3) 余额 / 套餐额度预警**已整体取消**（v3）：用户明确说不需要实时通知，
+//    改在会话标签页与输入框费用条里直接看余额。原先这一节测的
+//    balanceAlerts / quotaAlerts / AlertLatch 随之删除——**不要把它们加回来**：
+//    那等于把一套每分钟轮询、边沿触发、还要维护阈值的通知链重新塞回插件，
+//    而它正是用户觉得吵的那件事。
+//    这里保留一条反向断言，防止有人「顺手」恢复：
+{
+  // 配置里不许再有预警字段（这是数据契约：留着会让人以为功能还在）。
+  const warnKeys = Object.keys(CLIENT_DEFAULTS).filter((key) => /warning|balance|quota/i.test(key))
+  must(warnKeys.length === 0, `通知配置里不得再有预警相关字段，实际 ${warnKeys.join(', ')}`)
+  // 就算过渡期还留着同名函数，它也**必须只返回空**：真正的行为契约是
+  // 「这条通知链不再产生任何提醒」，而不是「名字被删掉」。
+  if (typeof notifyModule.balanceAlerts === 'function') {
+    must(
+      notifyModule.balanceAlerts({ enabled: true, balances: [{ currency: 'CNY', total: 1 }] }, { CNY: 10 }).length === 0,
+      '余额预警已取消：即使仍存同名函数，也不得再产出告警',
+    )
+  }
+  if (typeof notifyModule.quotaAlerts === 'function') {
+    must(
+      notifyModule.quotaAlerts({
+        enabled: true,
+        providers: [{ id: 'a', name: '甲', ok: true, windows: [{ window: 'weekly', label: '每周', usedPercent: 99 }] }],
+      }, 10).length === 0,
+      '套餐额度预警已取消：即使仍存同名函数，也不得再产出告警',
+    )
+  }
+}
 
 // 6) 去重游标：首轮绝不能重播历史；相同 id 不重复提醒
 const tracker = new SeenTracker()
@@ -705,7 +763,8 @@ must(permissionOf({}) === 'unsupported', '没有 Notification API 应归为 unsu
 must(permissionOf({ Notification: Object.assign(() => {}, { permission: 'granted' }) }) === 'granted', '已授权应被识别')
 must(permissionOf({ Notification: Object.assign(() => {}, { permission: 'weird' }) }) === 'default', '未知权限值应归为 default')
 must(typeof PERM_TEXT.unsupported === 'string' && PERM_TEXT.unsupported !== '', 'unsupported 必须有可读文案')
-must(CLIENT_DEFAULTS.warnQuotaPercent === 90, '客户端默认阈值应与宿主一致（90 与看板红色档相同）')
+// 预警阈值（warnQuotaPercent / warnBalance）已随该能力整体取消——
+// 上面第 3 节那段反向断言已经钉住「配置里不许再有预警字段」，这里不再重复。
 // 「子智能体进展」默认开着：关掉的默认值会让团队成员收工这件事静默消失，而用户
 // 打开面板看到的是「这个开关是关的」，只会以为插件默认不想提醒他。
 must(CLIENT_DEFAULTS.notifySubagent === true, '「子智能体进展」的客户端兜底默认值应为开')
@@ -1244,8 +1303,6 @@ must(
   const tags = [
     ['会话结束', notifyModule.composeNotice(sampleNotice).tag],
     ['待办', notifyModule.composeInteraction({ kind: 'question', key: 'question:1', sessionId: 'session-x' }).tag],
-    ['额度', notifyModule.composeQuotaAlert([{ provider: 'AVeryLongProviderName', window: 'monthly-window', label: '月度', percent: 91 }]).tag],
-    ['余额', notifyModule.composeBalanceAlert([{ currency: 'CNY', total: 3, threshold: 5 }], (v) => String(v)).tag],
   ]
   for (const [label, tag] of tags) {
     must(typeof tag === 'string' && tag.length > 0, `${label}通知必须有 tag`)
@@ -1265,7 +1322,11 @@ must(
 //     denied 下浏览器也不会再弹框）。
 {
   const panelModule = await import(pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
-  const { View: ViewForPerm } = panelModule
+  // v3 起通知面板不再内联在看板正文里，而是搬进「设置」弹层（默认关闭）。
+  // 静态渲染整页看不到它，因此这里**直接渲染面板**——断言的意图（四种权限
+  // 措辞不同、按钮只在对应状态下出现）与改动前一模一样，只是换了挂载点。
+  const { NotifyPanel } = panelModule
+  must(typeof NotifyPanel === 'function', '通知面板应可单独渲染（设置弹层要用它）')
   const store = storeFactory()
   const cases = [
     ['unsupported', '本环境不支持系统通知'],
@@ -1276,16 +1337,7 @@ must(
   const seenLabels = new Set()
   for (const [permission, expected] of cases) {
     store.setPermission(permission)
-    const html = renderToStaticMarkup(React.createElement(ViewForPerm, {
-      data: buildPayload(),
-      now: Date.now(),
-      refreshing: false,
-      onRefresh: () => {},
-      balance: { enabled: true, available: true, balances: [{ currency: 'CNY', total: 1 }] },
-      onToggleBalance: () => {},
-      plans: { enabled: true, providers: [] },
-      onTogglePlans: () => {},
-    }))
+    const html = renderToStaticMarkup(React.createElement(NotifyPanel))
     must(html.includes(expected), `权限 ${permission} 应显示「${expected}」`)
     seenLabels.add(expected)
     // 「申请授权」只在 default 下出现：其余状态点了没有意义
@@ -2243,6 +2295,39 @@ must(periodTitle(undefined) === '用量看板', '拿不到相位时应退回原�
 // ── 字体回归闸门：绝不能再引入点阵/像素字体或全局强制换字体 ────────
 const { STYLES } = await import(pathToFileURL(join(root, 'lib', 'client', 'theme.js')).href)
 const css = STYLES.map(([, text]) => text).join('\n')
+
+/**
+ * 样式表**括号必须配平**，且规则不许互相嵌套。
+ *
+ * 这条闸门是一次真实事故换来的：清理死样式时少删/多留了一个 `{`，
+ * 于是 `.px-balance-state.px-ok {` 把后面**整张表**的规则都吞进了自己体内。
+ * CSS 解析器遇到未闭合块会**丢弃其后全部规则**，而症状分散得完全看不出同源：
+ *   - 费用条的文字挤在一起（.px-pill 的 gap/padding 没了）
+ *   - 柱状图悬停时柱子变成**纯黑**（.px-hover-band 的 fill 没了，SVG 默认黑）
+ *   - 表格里的浮层位置全乱
+ * 一条断言都不断言得出来，因为它们"每一项"都只是样式没生效。
+ * 因此这里直接查结构：括号数相等，且除 @media/@supports/@keyframes 外不出现嵌套。
+ */
+{
+  for (const [name, text] of STYLES) {
+    const open = (text.match(/\{/g) ?? []).length
+    const close = (text.match(/\}/g) ?? []).length
+    must(open === close,
+      `样式表 ${name} 的括号不配平（{ × ${open} / } × ${close}）：`
+      + '未闭合块会让 CSS 解析器丢弃它之后的**全部**规则，表现为「界面看着像没样式」')
+    // 嵌套检查：正常写法里深度只会因 @media/@supports/@keyframes 递增到 2。
+    // 若出现更深的嵌套，说明有规则忘了闭合（正是上面那类事故的形态）。
+    let depth = 0
+    let maxDepth = 0
+    for (const ch of text) {
+      if (ch === '{') { depth += 1; maxDepth = Math.max(maxDepth, depth) }
+      else if (ch === '}') depth -= 1
+    }
+    must(maxDepth <= 2,
+      `样式表 ${name} 出现了 ${maxDepth} 层嵌套：普通规则不该嵌规则，`
+      + '几乎一定是某条规则忘了写闭合括号，把后面的规则吞进去了')
+  }
+}
 for (const banned of ['Fusion Pixel', 'Zpix', 'pixel-font']) {
   must(!css.includes(banned), `样式里出现了点阵字体「${banned}」，读起来累，必须用正常字体`)
 }
@@ -2471,7 +2556,8 @@ must(
   const ALLOWED_SECONDARY_BACKGROUND = [
     '.px-seg',            // 分段控件的凹槽（滑块是白的，浮在里面）
     '.px-barrow-track',   // 进度条轨道（填充部分才是内容）
-    '.px-table th',       // 表头（唯一一处「整行凹进」的表格语义）
+    // 表头原来在这里（.px-table th），v3.1 起改用中性层次层 --px-layer-2：
+    // 表头与卡片底色的区分现在靠「更淡的一层面 + 加粗描边」，不再是米色块。
     // 峰时/闲时占比条与耗时构成条：都是轨道（填充段才是内容），
     // 与 .px-barrow-track 同一语义——不是「一整块色块」。
     '.px-peak-bar',
@@ -2883,23 +2969,52 @@ const costTable = glmHtml.slice(
   must(costTable.includes('WorkBuddy 中国区'),
     '费用明细表仍应逐提供商列出用量——那里合并会丢掉归属')
 
-  // ── 自定义单价编辑器必须在页面上（用户要求的「加价不方便」入口）──────
+  // ── 补价入口：每行一个按钮 + 设置弹层里的整页编辑器 ──────────────
   //
-  // 早先想给一个价目表里没有的模型补价，唯一的路是改源码再重新构建。这里钉住
-  // 编辑器真的渲染出来、且六个价框齐全——少了它，用户没有任何可用的入口，
-  // 而症状是「那个模型永远显示估算价」，没有任何报错。
-  must(glmHtml.includes('px-price-editor'), '费用明细则下应有自定义单价编辑器')
-  must(glmHtml.includes('自定义单价'), '编辑器标题应写明它能做什么')
-  for (const label of ['模型键', '显示名', '厂商', '缓存命中', '未命中', '输出']) {
-    must(glmHtml.includes(label), `编辑器缺少「${label}」这一项`)
-  }
-  // 空闲 / 高峰必须成对出现：填错档位是这里最可能的错法
-  // 注意匹配要带边界：类名 `px-rate-pairs`（复数容器）也含 `px-rate-pair` 这段子串，
-  // 用不带边界的正则会把容器一起数进来，于是数目永远多一个。
-  must((glmHtml.match(/class="px-rate-pair"/g) ?? []).length === 3,
-    '三个价档（缓存命中 / 未命中 / 输出）各应有一对空闲 / 高峰输入框')
-  // 价目文件的绝对路径要显示出来：用户想一次补一批时，得知道去改哪个文件
-  must(glmHtml.includes('px-price-form'), '编辑器要有实际可用的表单')
+  // v3 起单价的编辑 UI 拆成两块（见 src/client/priceSettings.js）：
+  //   - `PriceSettingsButton`：费用明细每行一枚「补价」，点开是浮层；
+  //   - `PriceSettingsView`：设置弹层「单价」页签里的整页（厂商分组/搜索/汇率/倍率）。
+  // 闸门因此分两处验：看板里只验「入口在」（按钮在行里、不新增单元格），
+  // 编辑器本体直接渲染组件验——它在默认关闭的弹层里，整页静态渲染看不到。
+  must((costTable.match(/px-fix-link/g) ?? []).length >= 4,
+    '费用明细的每一行都应有「改单价」入口，否则用户没有任何给单个模型改价的地方')
+  // 它必须是**次要**样式（链接式），不能是有边框的按钮：每行一枚，带边框会让
+  // 整列看起来全是按钮（用户报过「这个按钮很丑」）。
+  must(!/px-price-fix-btn/.test(costTable), '「改单价」不应再用 px-btn 那套按钮样式')
+  must(!costTable.includes('px-price-editor'),
+    '浮层编辑器不该在默认渲染里出现（它由按钮点开，关闭态整个表单项都不渲染）')
+
+  const settingsModule = await import(pathToFileURL(join(root, 'lib', 'client', 'priceSettings.js')).href)
+  const { PriceSettingsView } = settingsModule
+  must(typeof PriceSettingsView === 'function', 'priceSettings.js 没有导出 PriceSettingsView')
+  const priceHtml = renderToStaticMarkup(React.createElement(PriceSettingsView, {
+    // `customRates` 必须给：它缺失时这一页会去宿主取一次（effect 在静态渲染里
+    // 不执行），于是永远停在「正在读取…」，而下面「逐模型成行」的断言会落空。
+    data: {
+      ...payload,
+      customRates: { enabled: true, path: '/tmp/custom-rates.json', count: 0, rates: {}, markup: {}, usdToCny: 7.3 },
+    },
+    onSaved: () => {},
+  }))
+  // 结构：这一页要能回答四个问题——汇率是多少、每家倍率多少、有哪些模型、怎么批量导入。
+  must(priceHtml.includes('px-price-settings'), '单价设置页应有自己的根容器')
+  must(priceHtml.includes('px-price-fx'), '应能改美元折算汇率')
+  must(priceHtml.includes('汇率'), '汇率那一行要写明它是什么')
+  must(priceHtml.includes('px-price-markup'), '应能改提供商加价倍率（第三方中转按 token 收的价与官方不同）')
+  must(/倍率/.test(priceHtml), '倍率那一节要写明它是什么')
+  must(priceHtml.includes('px-price-filters'), '模型很多时要能搜索')
+  must(priceHtml.includes('px-price-groups'), '应按厂商分组列出模型')
+  must(priceHtml.includes('px-price-io'), '应能整份导入 / 导出（一次补一批，或放进版本管理）')
+  must(priceHtml.includes('px-price-group'), '分组标题应真的渲染出来')
+  // 每个模型一行，且带「编辑」入口——否则用户看得到价、改不了价。
+  // 数目与 fixture 里的价目条数一致（这份 fixture 是 3 个模型），**不能**写成一个
+  // 与数据无关的常数：那样要么永远为真（没验到东西），要么换个 fixture 就红。
+  const fixtureRates = Object.keys(payload.pricing?.rates ?? {}).length
+  must((priceHtml.match(/px-price-item-head/g) ?? []).length >= fixtureRates,
+    `价目表应逐模型成一行的清单（fixture 里 ${fixtureRates} 个模型），而不是一团文字`)
+  // 编辑表单**默认不展开**：一进设置页就把几十个输入框全铺开，等于把清单淹掉。
+  // 「点开后六个价框齐全」属于交互，由 dom-check（jsdom 真点）验，见那边的用例。
+  must(!priceHtml.includes('px-price-form'), '编辑表单默认不该展开（点某一行的编辑才出现）')
   // 六个数字框挤在三列里，**必须**允许收缩，否则会横向溢出到面板外面。
   // 两个 min-width 缺一不可：flex 项默认 min-width:auto，会被输入框的固有宽度
   // （浏览器默认约 20 字符 ≈ 179px）撑住不收缩——实测溢出 66px。
@@ -3158,12 +3273,18 @@ const plansHtml = renderToStaticMarkup(React.createElement(View, {
   plansBusy: false,
   onTogglePlans: () => {},
 }))
-for (const token of ['账户与套餐', '智谱', 'Command Code', '火山方舟', '5 小时', '每周', '每月', 'px-quota-fill', 'px-plan-name']) {
-  must(plansHtml.includes(token), `套餐面板缺少「${token}」`)
+// 套餐余额：**每家一张卡**（左环形条 + 右窗口进度条），不再是标签页。
+const PLAN_TOKENS = [
+  '套餐余额', '智谱', 'Command Code', '火山方舟',
+  '5 小时', '每周', '每月',
+  'px-acc-cards', 'px-acc-card', 'px-acc-ring-svg', 'px-acc-win-fill',
+]
+for (const token of PLAN_TOKENS) {
+  must(plansHtml.includes(token), `套餐余额板块缺少「${token}」`)
 }
-must(plansHtml.includes('61.8%'), '套餐面板应显示已用百分比')
-must(plansHtml.includes('没有公开文档化的额度接口'), '套餐面板必须写明接口是未文档化的（诚实披露）')
-must(plansHtml.includes('不会离开本机'), '套餐面板必须写明凭据不出本机')
+must(plansHtml.includes('61.8%'), '套餐余额应显示已用百分比')
+must(plansHtml.includes('接口未公开文档化'), '套餐余额必须披露接口未公开文档化（诚实标注）')
+must(plansHtml.includes('凭据只在本机使用'), '凭据「不出本机」的说明必须仍在（可放 title 里）')
 must(plansHtml.includes('编程套餐专属'), '套餐面板应提示智谱需要套餐专属 Key')
 // 火山的凭据是**另一套**（控制面 AK/SK，不是推理 Key）。界面必须说清楚，
 // 否则用户会把自己唯一的 ark- Key 填进去、然后一直失败。
@@ -3207,11 +3328,13 @@ must(unknownPercentHtml.includes('GOAT'), '卡片上应显示套餐类型（GOAT
 must(unknownPercentHtml.includes('65.55'), '只有余额时仍要显示余额')
 must(unknownPercentHtml.includes('名义额度'), 'note 里的原因要显示出来，用户才知道为什么没有百分比')
 must(unknownPercentHtml.includes('官方只报了余额'), '连 note 都没有时，界面也要说清是官方没给已用额度')
-const unknownQuota = extractElement(unknownPercentHtml, '<div class="px-quota">')
-must(unknownQuota !== undefined, '应有额度窗口那一块')
+// 未知百分比的窗口：**不画条、不写 0%**，而是写 — 与原因。
+// 结构变了（旧的 .px-quota 包裹层已随标签页一起删掉），所以锚点改成一个窗口行。
+const unknownQuota = extractElement(unknownPercentHtml, '<div class="px-acc-win">')
+must(unknownQuota !== undefined, '应有额度窗口那一块（.px-acc-win）')
 must(unknownQuota.includes('—'), '百分比未知时应显示 —')
 must(!unknownQuota.includes('0.0%'), `未知百分比绝不能渲染成 0.0%：${unknownQuota}`)
-must(!unknownQuota.includes('px-quota-fill'), '未知百分比不该画进度条（空条看起来像「一点没用」）')
+must(!unknownQuota.includes('px-acc-win-fill'), '未知百分比不该画进度条（空条看起来像「一点没用」）')
 
 // 没配 Key 的两家：必须给出可读原因，且看板其余部分照常
 const plansEmptyHtml = renderToStaticMarkup(React.createElement(View, {
@@ -3338,27 +3461,30 @@ const html = renderToStaticMarkup(React.createElement(View, {
   balance: { enabled: true, available: true, official: true, keySource: 'file', baseURL: 'https://api.deepseek.com', fetchedAt: payload.generatedAt, balances: [{ currency: 'CNY', total: 12.34, granted: 0, toppedUp: 12.34 }] },
   balanceBusy: false,
   onToggleBalance: () => {},
+  // 套餐数据必须一起给：套餐余额现在是「每家一张卡」，没有 providers 就只剩
+  // 一句「读取中」，下面 required 里那些钩子自然一个都不会出现。
+  plans: planPayload,
+  plansBusy: false,
+  onTogglePlans: () => {},
 }))
 
 const required = [
   '用量看板', '累计 Token', '时段与计费', '高峰时段',
-  // 「法定节假日」这一行是这次口径改动的可见证据：节假日全天按空闲计费，
-  // 且写明日历收录到哪一年。少了它，用户在国庆那种日子只会看到「高峰时段」
-  // 一行写着周一至周五，却不知道这几天本该便宜。
-  '法定节假日', '全天按空闲计费 · 已收录 2026',
-  '周一至周五', '活跃日历', '趋势', '模型分布', '费用明细', '会话清单',
-  '官方定价页', '账户与套餐',
+  // 「法定节假日」那一行已按用户要求删除（它把卡片撑高，口径已经写在
+  // 「周一至周五（不含法定节假日）」这一行里）。**反向断言**见下面的结构闸门。
+  '周一至周五', '活跃日历', '趋势', '模型分布', '费用明细',
+  // 会话清单整表已移入会话标签页；看板只留「消费 Top 会话」。
+  '消费 Top 会话',
+  '官方定价页', '套餐余额',
   'px-seg-thumb', 'px-period-clock', 'px-stat-value', 'px-panel-dot',
   'px-barrow-fill', 'px-heat-4', 'px-slice', 'px-tone-fill-blue', 'px-rate-swatch',
-  'px-balance-amount', 'px-balance-privacy', 'px-account-grid',
-  // 通知与预警面板：开关、授权状态、阈值输入都在这里，缺一块就是功能没落地
-  '通知与预警', 'px-notify-permission', 'px-notify-flags', 'px-notify-threshold',
-  'px-notify-inputs', 'px-notify-recent', '余额预警阈值', '套餐额度预警',
-  '任务完成', '子智能体进展', '失败 / 中断', '等待授权 / 回答', '当前会话不打扰',
-  // 阈值并排：两项同处一个容器（原来各占一整行，白吃两倍高度）
-  'px-notify-thresholds',
+  // 套餐余额是**卡片网格**（每家一张，左环形条 + 右窗口条）。
+  // 现金余额已独立成一块小横条（见 .px-cash 的断言）。
+  'px-acc-cards', 'px-acc-card',
+  // 官方余额是顶行的**用户卡**（第五格）：头像 + 余额 + 官网入口。
+  'px-user', 'px-user-avatar', 'px-whale',
   // 两张趋势卡片同行 + 维度切换器
-  'px-trend-row', 'px-trend-dim', '消费估计趋势', '每日消费估计',
+  'px-trend-row', 'px-trend-dim', '消费趋势',
 ]
 for (const token of required) must(html.includes(token), `渲染结果缺少「${token}」`)
 must(html.length > 20_000, `整页 HTML 只有 ${html.length} 字节，可能有区块没渲染`)
@@ -3429,25 +3555,34 @@ must(
 )
 
 // ── 两张趋势卡片必须同行，且各带该带的切换器 / 合计 ────────────────
-// 用户要求：Token 趋势与消费估计趋势**同行展示，不分两行**。
+// 用户要求：Token 趋势与消费趋势**同行展示，不分两行**。
 // 两条曲线共用同一段时间轴，分两行就会让人来回滚动去对齐同一个日期。
 // 与 .px-pair 同一套配对扫描断言：必须真的同处一个容器，而不是「都在页面上」。
 {
   const trendHtml = extractElement(html, '<div class="px-trend-row">')
   must(trendHtml !== undefined, '缺少 .px-trend-row 容器：两张趋势卡片没有同行')
   must(trendHtml.includes('Token 趋势'), '.px-trend-row 里没有 Token 趋势卡片')
-  must(trendHtml.includes('消费估计趋势'), '.px-trend-row 里没有消费估计趋势卡片')
+  must(trendHtml.includes('消费趋势'), '.px-trend-row 里没有消费趋势卡片')
   must(
-    trendHtml.indexOf('Token 趋势') < trendHtml.indexOf('消费估计趋势'),
-    '.px-trend-row 里 Token 趋势应在左、消费估计趋势在右',
+    trendHtml.indexOf('Token 趋势') < trendHtml.indexOf('消费趋势'),
+    '.px-trend-row 里 Token 趋势应在左、消费趋势在右',
   )
   // 容器内恰好两张卡片：多塞一张进来会破坏「两张各占一半」的等分
   const panels = (trendHtml.match(/class="px-panel /g) ?? []).length
   must(panels === 2, `.px-trend-row 里应恰好两张面板，实际 ${panels}`)
-  // 维度切换器在 Token 那张卡片里（不是全局），且三个维度都列出
-  for (const dim of ['构成', '模型', '提供商']) {
+  // 维度切换器在 Token 那张卡片里（不是全局），且三个维度都列出。
+  // 顺序是**用户指定的**：模型（最常看）→ 供应商 → 构成（构成是补充信息，排最后）。
+  // 「构成」与费用明细里的「提供商」列名不是一回事，别顺手改名。
+  const dims = ['模型', '供应商', '构成']
+  for (const dim of dims) {
     must(trendHtml.includes(`>${dim}</button>`), `趋势卡片缺少「${dim}」维度按钮`)
   }
+  // 顺序判定：三个按钮的下标必须递增，否则「默认显示模型」这条就落空了
+  const dimIndex = dims.map((dim) => trendHtml.indexOf(`>${dim}</button>`))
+  must(
+    dimIndex[0] < dimIndex[1] && dimIndex[1] < dimIndex[2],
+    `维度按钮顺序应为 ${dims.join(' / ')}，实际顺序不对`,
+  )
   must(trendHtml.includes('px-trend-dim'), '维度切换器应有自己的类名（卡片内次级控件）')
 }
 
@@ -3568,52 +3703,63 @@ must(
 // 这三条锁的是「区域大小确实被压下来了」这个**结构事实**，而不只是类名存在：
 // 类名写对了但元素没套在里面，看板上就是一点没变。
 {
-  // 1) 两项预警阈值必须同处一个 .px-notify-thresholds 容器
-  const thresholds = extractElement(html, '<div class="px-notify-thresholds">')
-  must(thresholds !== undefined, '两项预警阈值没有并排：缺少 .px-notify-thresholds 容器')
-  must(thresholds.includes('余额预警阈值'), '.px-notify-thresholds 里没有余额阈值')
-  must(thresholds.includes('套餐额度预警'), '.px-notify-thresholds 里没有套餐阈值')
-  must((html.match(/class="px-notify-thresholds"/g) ?? []).length === 1,
-    '.px-notify-thresholds 容器应恰好一个')
-  // 窄屏必须塌回单列，否则余额那一项的输入框会挤成三行
-  must(
-    /@media\s*\(max-width:\s*960px\)\s*\{[\s\S]*?\.px-notify-thresholds\s*\{[^}]*grid-template-columns:\s*1fr/.test(css),
-    '窄屏媒体查询里缺少 .px-notify-thresholds { grid-template-columns: 1fr }',
-  )
+  // 0) 视觉分层（v3.1 用户反馈「配色割裂 / 表头跟背景一样」）：
+  //    - 概览卡**不得**再按 tone 上色（四张卡四种颜色是割裂的直接来源）；
+  //    - 面板头与表头必须走中性层次层，而不是七种彩色之一。
+  must(!/px-stat-(blue|purple|pink|green)/.test(html),
+    '概览卡不得再带按色调上色的 class：强调色只用于当前状态与主操作，不当装饰')
+  must(!/\.px-stat-(blue|purple|pink|green)\s*\{/.test(css),
+    '样式里不该还留着 .px-stat-<tone> 的配色规则')
+  must(/\.px-panel-head\s*\{[^}]*background:\s*var\(--px-layer-2\)/.test(css),
+    '面板头要铺中性层次层（--px-layer-2），否则「面板头」与「面板内容」分不开')
+  must(/\.px-table th\s*\{[^}]*background:\s*var\(--px-layer-2\)/.test(css),
+    '表头要铺中性层次层（--px-layer-2）')
+  // 1) 「法定节假日」那一行按用户要求删除。反向断言：不许悄悄加回来
+  //    （它把「时段与计费」卡片撑高，而口径已经写在「不含法定节假日」那句里）。
+  must(!html.includes('全天按空闲计费'), '「法定节假日」那一行已删除，不得再加回来')
 
-  // 2) 会话清单默认**收起**：标题行在、表头不在。
-  //    「默认收起」这件事只能这样断言——用 extractElement 取会话清单那张面板的
-  //    配对闭合片段，断言里面有标题、没有 <table>。用标签配对扫描而不是截到
-  //    字符串结尾：后者会让「表格被挪到面板外」这种回归悄悄通过。
-  //
-  //    会话清单是页面上**唯一**一张 .px-panel-collapsible 面板（最近通知用的是
-  //    面板内部的 .px-collapse）。因此这里直接按类名取，并顺带断言「恰好一张」
-  //    ——多出一张说明折叠被误加到了别的面板上。
-  const collapsibleOpen = '<section class="px-panel px-rise px-panel-collapsible"'
-  const collapsibleCount = (html.match(/class="px-panel px-rise px-panel-collapsible"/g) ?? []).length
-  must(collapsibleCount === 1, `应恰好一张可折叠面板（会话清单），实际 ${collapsibleCount} 张`)
-  const sessionBlock = extractElement(html, collapsibleOpen)
-  must(sessionBlock !== undefined, '会话清单应该是可折叠面板（.px-panel-collapsible）')
-  must(sessionBlock.includes('会话清单'), '可折叠面板里应有会话清单标题')
-  // 收起时**内容根本不渲染**（不是 display:none），所以 <table> 不该出现
-  must(!sessionBlock.includes('<table'),
-    '会话清单默认应收起——收起态下表格不该被渲染出来（收起的是内容，标题行仍要在）')
-  must(sessionBlock.includes('px-panel-extra'), '收起时右侧摘要仍要显示（否则连「有几个会话」都看不到了')
-  // 折叠开关必须真的是一枚按钮（可点、可聚焦），而不是一段纯文本
-  must(/<button[^>]*class="px-panel-toggle"[^>]*aria-expanded="false"/.test(sessionBlock),
-    '会话清单标题行应是一枚 aria-expanded="false" 的展开按钮')
+  // 1b) 余额 / 套餐额度预警已整体取消：整页**不得**再出现阈值 UI。
+  //    这条是反向断言——旧版这里验的是「两项阈值并排、窄屏塌一列」，
+  //    而那套 UI 与它背后的通知链都已按需求删除。
+  for (const gone of ['px-notify-thresholds', '余额预警阈值', '套餐额度预警']) {
+    must(!html.includes(gone), `整页不得再出现「${gone}」——余额与额度预警已取消（改在会话标签页里看）`)
+  }
+  must(!css.includes('.px-notify-threshold'), '样式里不该还留着 .px-notify-threshold* 死样式')
 
-  // 3) 最近通知默认收起：标题行在、明细不在
-  must(html.includes('px-collapse-head'), '最近通知缺少折叠标题行 .px-collapse-head')
-  const recentStart = html.indexOf('最近通知')
-  must(recentStart !== -1, '页面上找不到「最近通知」')
-  // 折叠区的类名是 px-collapse[ open]；标题行与正文之间没有别的 px-collapse 前缀，
-  // 因此取到下一次出现为止即可界定这一块的边界。
-  const recentBoundary = html.indexOf('px-collapse', recentStart + '最近通知'.length)
-  const recentBlock = html.slice(recentStart, recentBoundary === -1 ? recentStart + 400 : recentBoundary + 200)
-  must(!recentBlock.includes('px-collapse-body'),
-    '最近通知默认应收起——收起态下明细不该被渲染（见 Collapse 的说明）')
-  must(html.includes('px-collapse-summary'), '收起时右侧仍要显示条数摘要（收起的是内容，不是数量）')
+  // 2) 会话清单整表已移入会话标签页；看板只留「消费 Top 会话」精简表。
+  //    这里钉住三件事：表在（且只有这一张）、最多 8 行、标题是可聚焦按钮。
+  //    少一条，用户就再也点不进那条会话——而那是这张表唯一的用途。
+  const topCount = (html.match(/px-top-session-row/g) ?? []).length
+  must(html.includes('px-top-session-table'), '看板应有「消费 Top 会话」表')
+  must(topCount > 0 && topCount <= 8, `Top 会话应取前 8 名，实际 ${topCount} 行`)
+  // 标题必须是可聚焦按钮：整行可点只是鼠标方便，键盘用户要靠它。
+  // 注意它现在**不跳转会话**，只原地展开该会话的费用明细（用户要求改的），
+  // 所以这里断言的是按钮 + `aria-expanded`，而不是「点了会 openSession」。
+  must(/<button[^>]*class="[^"]*px-session-open[^>]*aria-expanded="false"/.test(html),
+    'Top 会话的标题必须是带 aria-expanded 的按钮（键盘可达，且能表达展开状态）')
+  // 完整清单不再铺在看板上：它的分身（SessionTable / SessionDetail）只在会话标签页里用。
+  must((html.match(/px-session-row/g) ?? []).length === 0,
+    '完整会话清单不该再渲染在看板上（它已移入会话标签页，看板只留 Top 8）')
+
+  // 3) 设置弹层默认关闭：整页静态渲染里**一个**弹层节点都不该有。
+  //    关闭态不渲染是有意的（留空壳会挡住下面的点击，而界面上看不出来）。
+  must(!html.includes('px-modal-mask'), '设置弹层默认应收起——关闭态连节点都不该渲染')
+
+  // 4) 最近通知仍要默认收起，而它现在住在设置弹层里 → 直接渲染 NotifyPanel 验。
+  {
+    const { NotifyPanel: PanelForRecent } = await import(
+      pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
+    const panelHtml = renderToStaticMarkup(React.createElement(PanelForRecent))
+    must(panelHtml.includes('px-collapse-head'), '最近通知缺少折叠标题行 .px-collapse-head')
+    must(panelHtml.includes('最近通知'), '通知面板里找不到「最近通知」')
+    must(!panelHtml.includes('px-collapse-body'),
+      '最近通知默认应收起——收起态下明细不该被渲染（见 Collapse 的说明）')
+    must(panelHtml.includes('px-collapse-summary'), '收起时右侧仍要显示条数摘要（收起的是内容，不是数量）')
+    // 通知页里也不该有阈值输入（能力已取消）
+    for (const gone of ['余额预警阈值', '套餐额度预警', 'px-notify-threshold']) {
+      must(!panelHtml.includes(gone), `通知面板不得再出现「${gone}」`)
+    }
+  }
 }
 
 // 折线曲线必须真的生成 path（单调插值的产物）
@@ -3625,11 +3771,31 @@ must(!html.includes('preserveAspectRatio'), '图表不得使用 preserveAspectRa
 // 分档单价必须出现在费用明细里，证明用的是高峰/空闲双档口径
 must(html.includes('0.02') && html.includes('0.04'), '费用明细应展示空闲/高峰双档单价')
 
-// 账户余额：金额、明细、以及隐私说明都必须在页面上
-must(html.includes('¥12.34'), '余额面板应显示金额')
-must(html.includes('充值') && html.includes('赠送'), '余额面板应给出充值/赠送明细')
-must(html.includes('Key 不会离开本机'), '余额面板必须写明 Key 不出本机（隐私承诺要可见）')
-must(html.includes('user/balance'), '余额面板应标出数据来源端点')
+// ── DeepSeek 官方余额：一块小横条（不再是大面板）────────────────────
+// 用户要求：小型显示即可、搭配一个直达官网用量页的入口；余额只用「当前登录的
+// 官方账号」取，没登录就不查。因此这里钉三件事：
+//   1) 有金额时把金额与币种显示出来；
+//   2) 永远给得出官网入口（不依赖凭据，余额不足时那是下一步动作）；
+//   3) 明确未登录时**说明并点出缺哪个引用名**，绝不显示 ¥0。
+must(html.includes('¥12.34'), '余额横条应显示金额')
+must(html.includes('DeepSeek 官方'), '余额横条应标明数据来自官方')
+must(html.includes('platform.deepseek.com/usage'), '余额横条必须给出官网用量入口')
+{
+  // 未登录：不发请求、不显示金额，并说清缺什么。
+  const notSignedIn = renderToStaticMarkup(React.createElement(View, {
+    data: payload,
+    now: payload.generatedAt,
+    refreshing: false,
+    onRefresh: () => {},
+    balance: { enabled: true, signedIn: false, reason: 'no-key', apiKeyEnv: 'DEEPSEEK_API_KEY', balances: [], available: null, fetchedAt: null },
+    onToggleBalance: () => {},
+    plans: { enabled: true, providers: [] },
+    onTogglePlans: () => {},
+  }))
+  must(notSignedIn.includes('未登录官方账号'), '没登录官方账号时应明说「未登录」，而不是显示 0 余额')
+  must(notSignedIn.includes('DEEPSEEK_API_KEY'), '未登录时应点出缺哪个凭据引用名')
+  must(!notSignedIn.includes('¥0.00'), '未登录时不得显示 ¥0（「不知道」与「余额为 0」是两件事）')
+}
 
 // ── 会话清单：第一列必须是**预览标题**（与侧栏同源），不是会话 id ──
 // 会话清单默认收起，整页静态渲染到不了它，因此这里直接渲染那张表。

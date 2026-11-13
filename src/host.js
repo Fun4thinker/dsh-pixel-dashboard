@@ -21,13 +21,16 @@ import {
   MODEL_RATES,
   PEAK_WEEKDAYS,
   PEAK_WINDOWS,
+  activeMarkup,
   activeRates,
   costOf,
   dateKey,
+  markupOf,
   normalizeModel,
   periodState,
   pricingOf,
   ratesOf,
+  usdToCny,
   zonedFacts,
   zonedParts,
 } from './pricing.js'
@@ -151,6 +154,10 @@ const CAPABILITIES = [
   // `teams[]` 分组。缺这一项时客户端退回「每会话一行」的老行为——那时费用条
   // 显示的是单会话金额，而不是团队合计。
   'agentTeam',
+  // 单会话明细路由（`GET /dsh-pixel/session?id=`）：会话标签页据此画逐模型明细
+  // 与逐日花费。旧宿主没有这条路由（404），那时会话标签页显示「当前宿主不支持
+  // 这条明细」而不是空白——降级必须可见。
+  'sessionDetail',
 ]
 
 /** 快照缓存有效期：会话日志只在使用后变化，短缓存即可挡住频繁刷新。 */
@@ -435,12 +442,20 @@ function costByModel(byModel) {
   let idlePart = 0
   for (const [model, usage] of Object.entries(byModel)) {
     // 键可能是 `deepseek-flash@commandcode` 这类「模型 × 提供商」复合键：
-    // 提供商不参与定价（同一模型各家的价目表条目本就不同，未知的按兜底价），
-    // 因此取键里的模型部分去查价。
+    // 模型部分用来查价目表，提供商部分用来取**加价倍率**。
+    //
+    // 倍率（markup）是给第三方中转用的：它按 token 收你的钱，但单价与你那张
+    // 官方价目表不同。没有倍率时这里恒为 1，行为与改动前完全一致。
+    //
+    // **宿主自己算的金额也必须乘倍率**（不是只在客户端乘）：`overview.cost`、
+    // 每会话的 cost、每行的 cost 都出自这个函数，只要有一处漏乘，
+    // 看板卡片（客户端重算）就会与宿主给的合计差出一个倍率——用户看到的是
+    // 「明细加起来不等于合计」，而数字本身还都像对的。
+    const factor = markupOf(providerOfModelKey(model))
     const rates = ratesOf(rateKeyOfModelKey(model))
-    peakPart += costOf(usage.peak, rates, 'peak')
-    idlePart += costOf(usage.idle, rates, 'idle')
-    standard += costOf(usage.peak, rates, 'peak') + costOf(usage.idle, rates, 'idle')
+    peakPart += costOf(usage.peak, rates, 'peak') * factor
+    idlePart += costOf(usage.idle, rates, 'idle') * factor
+    standard += (costOf(usage.peak, rates, 'peak') + costOf(usage.idle, rates, 'idle')) * factor
     // 同一份用量若全落在空闲时段能省多少。
     //
     // **每个字段都用 `?? 0` 兜底**（踩过）：旧缓存/旧宿主的分档桶里没有
@@ -456,7 +471,7 @@ function costByModel(byModel) {
       },
       rates,
       'idle',
-    )
+    ) * factor
   }
   return { standard, ifAllIdle, saved: standard - ifAllIdle, peak: peakPart, idle: idlePart }
 }
@@ -779,6 +794,14 @@ export class UsageCatalog {
     this.snapshot = undefined
     this.snapshotAt = 0
     this.inflight = undefined
+    /**
+     * 单会话明细（会话 id → 取整后的逐模型 / 逐日用量）。
+     *
+     * 与 `snapshot` 同一生命周期：`build()` 生成快照时一起写这里。
+     * 它**不参与 `/data` 序列化**，只被 `/dsh-pixel/session` 按 id 取一条。
+     * @type {Map<string, {byModel:object, byDay:object}>|undefined}
+     */
+    this.sessionDetails = undefined
   }
 
   /** 让下一次请求重新扫盘。 */
@@ -849,6 +872,125 @@ export class UsageCatalog {
         this.inflight = undefined
       })
     return this.inflight
+  }
+
+  /**
+   * 单会话明细：供会话标签页（`conversation.view` 的「费用」）使用。
+   *
+   * ## 为什么不复用 `/data`
+   *
+   * `/data` 是**全量**的：160 多个会话、十几个模型、一年日历。而会话标签页
+   * 一次只显示**一条**会话，让它在每次切换标签页时拉全量数据既慢又浪费。
+   * 因此宿主单独交一条：逐模型用量 + 逐日用量 + 该会话用到的单价。
+   *
+   * ## 金额口径：合计 = 逐行金额之和
+   *
+   * 每行金额用 `sessionCost()`（与费用条、看板完全同一套分档口径）算一次并
+   * 取整到 6 位，**合计取这些已取整行值之和**。这样屏幕上「合计」与它下面
+   * 那几行之和**严格相等**——用户一定会加一遍，尾差会让整个数字显得不可信。
+   * 与输入框费用条那一枚（按原始用量算完才取整）在 10⁻⁶ 量级可能相差一点，
+   * 但界面上都按分显示，看不到差异。
+   * @param {string} id - 会话 id。
+   * @returns {Promise<object|undefined>} undefined 表示这条会话不存在。
+   */
+  async readSessionDetail(id) {
+    const data = await this.read()
+    const session = (data.sessions ?? []).find((row) => row.id === id)
+    if (session === undefined) return undefined
+    const detail = this.sessionDetails?.get(id) ?? { byModel: {}, byDay: {} }
+    // 模型显示名 / 提供商名：`data.models` 里已经算好，直接按复合键索引。
+    const metas = new Map((data.models ?? []).map((model) => [model.key, model]))
+
+    const entries = Object.entries(detail.byModel).map(([key, totals]) => {
+      const meta = metas.get(key)
+      const rollup = meta?.rollup ?? rateKeyOfModelKey(key)
+      const prices = pricingOf(rollup)
+      const rates = prices.rates
+      return {
+        key,
+        rollup,
+        provider: meta?.provider ?? '',
+        providerLabel: meta?.providerLabel ?? '',
+        // 外显名以 DSH 设置里那条为准（`data.models` 已按同一规则算好），
+        // 拿不到才退回价目表里的官方名。
+        label: meta?.label ?? rates?.label ?? rollup,
+        vendor: rates?.vendor ?? '',
+        // 价目表里没有这个模型时如实标出来：金额是估算，不是官方价。
+        priced: prices.known === true,
+        totals,
+        cost: sessionCost({ [key]: totals }),
+      }
+    })
+    entries.sort((a, b) => Number(b.cost.standard) - Number(a.cost.standard))
+
+    const days = Object.entries(detail.byDay)
+      .map(([key, dayModels]) => ({
+        key,
+        totals: roundUsage(sumUsageOf(dayModels)),
+        // 当天的金额仍按**逐模型**算：拿日合计查一次价只会命中一个模型，
+        // 其余落到兜底价（实测能差五倍）。
+        cost: sessionCost(dayModels),
+      }))
+      .sort((a, b) => a.key.localeCompare(b.key))
+
+    const round6 = (value) => Math.round(value * 1e6) / 1e6
+    const total = { standard: 0, peak: 0, idle: 0, ifAllIdle: 0, saved: 0 }
+    for (const entry of entries) {
+      for (const field of Object.keys(total)) total[field] += Number(entry.cost?.[field] ?? 0)
+    }
+    for (const field of Object.keys(total)) total[field] = round6(total[field])
+
+    // 该会话用到的模型单价：客户端不必自己按路由 id 再查一次价目表
+    // （查不到会静默回落 Flash 价，那正是「表格列错位」的老根因）。
+    const pricing = {}
+    for (const entry of entries) {
+      const prices = pricingOf(entry.rollup)
+      pricing[entry.key] = {
+        rates: prices.rates,
+        // 这一行的**加价倍率**：按它自己的提供商取，缺省 1。
+        markup: markupOf(entry.provider),
+        currency: prices.rates?.currency ?? data.pricing?.currency ?? 'CNY',
+      }
+    }
+
+    // 团队口径：只有**真的多成员**的团队才给（单人会话在界面上不该变成「团队」）。
+    const teamRow = (data.teams ?? []).find((team) => team.id === session.teamId)
+    const team = teamRow !== undefined && Number(teamRow.memberCount ?? 0) >= 2
+      ? {
+        id: teamRow.id,
+        title: teamRow.title,
+        memberCount: teamRow.memberCount,
+        cost: teamRow.cost,
+        totals: teamRow.totals,
+        members: (teamRow.members ?? []).map((member) => ({
+          id: member.id,
+          name: member.name,
+          role: member.role,
+          live: member.live === true,
+          totals: member.totals,
+          cost: member.cost,
+        })),
+      }
+      : null
+
+    return {
+      generatedAt: data.generatedAt,
+      timezone: data.timezone,
+      version: data.version,
+      capabilities: data.capabilities,
+      session,
+      entries,
+      days,
+      cost: total,
+      pricing: {
+        currency: data.pricing?.currency ?? 'CNY',
+        unit: data.pricing?.unit ?? 'per-million-tokens',
+        ...(data.pricing?.usdToCny === undefined ? {} : { usdToCny: data.pricing.usdToCny }),
+        models: pricing,
+        source: data.pricing?.source,
+      },
+      team,
+    }
   }
 
   /**
@@ -1058,6 +1200,19 @@ export class UsageCatalog {
     /** @type {Map<string, object>} */
     const bySession = new Map()
     /**
+     * 单会话的逐模型 / 逐日用量：**只给会话标签页那条路由**用，不进 `/data`。
+     *
+     * 为什么单独留一份而不是塞进 `sessions[]`：`sessions[]` 有 160 多行，
+     * 每行再带十几条模型明细会让 `/data` 体积翻好几倍，而看板一次也用不到
+     * 那些明细（它只显示每会话的合计）。反过来，会话标签页每次只看**一条**
+     * 会话，一条的明细只有几百字节。
+     *
+     * 因此这里只留「派生结果」（取整后的用量），并且**不随 `/data` 序列化**：
+     * 它由 `/dsh-pixel/session` 按会话 id 取一条。
+     * @type {Map<string, {byModel:object, byDay:object}>}
+     */
+    const sessionDetails = new Map()
+    /**
      * 日历数据：按天索引的请求 / 会话 / token。
      *
      * 早先这里还有一份「星期 × 小时」分布，供单独的小时热力图使用；那张图已按
@@ -1107,13 +1262,22 @@ export class UsageCatalog {
 
       addUsage((modelTotals[model] ??= emptyUsage()), usage, peak)
 
-      const sessionAcc = bySession.get(sessionId) ?? { totals: emptyUsage(), byModel: {}, days: new Set() }
+      const sessionAcc = bySession.get(sessionId)
+        ?? { totals: emptyUsage(), byModel: {}, days: new Set(), byDay: {} }
       addUsage(sessionAcc.totals, usage, peak)
       addUsage((sessionAcc.byModel[model] ??= emptyUsage()), usage, peak)
       bySession.set(sessionId, sessionAcc)
 
       const key = facts.key
       sessionAcc.days.add(key)
+      // 逐日 × 逐模型用量：会话标签页要画「这条会话哪天花了多少」。
+      //
+      // **必须按模型分开存**，不能只存当天的合计：金额是按模型单价折算的，
+      // 拿日合计去查一次价只能查到一个模型，其余会落到兜底价——金额会错，
+      // 而且不报错。实测把日期键当模型键去查价，第二天（GLM-5.3）的金额
+      // 从 ¥0.0244 掉到 ¥0.0032，合计相差五倍。
+      const dayModels = (sessionAcc.byDay[key] ??= {})
+      addUsage((dayModels[model] ??= emptyUsage()), usage, peak)
       const day = days.get(key) ?? { key, totals: emptyUsage(), byModel: {}, sessions: new Set() }
       addUsage(day.totals, usage, peak)
       addUsage((day.byModel[model] ??= emptyUsage()), usage, peak)
@@ -1146,9 +1310,21 @@ export class UsageCatalog {
       session.cost = sessionCost(acc.byModel)
       session.models = Object.keys(acc.byModel).sort()
       session.days = [...acc.days].sort()
+      // 明细只留取整后的派生用量：会话标签页按它画逐模型表与逐日花费。
+      // 这里只存结果、不留 `acc.byModel` 引用——留引用等于把原始累加器
+      // 钉在快照上，而 `bySession` 随后就该被回收。
+      sessionDetails.set(session.id, {
+        byModel: roundByModel(acc.byModel),
+        byDay: roundByDayModels(acc.byDay),
+      })
     }
     // 仅存在于账本（其它机器）的会话也补进清单，否则跨设备历史会凭空消失
     for (const [sessionId, acc] of bySession) {
+      // 明细同样要留：这些会话也能在会话标签页里打开（它们确实有账本里的用量）。
+      sessionDetails.set(sessionId, {
+        byModel: roundByModel(acc.byModel),
+        byDay: roundByDayModels(acc.byDay),
+      })
       sessions.push({
         id: sessionId,
         createdAt: Number(records.find((record) => record.s === sessionId)?.t ?? 0),
@@ -1339,6 +1515,10 @@ export class UsageCatalog {
       return out.sort((a, b) => Number(b.cost?.standard ?? 0) - Number(a.cost?.standard ?? 0))
     })()
 
+    // 单会话明细挂在数据对象上供 `/dsh-pixel/session` 按 id 取一条；
+    // 它**不参与 `/data` 的序列化**（下方响应体是逐字段挑出来拼的，不会带上它）。
+    this.sessionDetails = sessionDetails
+
     return {
       generatedAt: now,
       timezone,
@@ -1365,12 +1545,20 @@ export class UsageCatalog {
       pricing: {
         currency: 'CNY',
         unit: 'per-million-tokens',
+        // 美元价目折算成人民币用的汇率。价目表里 USD 的条目由 pricing.js 的
+        // 生效视图统一折算，界面也要标出「按汇率 X 折算」，否则用户看到一个
+        // 人民币金额会以为是官方人民币价。
+        usdToCny: usdToCny(),
+        // 提供商加价倍率（第三方中转按 token 收的价往往与官方不同）。
+        // 只是给界面展示「这一家乘了几倍」，金额本身在 costByModel 里已经算进去了。
+        markup: activeMarkup(),
         // 生效中的价目表 = 内置 + 用户补充（见 lib/custom-rates.js）。
         // 交**生效的那一份**，否则界面「单价表」显示的还是内置价，而金额已经按
         // 自定义价算了——同一张卡片上两个数字互相矛盾。
         rates: activeRates(),
-        // 逐模型单价，按**归一键**索引：客户端拿到的是宿主已经查好的那一份，
-        // 不必也不能自己按路由 id 再查一次（查不到会静默回落 Flash 价）。
+        // 逐模型单价，按**模型键**与**归一键**各索引一次（见 ratesOfModels）。
+        // 客户端拿到的是宿主已经查好的那一份，不必也不能自己按路由 id 再查一次
+        // （查不到会静默回落 Flash 价）。
         models: ratesOfModels(models),
         source: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing/',
       },
@@ -1454,18 +1642,47 @@ function withRouteOf(record, directory) {
 }
 
 /**
+ * 从复合键里取提供商（`模型@提供商` → `提供商`）。
+ *
+ * 与 {@link rateKeyOfModelKey} 正好互补：那个取模型部分去查价，这个取提供商
+ * 部分去查**加价倍率**。裸键（没有 `@`）表示「官方价」，返回空串，倍率按 1 算。
+ * @param {string} modelKey - 复合键或裸模型键。
+ * @returns {string} 提供商路由名；裸键时是空串。
+ */
+function providerOfModelKey(modelKey) {
+  const text = String(modelKey ?? '')
+  const at = text.indexOf('@')
+  return at < 0 ? '' : text.slice(at + 1)
+}
+
+/**
  * 把逐模型单价按**归一键**摊平成一张表，供客户端按同一口径计价。
  *
  * 客户端拿到的原生 id 可能是 `deepseek/deepseek-v4.1-flash`（路由 id），
  * 而价目表里只有 `deepseek-flash`。让客户端自己查就会静默回落到 Flash 价——
  * 那正是「GLM 那一行被当成不分时、表格列数错位」的根因。宿主这里已经知道
  * 每一行的模型是什么，直接把它用的那份价目交出去。
+ *
+ * ## 两个键的形状**不一样**（这里踩过一次）
+ *
+ * | 键 | 形状 | 含义 | 谁在用 |
+ * |---|---|---|---|
+ * | `模型@提供商` | `{ rates, markup, currency }` | 该**路由**的价目：单价 × 该提供商的倍率 | 会话标签页、费用明细逐行 |
+ * | 裸 `模型` | **裸 RATE**（`{cacheHit, cacheMiss, output, …}`） | **官方价**，倍率恒为 1 | 看板的「官方价 vs 我的价」对比 |
+ *
+ * 裸键**必须保持裸 RATE**：看板那边把它当价目直接读 `mine.cacheHit?.peak`，
+ * 若改成包装对象，三个数字会全部取到 undefined 并按 `?? 0` 显示成 **¥0**——
+ * 有数字、不报错、完全看不出异常。`tools/test.mjs` 也因此断言裸键**就是**
+ * `models[0].rates` 那个对象。
  * @param {object[]} models - `build()` 里已算好的模型条目。
- * @returns {Record<string, object>} 归一键 → 价目表条目。
+ * @returns {Record<string, object>} 键 → 价目（复合键是包装，裸键是 RATE）。
  */
 function ratesOfModels(models) {
   const out = {}
   for (const model of models) {
+    // 精确身份：带该提供商的倍率。会话标签页按 modelKey 读这个包装。
+    out[model.key] = { rates: model.rates, markup: markupOf(model.provider), currency: 'CNY' }
+    // 官方价（裸键）：保持 v2 的**裸 RATE**，看板与 test.mjs 都按它读。
     if (out[model.rollup] === undefined) out[model.rollup] = model.rates
   }
   return out
@@ -1506,6 +1723,45 @@ function roundByModel(byModel) {
   const out = {}
   for (const [model, usage] of Object.entries(byModel)) out[model] = roundUsage(usage)
   return out
+}
+
+/**
+ * 逐日 × 逐模型用量取整（日期键 → 模型 → 用量）。
+ *
+ * 与 {@link roundByModel} 同形，只是多一层日期。**必须走 `roundUsage`**：
+ * 手写一份取整会漏掉某个分档字段，而漏掉的表现是「分时金额与合计对不上」
+ * ——不报错，只是数字小一点。
+ * @param {Record<string, Record<string, object>>} byDay - 日期键 → 模型 → 用量。
+ * @returns {Record<string, Record<string, object>>} 取整后的副本。
+ */
+function roundByDayModels(byDay) {
+  const out = {}
+  for (const [day, byModel] of Object.entries(byDay ?? {})) {
+    const bucket = {}
+    for (const [model, usage] of Object.entries(byModel ?? {})) bucket[model] = roundUsage(usage)
+    out[day] = bucket
+  }
+  return out
+}
+
+/**
+ * 把「模型 → 用量」求合成一份用量（同一天多个模型摊成一行）。
+ *
+ * 合计桶与分档桶都要累加：缺一档的表现同样是「分时金额对不上」，且不抛错。
+ * @param {Record<string, object>} byModel - 模型 → 用量。
+ * @returns {object} 合计用量。
+ */
+function sumUsageOf(byModel) {
+  const acc = emptyUsage()
+  for (const usage of Object.values(byModel ?? {})) {
+    for (const field of ['cacheHit', 'cacheMiss', 'cacheWrite', 'output', 'reasoning', 'local', 'requests']) {
+      acc[field] += Number(usage?.[field] ?? 0)
+    }
+    for (const part of ['peak', 'idle']) {
+      for (const field of BUCKET_FIELDS) acc[part][field] += Number(usage?.[part]?.[field] ?? 0)
+    }
+  }
+  return acc
 }
 
 /** 求和多天用量。 */
@@ -1918,6 +2174,46 @@ export default {
           payload = await plans.read({ refresh: url.searchParams.get('refresh') === '1' })
         } catch (error) {
           sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+          return
+        }
+        sendJson(res, 200, payload, req.method === 'HEAD')
+      },
+    })
+
+    /**
+     * 单会话明细（会话标签页用）。
+     *
+     * `GET /dsh-pixel/session?id=<sessionId>`
+     *
+     * 只读、无副作用：不重扫会话日志（复用 `/data` 那份快照的 TTL 缓存），
+     * 因此频繁切换会话标签页不会把磁盘读爆。会话 id 认不出时回 404 而不是
+     * 空对象——「这条会话不存在」与「这条会话没有任何用量」是两件事，
+     * 界面上说法完全不同。
+     */
+    route({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/session`,
+      handler: async (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          req.resume?.()
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const id = url.searchParams.get('id') ?? ''
+        if (id === '') {
+          sendJson(res, 400, { error: '缺少 id 参数' })
+          return
+        }
+        let payload
+        try {
+          payload = await catalog.readSessionDetail(id)
+        } catch (error) {
+          sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+          return
+        }
+        if (payload === undefined) {
+          sendJson(res, 404, { error: '会话不存在' })
           return
         }
         sendJson(res, 200, payload, req.method === 'HEAD')

@@ -40,9 +40,22 @@ const MODULES = [
   'period.js',
   'usage.js',
   'graph.js',
+  // 样式按功能拆成独立模块，分别汇总进 theme.js 的 STYLES：
+  //   pricing  → 定价与「单价设置」界面
+  //   accounts → 「账户与套餐」标签页
+  //   session  → 会话标签页（conversation.view 里的「费用」）
+  // 拆开是为了让这三块能各自改动而不撞同一个文件；theme.js 只负责装配。
+  'styles/pricing.js',
+  'styles/accounts.js',
+  'styles/session.js',
   'theme.js',
   'Notifier.js',
   'SessionCost.js',
+  // 单价设置界面与会话标签页各自独立成文件：前者属于定价，后者属于会话视图，
+  // 与看板整页（dashboard.js）不共享任何内部状态。
+  'priceSettings.js',
+  'accountPanel.js',
+  'sessionView.js',
   'dashboard.js',
   'entry.js',
 ]

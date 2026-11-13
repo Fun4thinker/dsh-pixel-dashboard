@@ -109,6 +109,9 @@ const versionRoute = routeOf('/dsh-pixel/version')
 const periodRoute = routeOf('/dsh-pixel/period')
 const balanceRoute = routeOf('/dsh-pixel/balance')
 const plansRoute = routeOf('/dsh-pixel/plans')
+// 单会话明细（会话标签页）。它的存在本身就是一项能力：旧宿主没有这条路由，
+// 会话标签页要显示「当前宿主不支持这条明细」而不是空白。
+const sessionRoute = routeOf('/dsh-pixel/session')
 const toggleRoute = routeOf('/dsh-pixel/toggle')
 const notifyRoute = routeOf('/dsh-pixel/notify')
 // 桌面端把窗口拉到前台（宿主唤起 dsh://open）。
@@ -117,7 +120,8 @@ const ratesRoute = routeOf('/dsh-pixel/rates')
 const credsRoute = routeOf('/dsh-pixel/plan-credentials')
 // 路由条数是**有意**钉死的：新增路由必须在这里显式加一行，并想清楚它是否需要
 // 同源闸门与写权限，而不是让新增悄悄溜过去（见 lib/host.js 的注册处）。
-assert.equal(routes.length, 10, `应注册恰好十条路由，实际 ${routes.length}`)
+// 11 = version / period / balance / plans / session / notify / focus / toggle / rates / plan-credentials / data
+assert.equal(routes.length, 11, `应注册恰好十一条路由，实际 ${routes.length}`)
 
 /**
  * 最小 req/res 替身。
@@ -129,8 +133,7 @@ assert.equal(routes.length, 10, `应注册恰好十条路由，实际 ${routes.l
  * @param {object} [headers] - 额外请求头。
  * @returns {Promise<{statusCode:number,headers:object,body:string|undefined}>} 响应。
  */
-function call(route, method = 'GET', url = route.path, body, headers = {}) {
-  return new Promise((resolve, reject) => {
+function call(route, method = 'GET', url = route.path, body, headers = {}) {  return new Promise((resolve, reject) => {
     const res = {
       statusCode: 0,
       headers: {},
@@ -168,6 +171,35 @@ function call(route, method = 'GET', url = route.path, body, headers = {}) {
   })
 }
 
+/**
+ * 隐私闸门：响应里**不得出现凭据的值**。
+ *
+ * ## 为什么不能搜朴素的 `'sk-'` 子串（这一版踩过）
+ *
+ * 空白名单搜整串的做法会把**说明文案**误判成泄漏：新版各家的「怎么配凭据」
+ * 里有一句「要的是登录态 access token，不是 `sk-` 开头的平台 API Key」——
+ * 那句话里就带着 `sk-`。而它恰恰是用户最需要读到的一句。
+ *
+ * 因此这里只认**凭据形态**：`Bearer <token>`、`sk-` 后面跟足够长的 key 字符、
+ * 或 JWT（`eyJ…`）。漏掉说明文案、钉住真正的泄漏。
+ */
+const SECRET_SHAPES = [
+  [/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/, 'Bearer 令牌'],
+  [/sk-[A-Za-z0-9_-]{16,}/, 'sk- 平台 Key'],
+  [/eyJ[A-Za-z0-9_-]{10,}/, 'JWT'],
+  [/AKLT[A-Za-z0-9]{10,}/, '火山 AccessKey'],
+]
+/**
+ * @param {string} text - 已序列化的响应。
+ * @param {string} label - 出错时点名是哪条路由。
+ * @returns {void}
+ */
+function assertNoSecrets(text, label) {
+  for (const [pattern, name] of SECRET_SHAPES) {
+    assert.ok(!pattern.test(text), `${label}里出现了疑似凭据内容（${name}）：${String(pattern)}`)
+  }
+}
+
 const versioned = await call(versionRoute)
 assert.equal(versioned.statusCode, 200)
 const info = JSON.parse(versioned.body)
@@ -196,6 +228,9 @@ const REQUIRED_CAPABILITIES = [
   'focusWindow',
   // 会话清单里的预览标题（与 DSH 侧栏同源）。旧的 id 片段用户对不上侧栏任何一个会话。
   'sessionTitle',
+  // 单会话明细路由。缺这一项说明宿主还是旧版本，会话标签页据此显示
+  // 「当前宿主不支持这条明细」，而不是画一张空表。
+  'sessionDetail',
 ]
 assert.ok(Array.isArray(payload.capabilities), '响应应含 capabilities 数组')
 for (const name of REQUIRED_CAPABILITIES) {
@@ -217,6 +252,109 @@ assert.ok(payload.peakRule.note.includes('法定节假日'), '口径说明里必
 assert.ok(payload.period !== undefined, '响应应含当前时段状态')
 assert.equal(payload.offPeak, undefined, '旧的 offPeak 字段不应再出现')
 assert.equal(typeof payload.ledger?.path, 'string', '响应应回报账本路径，便于确认跨设备同步是否生效')
+
+// ── 单会话明细路由（会话标签页的取数口）───────────────────────────
+const { UsageCatalog } = await import(pathToFileURL(join(root, 'lib', 'host.js')).href)
+//
+// 会话标签页要回答「这条会话花了多少、花在哪些模型上」。它与看板的口径必须
+// **一致**（同一套分档计价），但又不能为此拉全量 `/data`。这里钉三件事：
+//   1) 路由的三种错误形态（缺参 400 / 认不出 404 / 只读 405）；
+//   2) 逐模型金额之和 == 响应里的合计（严格相等，用户一定会加一遍）；
+//   3) 逐日金额之和与合计一致（两种分组各自取整，允许 1e-6 尾差，不放过 1% 级偏差）。
+{
+  const missingId = await call(sessionRoute, 'GET', '/dsh-pixel/session')
+  assert.equal(missingId.statusCode, 400, '缺 id 参数应回 400，而不是给一份空明细')
+  const unknownId = await call(sessionRoute, 'GET', '/dsh-pixel/session?id=session-does-not-exist')
+  assert.equal(unknownId.statusCode, 404, '会话不存在应回 404（与「没有用量」是两件事）')
+  const wrongMethod = await call(sessionRoute, 'POST', '/dsh-pixel/session?id=x')
+  assert.equal(wrongMethod.statusCode, 405, '明细路由只读，POST 应回 405')
+
+  // 造一条跨两天、两个模型的会话：一天高峰、一天国庆（空闲）。
+  const peakDay = Date.parse('2026-09-30T02:00:00Z')
+  const idleDay = Date.parse('2026-10-03T02:00:00Z')
+  const sessionId = 'session-detail-0000-0000-000000000000'
+  const detailEvents = [
+    { type: 'turn/start', seq: 0, time: peakDay },
+    {
+      type: 'assistant/message',
+      seq: 1,
+      time: peakDay,
+      data: {
+        turn: 1,
+        step: 1,
+        message: { role: 'assistant', content: [], source: { kind: 'model', provider: 'deepseek-official', model: 'deepseek-flash' } },
+        usage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100, cacheReadTokens: 400, cacheWriteTokens: 0 },
+      },
+    },
+    {
+      type: 'assistant/message',
+      seq: 2,
+      time: idleDay,
+      data: {
+        turn: 1,
+        step: 2,
+        message: { role: 'assistant', content: [], source: { kind: 'model', provider: 'deepseek-official', model: 'glm-5.3' } },
+        usage: { inputTokens: 2000, outputTokens: 300, totalTokens: 2300, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      },
+    },
+  ]
+  const detailPersistence = {
+    async list() {
+      return [{ header: { id: sessionId, createdAt: peakDay, cwd: 'D:\\blog' }, revision: 'r1', eventCount: detailEvents.length }]
+    },
+    async open() {
+      return {
+        async read(offset = 0, length = 500) { return { events: detailEvents.slice(offset, offset + length) } },
+        async close() {},
+      }
+    },
+  }
+  const ledgerFile = join(tmpdir(), `dsh-pixel-session-${process.pid}.jsonl`)
+  rmSync(ledgerFile, { force: true })
+  const detailCatalog = new UsageCatalog({
+    persistence: () => detailPersistence,
+    sessions: () => undefined,
+    timezone: () => 'Asia/Shanghai',
+    ledgerPath: ledgerFile,
+  })
+  const detail = await detailCatalog.readSessionDetail(sessionId)
+  assert.ok(detail !== undefined, '有账本记录的会话应能取到明细')
+  assert.equal(detail.session.id, sessionId)
+  assert.equal(detail.entries.length, 2, '两个模型应各占一行')
+  // 顺序：按金额降序，用户第一眼要看到最贵的那一行
+  assert.ok(
+    Number(detail.entries[0].cost.standard) >= Number(detail.entries[1].cost.standard),
+    '逐模型明细应按金额降序',
+  )
+  // 每一行都必须是**该行自己**的金额（不是会话合计的复制）：两行金额相加要等于合计
+  const entrySum = detail.entries.reduce((sum, entry) => sum + Number(entry.cost.standard ?? 0), 0)
+  assert.equal(
+    Math.round(entrySum * 1e6) / 1e6,
+    detail.cost.standard,
+    '逐模型金额之和必须严格等于响应里的合计',
+  )
+  const daySum = detail.days.reduce((sum, day) => sum + Number(day.cost.standard ?? 0), 0)
+  assert.ok(
+    Math.abs(daySum - detail.cost.standard) < 1e-5,
+    `逐日金额之和应与合计一致（两种分组各自取整，允许 1e-6 尾差）：${daySum} vs ${detail.cost.standard}`,
+  )
+  assert.equal(detail.days.length, 2, '两天的用量应各占一行')
+  // 分档必须真的分开：一天在节前工作日（高峰）、一天在国庆（空闲）
+  assert.ok(Number(detail.cost.peak) > 0, '高峰那天应计入高峰档')
+  assert.ok(Number(detail.cost.idle) > 0, '国庆那天应按空闲档计费')
+  // 单价随明细下发：客户端不得自己按路由 id 去价目表查（查不到会静默回落 Flash 价）
+  for (const entry of detail.entries) {
+    assert.ok(detail.pricing.models[entry.key]?.rates !== undefined, `明细应带上 ${entry.key} 的单价`)
+    assert.equal(entry.priced, true, `${entry.key} 在价目表里，应标为已定价`)
+  }
+  // 外显名 / 提供商名要能直接用，不必客户端再拼
+  for (const entry of detail.entries) {
+    assert.equal(typeof entry.label, 'string', '每行应带显示名')
+    assert.equal(entry.provider, 'deepseek-official')
+  }
+  assert.equal(await detailCatalog.readSessionDetail('session-nope'), undefined, '认不出的会话应返回 undefined')
+  rmSync(ledgerFile, { force: true })
+}
 
 // ── 时段路由：侧栏指示灯的取数口 ────────────────────────────────
 // 侧栏那枚点靠它画环形进度，因此这里锁住三件事：**纯时钟**（不依赖账本/会话，
@@ -309,7 +447,6 @@ const samplePersistence = {
   },
 }
 
-const { UsageCatalog } = await import(pathToFileURL(join(root, 'lib', 'host.js')).href)
 const sampleCatalog = new UsageCatalog({
   persistence: () => samplePersistence,
   sessions: () => undefined,
@@ -384,7 +521,20 @@ assert.deepEqual(sample.models.map((row) => row.key), ['deepseek-flash@deepseek-
 assert.deepEqual(sample.models.map((row) => row.rollup), ['deepseek-flash'])
 assert.equal(sample.models[0].provider, 'deepseek-official')
 assert.ok(sample.models[0].rates !== undefined, '每个条目必须带上自己那一份单价')
-assert.equal(sample.pricing.models['deepseek-flash'], sample.models[0].rates, '逐模型单价表按归一键索引')
+// 逐模型单价表：**两个键、两种形状** ——
+//   复合键（`模型@提供商`）= 包装 `{rates, markup, currency}`，带该提供商的倍率；
+//   裸键（`模型`）        = **裸 RATE**，代表官方价（看板把它当价目直接读字段）。
+// 把裸键也做成包装会让看板的「我的价」三档全部取到 undefined、显示成 ¥0，
+// 而界面上完全看不出异常——所以这里两种形状都要钉住。
+const samplePriced = sample.pricing.models['deepseek-flash@deepseek-official']
+assert.ok(samplePriced !== undefined, '按复合键应查得到单价')
+assert.equal(samplePriced.rates, sample.models[0].rates, '复合键包装里的价目应与模型条目是同一个对象')
+assert.equal(samplePriced.markup, 1, '没有配倍率时，提供商倍率必须是 1（不是 0，也不是缺省 undefined）')
+const sampleOfficial = sample.pricing.models['deepseek-flash']
+assert.equal(sampleOfficial, sample.models[0].rates, '裸键必须**就是**那份裸 RATE 对象（看板按价目直接读字段）')
+assert.equal(typeof sample.pricing.usdToCny, 'number', '响应应带上美元折算汇率（界面要标出按汇率折算）')
+assert.ok(sample.pricing.usdToCny > 0, '汇率必须是正数')
+assert.equal(typeof sample.pricing.markup, 'object', '应带上提供商倍率表（按裸键查价时也要能显示倍率）')
 assert.ok(sample.sessions[0].cost.standard > 0, '会话应带非零费用摘要')
 assert.equal(sample.ledger.total, 1, '账本应记录一条')
 
@@ -553,6 +703,11 @@ assert.equal(balancePayload.official, true, '默认端点应被识别为官方')
 assert.ok(Array.isArray(balancePayload.balances), '余额应始终是数组（可能为空）')
 // 预检环境没有 credentials 服务、也没有设 DEEPSEEK_API_KEY：应明确回报原因而不是假装 0
 assert.equal(balancePayload.reason, 'no-key', '没配 Key 时应回报 no-key，而不是显示 0 余额')
+// 登录态：界面据此决定「显示金额」还是「显示未登录 + 官网入口」。
+// 它必须是布尔而不是 undefined：客户端拿 undefined 会当成"未知"，
+// 于是既不敢显示金额、也不敢说未登录，最后什么也不显示。
+assert.equal(balancePayload.signedIn, false,
+  '拿不到官方凭据时应明确回报 signedIn:false（界面据此不发请求、显示未登录）')
 
 // ── 隐私闸门：凭据的**值**绝不能跨到浏览器端 ──────────────────────
 // 注意 `apiKeyEnv` 是引用的**名字**（DEEPSEEK_API_KEY），不是秘密——它出现在响应里
@@ -822,27 +977,48 @@ assert.equal(off.headers['cache-control'], 'no-store', '余额响应不得被缓
 const plansPayload = JSON.parse((await call(plansRoute)).body)
 assert.equal(plansPayload.enabled, true, '默认应启用套餐监控')
 assert.ok(Array.isArray(plansPayload.providers), 'providers 应是数组')
+// 六家：现金余额只有 DeepSeek 官方（走 /balance），套餐额度就这六家。
+// 清单要**完整**：少一家等于界面上干脆没有那家的入口；多一家等于画一个永远
+// 取不到数的块。新增厂商时这里必须显式改一行。
 assert.deepEqual(
   plansPayload.providers.map((provider) => provider.id).sort(),
-  ['commandcode', 'volcengine', 'zhipu'],
-  '应包含智谱、Command Code 与火山方舟三家',
+  ['codex', 'commandcode', 'cursor', 'opencode', 'volcengine', 'zhipu'],
+  '应包含智谱、Command Code、火山方舟、Codex、Cursor、Opencode 六家',
 )
-// 预检环境既没有凭据服务也没有环境变量、更没有 CLI 凭据文件：三家都应明说没配 Key
+// 预检环境既没有 DSH 凭据服务、也没有相关环境变量。
+//
+// **但有三家会读别的 App 的登录态**（Codex 的 `~/.codex/auth.json`、Cursor 的
+// `auth.json`、Opencode 的 `auth.json`）。开发机上这些文件很可能真的存在，
+// 于是它们会去发一次真实请求并失败——那是如实反映「本机有登录态但取数失败」，
+// 与「没配凭据」是两种处境，因此这里不把 reason 钉死成 no-key，而是钉住
+// 「一定要给出一个可解释的原因」＋「绝不能把凭据本身漏出来」。
+const PLAN_FAILURE_REASONS = ['no-key', 'rejected', 'request-failed', 'unsupported']
 for (const provider of plansPayload.providers) {
   assert.equal(provider.ok, false, `${provider.id} 未配 Key 时不应报成功`)
-  assert.equal(provider.reason, 'no-key', `${provider.id} 应回报 no-key`)
+  assert.ok(
+    PLAN_FAILURE_REASONS.includes(provider.reason),
+    `${provider.id} 的失败原因应可解释（${PLAN_FAILURE_REASONS.join(' / ')}），实际 ${provider.reason}`,
+  )
   assert.ok(Array.isArray(provider.windows), `${provider.id} 的 windows 应是数组`)
+  // 每家都要能说清「我的凭据从哪来、去哪拿」——只有原因没有下一步，用户会卡死。
+  assert.equal(typeof provider.setup?.keyURL, 'string', `${provider.id} 应给出凭据获取地址`)
 }
+// 没有任何 CLI 登录态可读的两家必须仍是 no-key（这条与上面互为对照：
+// 谁都报 request-failed 就说明「缺凭据」这条分支根本没人走通）。
+for (const id of ['zhipu', 'volcengine']) {
+  const provider = plansPayload.providers.find((item) => item.id === id)
+  assert.equal(provider.reason, 'no-key', `${id} 没有可自动发现的凭据文件，应回报 no-key`)
+}
+// 凭据绝不能出现在响应里。这一条与环境无关，而且比「reason 是 no-key」更要紧
+// ——漏一次就是永久泄漏。
+assertNoSecrets(JSON.stringify(plansPayload), '套餐响应')
 // 智谱官方只有 5 小时与每周，**没有**月度；这一条要留在数据里让界面解释清楚
 const zhipu = plansPayload.providers.find((provider) => provider.id === 'zhipu')
 assert.deepEqual(zhipu.supportedWindows, ['fiveHour', 'weekly'], '智谱只有 5 小时与每周窗口')
 const commandCode = plansPayload.providers.find((provider) => provider.id === 'commandcode')
 assert.deepEqual(commandCode.supportedWindows, ['fiveHour', 'weekly', 'monthly'], 'Command Code 应有三个窗口')
-// 隐私闸门：套餐响应里绝不能出现凭据的**值**
-const plansBody = JSON.stringify(plansPayload)
-for (const banned of ['Bearer ', 'sk-', 'eyJ']) {
-  assert.ok(!plansBody.includes(banned), `套餐响应里出现了疑似凭据内容「${banned}」`)
-}
+// 隐私闸门：套餐响应里绝不能出现凭据的**值**（只看凭据形态，见 assertNoSecrets）。
+assertNoSecrets(JSON.stringify(plansPayload), '套餐响应')
 
 // 解析器：用假响应验窗口归类与「缺失不显示成 0」
 const plansModule = await import(pathToFileURL(join(root, 'lib', 'plans.js')).href)
@@ -1412,15 +1588,18 @@ assert.ok(halfProvider.hint.includes('AccessKey'), '应说明这里要的是 Acc
   const {
     planVendorInventory, removableOf, blockedReasonOf, credentialSourceLabel,
     PlansService, ZHIPU_KEY_ENVS, COMMAND_CODE_KEY_ENVS, VOLC_AK_ENVS, VOLC_SK_ENVS,
+    CODEX_TOKEN_ENVS, CODEX_ACCOUNT_ENVS, CURSOR_TOKEN_ENVS, OPENCODE_KEY_ENVS, OPENCODE_WORKSPACE_ENVS,
   } = plansForCreds
 
   // 1) 清单必须**覆盖各家解析时真正会试的全部候选名**。
   //    漏一个的后果最严重：用户点了移除，那家照样能解析到 Key，界面却显示已移除。
   const inventory = planVendorInventory()
+  // 六家：与 `/plans` 的 provider 清单必须**同一组**（两处各写一份就会漂移，
+  // 而漂移的表现是「某个厂商的凭据删不掉，界面上却根本不提它的移除入口」）。
   assert.deepEqual(
     inventory.map((vendor) => vendor.id),
-    ['zhipu', 'commandcode', 'volcengine'],
-    '移除清单应覆盖三家',
+    ['zhipu', 'commandcode', 'volcengine', 'codex', 'cursor', 'opencode'],
+    '移除清单应覆盖六家',
   )
   const refsOfVendor = (id) => new Set(inventory.find((item) => item.id === id).refs.map((item) => item.name))
   for (const name of ZHIPU_KEY_ENVS) {
@@ -1432,8 +1611,23 @@ assert.ok(halfProvider.hint.includes('AccessKey'), '应说明这里要的是 Acc
   for (const name of [...VOLC_AK_ENVS, ...VOLC_SK_ENVS]) {
     assert.ok(refsOfVendor('volcengine').has(name), `移除清单漏了火山的候选名 ${name}`)
   }
+  // 三家新厂商同样要「试哪些名字就列哪些名字」——漏一个同样是「点了移除还读得到」。
+  const NEW_VENDOR_REFS = {
+    codex: [...CODEX_TOKEN_ENVS, ...CODEX_ACCOUNT_ENVS],
+    cursor: [...CURSOR_TOKEN_ENVS],
+    opencode: [...OPENCODE_KEY_ENVS, ...OPENCODE_WORKSPACE_ENVS],
+  }
+  for (const [id, names] of Object.entries(NEW_VENDOR_REFS)) {
+    for (const name of names) {
+      assert.ok(refsOfVendor(id).has(name), `移除清单漏了 ${id} 的候选名 ${name}`)
+    }
+  }
   // 反向：清单里也不该有各家解析时根本不会试的名字（删一个无关的键同样是越权）
-  const allCandidates = new Set([...ZHIPU_KEY_ENVS, ...COMMAND_CODE_KEY_ENVS, ...VOLC_AK_ENVS, ...VOLC_SK_ENVS])
+  const allCandidates = new Set([
+    ...ZHIPU_KEY_ENVS, ...COMMAND_CODE_KEY_ENVS, ...VOLC_AK_ENVS, ...VOLC_SK_ENVS,
+    ...CODEX_TOKEN_ENVS, ...CODEX_ACCOUNT_ENVS, ...CURSOR_TOKEN_ENVS,
+    ...OPENCODE_KEY_ENVS, ...OPENCODE_WORKSPACE_ENVS,
+  ])
   for (const vendor of inventory) {
     for (const item of vendor.refs) {
       assert.ok(allCandidates.has(item.name), `移除清单里的 ${item.name} 并不是任何一家的候选名`)
@@ -1469,11 +1663,10 @@ assert.ok(halfProvider.hint.includes('AccessKey'), '应说明这里要的是 Acc
   const emptyPayload = JSON.parse((await call(credsRoute)).body)
   assert.equal(emptyPayload.writable, false,
     '预检的 ctx 没有 credentials 服务，应如实回报不可写（而不是假装能删）')
-  assert.equal(emptyPayload.providers.length, 3, '清单应列出三家')
-  const emptyBody = JSON.stringify(emptyPayload)
-  for (const banned of ['Bearer ', 'sk-', 'eyJ']) {
-    assert.ok(!emptyBody.includes(banned), `凭据清单里出现了疑似凭据内容「${banned}」`)
-  }
+  assert.equal(emptyPayload.providers.length, 6, '清单应列出六家')
+  // 只看凭据形态：清单里必然会出现引用名（如 `CODEX_ACCESS_TOKEN`）与说明文案，
+  // 那些不是泄漏；真正不许出现的是凭据的值。
+  assertNoSecrets(JSON.stringify(emptyPayload), '凭据清单')
   for (const provider of emptyPayload.providers) {
     for (const ref of provider.refs) {
       assert.equal(ref.configured, false, `${ref.name} 在预检环境里应是未配置`)
@@ -1598,7 +1791,7 @@ rmSync(fakeAuth, { force: true })
 
 // ── 多厂商价目：智谱 GLM 与「估算价」的诚实标注 ──────────────────
 const pricingModule = await import(pathToFileURL(join(root, 'lib', 'pricing.js')).href)
-const { pricingOf, normalizeModel, MODEL_RATES } = pricingModule
+const { pricingOf, normalizeModel, MODEL_RATES, ratesOf, usdToCny } = pricingModule
 
 // deepseek-v4.1-flash 是 DSH 实际在用的模型名（本机账本里有近 2000 条）。
 // 不折叠的话它会走兜底：金额一样但被标成「估算价」并多出一行，看起来像另一个模型。
@@ -1658,8 +1851,19 @@ assert.equal(MODEL_RATES['qwen3.7-flash'].tiered, true, '分档模型必须标 t
 // 限时 8 折：按折后价录，按原价会高估 25%。
 assert.equal(MODEL_RATES['qwen3.7-plus'].cacheMiss.peak, 1.6, 'qwen3.7-plus 应取 8 折后的 ¥1.6')
 // OpenAI：账本里真实出现的 gpt-5.6-terra 必须有价，否则它一直显示「估算价」。
-assert.equal(MODEL_RATES['gpt-5.6-terra'].cacheMiss.peak, 14.4, 'gpt-5.6-terra 输入 $2 × 7.2')
-assert.equal(MODEL_RATES['gpt-5.6-terra'].output.peak, 86.4, 'gpt-5.6-terra 输出 $12 × 7.2')
+//
+// **价目表里存的是官方原币（USD），人民币值只在生效视图里按汇率折算。**
+// 早先这里断言的是写死的 `$2 × 7.2 = 14.4`：那时汇率是常量 7.2，而现在汇率
+// 由用户在设置里改，写死的人民币值会与界面上的金额对不上（用户改了汇率，
+// 金额变了而这条断言还在测旧的 7.2）。因此这里分两段钉：
+//   1) 原币价目必须与官方页一致（USD）；
+//   2) 生效视图的人民币值必须 = 原币 × 当前汇率（构造上不可能漂移）。
+assert.equal(MODEL_RATES['gpt-5.6-terra'].currency, 'USD', 'OpenAI 价目是美元，不能写死成人民币')
+assert.deepEqual(MODEL_RATES['gpt-5.6-terra'].cacheMiss, { peak: 2, idle: 2 }, 'gpt-5.6-terra 输入 $2/M')
+assert.deepEqual(MODEL_RATES['gpt-5.6-terra'].output, { peak: 12, idle: 12 }, 'gpt-5.6-terra 输出 $12/M')
+assert.equal(ratesOf('gpt-5.6-terra').cacheMiss.peak, Number((2 * usdToCny()).toFixed(6)),
+  '生效视图必须按当前汇率折算（改了汇率金额要跟着变）')
+assert.equal(ratesOf('gpt-5.6-terra').currency, 'CNY', '生效视图一律是人民币')
 assert.equal(pricingOf('gpt-5.6-terra').known, true, '账本里出现过的模型必须 known=true')
 assert.equal(MODEL_RATES['qwen-max'].cacheMiss.peak, 2.484,
   'qwen-max 是内地特例价 $0.345，与国际站 $1.6 差 4 倍多，不能折进 qwen3.8-max')
@@ -1809,20 +2013,23 @@ assert.equal(stale.dropped, true, 'since 早于最旧记录时应标出 dropped'
 assert.equal(journal.read({ since: 4 }).dropped, false, '没丢记录时不应误报 dropped')
 
 // 3) 配置归一：脏输入不能污染配置，也不能把「未设置」变成 0
+//
+// **余额 / 套餐额度预警已整体取消**（v3）。因此这一节现在钉的是反向事实：
+// 归一化会把旧配置文件里的阈值键**丢掉**，而不是继续传播它们。
+// 旧版这里逐个断言阈值表的大小写归一、负值丢弃、原型键拦截……那些逻辑随
+// 功能一起删掉了；留一句「阈值还能调」的断言，只会让人以为功能还在。
 const clean = normalizeNotify({
   notifyDone: 'yes',
-  warnBalance: { cny: 10, USD: '5', __proto__: 999, BAD: -1, EMPTY: '', NULL: null },
+  // 旧配置文件里可能还带着这些键：读进来必须被丢掉，而不是又被写回去。
+  warnBalance: { cny: 10, USD: '5', __proto__: 999, BAD: -1 },
   warnQuotaPercent: 250,
+  notifyBalance: false,
+  notifyQuota: false,
 })
 assert.equal(clean.notifyDone, NOTIFY_DEFAULTS.notifyDone, '非布尔值应退回默认值')
-assert.equal(clean.warnBalance.CNY, 10, '币种键应归一成大写')
-assert.equal(clean.warnBalance.USD, 5, '数字字符串应被接受')
-assert.equal(clean.warnBalance.BAD, undefined, '负阈值应被丢弃')
-assert.equal(clean.warnBalance.EMPTY, undefined, '空串不能被当成 0')
-assert.equal(clean.warnBalance.NULL, undefined, 'null 不能被当成 0')
-assert.ok(!Object.hasOwn(clean.warnBalance, '__proto__'), '原型键必须被正则挡掉')
-assert.equal(clean.warnQuotaPercent, 250, '超过 100 的阈值是合法用法（只提醒超限）')
-assert.equal(normalizeNotify({ warnQuotaPercent: 'abc' }).warnQuotaPercent, NOTIFY_DEFAULTS.warnQuotaPercent, '读不懂的百分比应退回默认')
+for (const stale of ['warnBalance', 'warnQuotaPercent', 'notifyBalance', 'notifyQuota']) {
+  assert.ok(!Object.hasOwn(clean, stale), `旧配置里的 ${stale} 应被丢弃（该能力已取消）`)
+}
 assert.deepEqual(Object.keys(clean).sort(), Object.keys(NOTIFY_DEFAULTS).sort(), '归一结果只能含已知键')
 
 // 3b) 提示音：认不出的模式必须回落到 `system`（= 什么都不改），**不是**静音。
@@ -1986,16 +2193,25 @@ assert.ok(
 )
 assert.equal(evicted.subagent, true, '名字被淘汰不影响「这是个员工」这个事实')
 
-const notifyWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', { warnBalance: { CNY: 20 } })
+// 写开关：用仍然存在的字段（`notifyDone`）验证「合并 + 持久化」两条语义。
+// 阈值键（warnBalance 等）已随预警功能取消——写进来必须被忽略，见下面那条。
+const notifyWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', { notifyDone: false })
 assert.equal(notifyWrite.statusCode, 200, `POST 应返回 200，实际 ${notifyWrite.statusCode}`)
 const written = JSON.parse(notifyWrite.body)
-assert.equal(written.config.warnBalance.CNY, 20, '阈值应被写入')
-assert.equal(written.config.notifyDone, true, '未提交的项应保持原值（合并语义）')
+assert.equal(written.config.notifyDone, false, '开关应被写入')
+assert.equal(written.config.notifySubagent, true, '未提交的项应保持原值（合并语义）')
 // 写回后读一次，确认真的持久化到隔离的 prefs 文件里
 const reread = JSON.parse((await call(notifyRoute, 'GET')).body)
-assert.equal(reread.config.warnBalance.CNY, 20, '重新读取应看到刚写入的阈值')
+assert.equal(reread.config.notifyDone, false, '重新读取应看到刚写入的开关')
+// 已取消的阈值键：写进来返回 200（不是报错——旧版本客户端可能还在发），
+// 但**配置里不能出现它**。否则「界面已经删了阈值，配置里还留着」会让人以为功能没删干净。
+const staleWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', { warnBalance: { CNY: 20 }, warnQuotaPercent: 90 })
+assert.equal(staleWrite.statusCode, 200, '旧客户端提交阈值不应报错（否则它的其余开关也写不进去）')
+const staleConfig = JSON.parse(staleWrite.body).config
+assert.ok(!Object.hasOwn(staleConfig, 'warnBalance'), '阈值键不得写进配置（该能力已取消）')
+assert.ok(!Object.hasOwn(staleConfig, 'warnQuotaPercent'), '额度阈值不得写进配置')
 // 跨站被拒：写路由不接受跨站表单触发
-const crossSiteWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', { warnQuotaPercent: 1 }, { 'sec-fetch-site': 'cross-site' })
+const crossSiteWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', { notifyDone: true }, { 'sec-fetch-site': 'cross-site' })
 assert.equal(crossSiteWrite.statusCode, 403, '跨站写请求应被拒绝')
 // 非法体被拒（数组不是对象）
 const badWrite = await call(notifyRoute, 'POST', '/dsh-pixel/notify', [1, 2, 3])
@@ -2092,7 +2308,7 @@ assert.equal(typeof focusBody.ok, 'boolean', '/focus 应回报 ok')
 // 恢复：把开关文件清干净，避免影响后续断言
 rmSync(sandboxPrefs, { force: true })
 
-console.log(`预检通过：插件形状、10 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
-  + 'POST 拒绝、时段时钟、余额隐私与开关、套餐解析与凭据打码、多厂商价目、自定义单价、通知日志与预警阈值')
+console.log(`预检通过：插件形状、${routes.length} 条路由、版本注入（${info.version}）、能力声明、空/非空聚合、`
+  + 'POST 拒绝、时段时钟、余额隐私与开关、套餐解析与凭据打码、多厂商价目、自定义单价、通知日志与开关')
 
 rmSync(sandboxPrefs, { force: true })

@@ -18,8 +18,165 @@ const REQUEST_TIMEOUT_MS = 20_000
 /**
  * 窗口显示顺序：由短到长。
  * 智谱没有 monthly，缺的窗口自然不渲染。
+ *
+ * 认不出的窗口（`hourly` / `budget` / `windowN` 之类）**排在已知窗口之后**，
+ * 顺序保持宿主给的先后——早先这里用「按固定顺序 map 再 find」的写法，于是
+ * 任何新窗口种类都会被静默丢掉。展示「还剩多少」这件事上，**少一格比多一格糟**。
  */
 export const WINDOW_ORDER = ['fiveHour', 'weekly', 'monthly']
+
+/**
+ * 把宿主的窗口数组排成稳定顺序：已知窗口按 {@link WINDOW_ORDER}，其余按原顺序跟在后面。
+ * @param {object[]} windows - 宿主返回的窗口。
+ * @returns {object[]} 排序后的新数组（不改原数组）。
+ */
+export function orderWindows(windows) {
+  const list = Array.isArray(windows) ? windows.filter((win) => win !== null && typeof win === 'object') : []
+  const known = []
+  for (const key of WINDOW_ORDER) {
+    for (const win of list) if (win.window === key) known.push(win)
+  }
+  const rest = list.filter((win) => !WINDOW_ORDER.includes(win.window))
+  return [...known, ...rest]
+}
+
+/**
+ * 厂商 id → 这一家在费用条那种一行位置用得下的短名。
+ *
+ * 新接入的三家在 `client/provider.js` 的 `PLAN_SHORT` 里没有条目（那个文件属于
+ * 路由映射的既有实现），因此这一份是**补充表**：查不到时退回宿主给的名字。
+ */
+export const VENDOR_SHORT = {
+  codex: 'Codex',
+  cursor: 'Cursor',
+  opencode: 'Opencode',
+}
+
+/**
+ * 厂商 id → 这一家的数据形状（界面用来决定「百分比 / 绝对值 / 只有剩余额」怎么讲）。
+ *
+ * 与宿主 `lib/plans.js` 的 `SHAPE_LABELS` 同一组事实：宿主已经在每家结果上给了
+ * `shape`，这里只是给**旧宿主**（没有 shape 字段）留一张回落表。
+ */
+export const VENDOR_SHAPE = {
+  zhipu: 'percent',
+  commandcode: 'absolute',
+  volcengine: 'mixed',
+  codex: 'percent',
+  cursor: 'percent',
+  opencode: 'mixed',
+}
+
+/**
+ * 数据形状 → 一句话说明（旧宿主没有 `setup.shape` 时的回落）。
+ */
+export const SHAPE_TEXT = {
+  percent: '官方只给百分比',
+  absolute: '官方给绝对值（已用 + 上限）',
+  remaining: '官方只给剩余额',
+  mixed: '套餐给百分比，预算给金额',
+}
+
+/**
+ * 各家的管理 / 充值入口（**旧宿主的回落**）。
+ *
+ * 新宿主在每一家里交下 `setup.keyURL` / `keyURLName`；这里只服务没有 `setup` 的
+ * 旧宿主。**注意火山的入口是 IAM 的「API 访问密钥」页，不是方舟控制台**——AK/SK
+ * 是账号级 IAM 凭据，方舟控制台给的是推理用的 `ark-` Key，那个恰好是会被拒的一把。
+ */
+export const VENDOR_LINKS = {
+  zhipu: { href: 'https://www.bigmodel.cn/coding-plan/personal/usage', label: '智谱套餐用量 ↗' },
+  commandcode: { href: 'https://commandcode.ai/studio', label: 'Command Code 工作室 ↗' },
+  volcengine: { href: 'https://console.volcengine.com/iam/keymanage/', label: '火山引擎 API 访问密钥（AccessKey）↗' },
+  codex: { href: 'https://developers.openai.com/codex/auth', label: 'Codex 登录说明 ↗' },
+  cursor: { href: 'https://cursor.com/dashboard', label: 'Cursor 控制台 ↗' },
+  opencode: { href: 'https://opencode.ai/console', label: 'OpenCode Console ↗' },
+}
+
+/**
+ * 这一家的凭据要求（一句人话，**旧宿主的回落**）。
+ *
+ * 为什么要单独一张表：用户最容易在这一步上错得最离谱，而错法各不相同——
+ * 智谱要「编程套餐专属」Key（平台 Key 不通用）；火山要 AK/SK 而不是推理 Key；
+ * Codex / Cursor 要登录态 token 而不是平台 API Key。新宿主会把这些写在
+ * `setup.acquire` 里；旧宿主没有，界面也不能留空。
+ */
+export const VENDOR_CREDENTIAL_HINT = {
+  zhipu: '需要「编程套餐专属」Key：平台普通的 API Key 不通用（标准调用能过、额度查询会被拒）。',
+  commandcode: '在工作台里创建 API Key；装过 CLI 并登录过的话插件会自动读本机的登录文件。',
+  volcengine: '要的是火山账号的 AccessKey ID / Secret AccessKey，不是方舟推理用的 ark- Key（后者会被网关在格式层拒掉）。',
+  codex: '要的是 Codex 的登录态 access token（不是 sk 开头的平台 API Key），另需 workspace / 账号 id。',
+  cursor: '要的是 Cursor 的登录态 access token；过期需在 Cursor 里重新登录。',
+  opencode: '要 OpenCode Console 的 Key，并且需要 workspace id（Console 地址里那一段）。',
+}
+
+/**
+ * 这一家的凭据要求一句话（供界面直接渲染）。
+ * @param {object|undefined} provider - 宿主返回的一家结果。
+ * @returns {string} 说明；认不出时是空串。
+ */
+export function vendorCredentialHint(provider) {
+  const id = provider?.id
+  if (typeof id !== 'string') return ''
+  return VENDOR_CREDENTIAL_HINT[id] ?? ''
+}
+
+/**
+ * 这一家的入口链接：宿主 `setup.keyURL` 优先，其次旧宿主的回落表。
+ * @param {object|undefined} provider - 宿主返回的一家结果。
+ * @returns {{href:string,label:string}|undefined} 入口；都没有时 undefined。
+ */
+export function vendorLinkOf(provider) {
+  const setup = provider?.setup
+  const href = typeof setup?.keyURL === 'string' && setup.keyURL !== '' ? setup.keyURL : ''
+  if (href !== '') {
+    return {
+      href,
+      label: `${typeof setup?.keyURLName === 'string' && setup.keyURLName !== '' ? setup.keyURLName : '打开创建页'} ↗`,
+    }
+  }
+  const id = provider?.id
+  return typeof id === 'string' ? VENDOR_LINKS[id] : undefined
+}
+
+/**
+ * 新接入三家的 provider 路由名 → 厂商 id。
+ *
+ * **与宿主 `lib/plans.js` 的 `CODEX_ROUTES` / `CURSOR_ROUTES` / `OPENCODE_ROUTES`
+ * 是同一组事实的两份抄写。** 宿主用它们派生凭据引用名，这里用来判断「当前会话用的是
+ * 哪一家」。漂移的表现是「套餐卡片里有这一家、费用条旁边却始终不显示它」——
+ * 没有报错，只是那一枚永远不出现，因此两边必须一起改。
+ */
+export const EXTRA_PLAN_ROUTES = {
+  codex: ['codex', 'codex-cli', 'openai-codex', 'chatgpt-codex'],
+  cursor: ['cursor', 'cursor-agent'],
+  opencode: ['opencode', 'opencode-zen', 'zen'],
+}
+
+/** 小写路由名 → 新三家厂商 id。 */
+const EXTRA_ROUTE_INDEX = (() => {
+  const map = new Map()
+  for (const [id, routes] of Object.entries(EXTRA_PLAN_ROUTES)) {
+    for (const route of routes) map.set(String(route).toLowerCase(), id)
+  }
+  return map
+})()
+
+/**
+ * 由 provider 路由名认出**新接入的三家**之一。
+ *
+ * 为什么不直接改 `client/provider.js`：那个文件里的 `PLAN_ROUTES` 与宿主的
+ * 三家候选表成对维护，渲染闸门会逐条比对；把新三家塞进去要同时改两边与闸门。
+ * 这里独立一张表，只在 `client/account.js` 里**优先**查它，查不到再退回那张旧表，
+ * 于是新旧两批互不干扰。
+ * @param {unknown} provider - provider 路由名。
+ * @returns {string|undefined} 厂商 id（codex / cursor / opencode）。
+ */
+export function extraPlanIdOfRoute(provider) {
+  const key = String(provider ?? '').trim().toLowerCase()
+  if (key === '') return undefined
+  return EXTRA_ROUTE_INDEX.get(key)
+}
 
 /**
  * 格式化一个额度数值。
@@ -345,12 +502,14 @@ export async function removePlanCredentials(refs) {
  *     （前者抛错，后者是**静默空操作**）。画上勾选框就是骗人。
  *   - 未配置：本来就没有，没什么可移除的。
  * @param {object|undefined} payload - {@link fetchPlanCredentials} 的负载。
+ * @param {string} [vendorId] - 只取这一家的行（标签页一次只显示一家）。
  * @returns {Array<{vendor:string,vendorName:string,ref:object,selectable:boolean}>} 行。
  */
-export function credentialRows(payload) {
+export function credentialRows(payload, vendorId) {
   const providers = Array.isArray(payload?.providers) ? payload.providers : []
   const rows = []
   for (const provider of providers) {
+    if (vendorId !== undefined && provider?.id !== vendorId) continue
     for (const ref of Array.isArray(provider?.refs) ? provider.refs : []) {
       rows.push({
         vendor: provider.id,
@@ -361,6 +520,75 @@ export function credentialRows(payload) {
     }
   }
   return rows
+}
+
+/**
+ * 某一家**自动发现**会读的本机凭据文件（只读、不可删）。
+ *
+ * 这些文件属于别的 App，插件只读。但必须列出来并标明「不会删除它」：
+ * 否则用户清完凭据文件里那把之后，插件照样能从这些文件读到，界面上却显示「未配」。
+ * @param {object|undefined} payload - {@link fetchPlanCredentials} 的负载。
+ * @param {string} vendorId - 厂商 id。
+ * @returns {Array<{path:string,present:boolean,note:string}>} 文件清单。
+ */
+export function credentialFiles(payload, vendorId) {
+  const providers = Array.isArray(payload?.providers) ? payload.providers : []
+  const provider = providers.find((item) => item?.id === vendorId)
+  const files = Array.isArray(provider?.files) ? provider.files : []
+  return files
+    .filter((file) => file !== null && typeof file === 'object' && typeof file.path === 'string')
+    .map((file) => ({
+      path: file.path,
+      present: file.present === true,
+      note: typeof file.note === 'string' ? file.note : '',
+    }))
+}
+
+/**
+ * 这一家的端点核验级别。
+ *
+ * `community` 表示**只有社区逆向实现**、没有一方来源（开源代码或官方文档），
+ * 界面必须显式说出来——用户据此决定「这个数字能不能当准」。缺字段时按
+ * `first-party` 处理（旧宿主没有这个概念，那时也没有新接入的三家）。
+ * @param {object|undefined} provider - 宿主返回的一家结果。
+ * @returns {'first-party'|'community'} 核验级别。
+ */
+export function vendorVerification(provider) {
+  return provider?.verification === 'community' ? 'community' : 'first-party'
+}
+
+/**
+ * 这一家给的是哪种形状（百分比 / 绝对值 / 只有剩余额 / 混合）。
+ * @param {object|undefined} provider - 宿主返回的一家结果。
+ * @returns {string} 形状 id；认不出时空串。
+ */
+export function vendorShape(provider) {
+  const shape = provider?.shape
+  if (typeof shape === 'string' && shape !== '') return shape
+  return VENDOR_SHAPE[provider?.id] ?? ''
+}
+
+/**
+ * 形状 id → 一句话说明。
+ * @param {string} shape - 形状 id。
+ * @returns {string} 说明；认不出时空串。
+ */
+export function shapeText(shape) {
+  return SHAPE_TEXT[shape] ?? ''
+}
+
+/**
+ * 宿主的套餐负载里，真正「在监控列表里」的厂商。
+ *
+ * 与 {@link providerChoices} 的差别：这个只回答「这一轮有几家能显示」，
+ * 标签页用它决定要不要画「添加厂商」入口。
+ * @param {object|undefined} payload - 宿主负载。
+ * @returns {object[]} 厂商结果数组（保持宿主顺序）。
+ */
+export function allProviders(payload) {
+  const providers = Array.isArray(payload?.providers) ? payload.providers : []
+  return providers.filter((provider) => provider !== null && typeof provider === 'object'
+    && typeof provider.id === 'string')
 }
 
 /**

@@ -1,7 +1,9 @@
 /**
  * dsh-pixel-dashboard 的浏览器半边：
- * 1) 装载视觉系统样式表（只有 tokens + dashboard 两张，都是 .px-* 局部样式）；
- * 2) 在侧栏面板列表与主区注册用量看板。
+ * 1) 装载视觉系统样式表（tokens / dashboard / pricing / accounts / session 五张，
+ *    都是 .px-* 局部样式）；
+ * 2) 在侧栏面板列表与主区注册用量看板；
+ * 3) 在输入框下方注册本次会话费用条，在会话标签页注册「费用」（会话作用域）。
  *
  * **不再注册可选主题、也不再覆盖产品令牌。** 早先这里有「奶油·昼 / 暮色·夜」两套
  * 主题注册与一层 overrideTokens 覆盖，等于替用户改掉整个产品界面的配色；皮肤已按
@@ -18,6 +20,7 @@ import { Dashboard } from './dashboard.js'
 import { installNotifier, notifyStore } from './Notifier.js'
 import { PeriodDot, panelEntryLayout, periodTitle, usePeriodPhase } from './period.js'
 import { COST_ENTRY_ID, COST_ENTRY_ORDER, SessionCost } from './SessionCost.js'
+import { SESSION_VIEW_ID, SessionCostView } from './sessionView.js'
 import { STYLES } from './theme.js'
 
 const { createElement: h, useEffect, useRef, useState } = React
@@ -27,6 +30,19 @@ const PACKAGE_ID = 'dsh-pixel-dashboard'
 
 /** 侧栏面板与主区共用同一个 id：侧栏按钮靠它选中主区面板。 */
 const PANEL_ID = 'pixel-usage'
+
+/**
+ * 会话标签页「费用」的排序与标签（契约第 4 节钉死）。
+ *
+ * `conversation.view` 是**会话作用域**的 list 槽位，一次只渲染一个视图，
+ * 现有占用者是 chat(0) / trajectory(10) / context(20) / fleet(30) / stats(40)。
+ * 取 50 使这一页排在它们**之后**：它是「回头看这笔钱花在哪」的地方，
+ * 不该抢在对话视图前面。
+ */
+const SESSION_VIEW_ORDER = 50
+
+/** 标签文字。用户可见文案不写 Markdown（强调用 <b>，这里不需要）。 */
+const SESSION_VIEW_LABEL = '费用'
 
 /**
  * 认「产品那一行」的宽度下限（px）。
@@ -313,5 +329,14 @@ export function apply(ctx) {
   slots.inject('conversation.composer.dock', () => slots.register(
     { name: 'conversation.composer.dock', id: COST_ENTRY_ID, order: COST_ENTRY_ORDER },
     SessionCost,
+  ))
+
+  // 会话标签页的「费用」：`conversation.view` 是**会话作用域**的 list 槽位，
+  // 一次只渲染一个视图（现有 chat / trajectory / context / fleet / stats）。
+  // order=50 落在它们之后：这一页是「读数」的地方，不该抢在对话前面。
+  // 与费用条同一个 id 是刻意的——它们是同一笔钱的摘要与明细，槽位不同、互不冲突。
+  slots.inject('conversation.view', () => slots.register(
+    { name: 'conversation.view', id: SESSION_VIEW_ID, order: SESSION_VIEW_ORDER, label: SESSION_VIEW_LABEL },
+    SessionCostView,
   ))
 }

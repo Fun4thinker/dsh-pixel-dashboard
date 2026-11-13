@@ -1,19 +1,28 @@
 /**
- * 通知与预警（宿主半边）：把会话的**结束事实**收成一份可在浏览器里轮询的小日志，
- * 并定义预警阈值配置的默认值与校验规则。
+ * 通知（宿主半边）：把会话的**结束事实**收成一份可在浏览器里轮询的小日志，
+ * 并定义通知开关配置的默认值与校验规则。
  *
  * ## 为什么这件事必须有一半在宿主做
  *
  * 浏览器**看不到后台会话的 `turn/end`**。客户端的会话事件窗口只对「已上台」
  * （当前选中）的会话分页装载，后台会话的窗口是空的——而那正是你最需要被提醒的场景。
  * 宿主对每个活着的会话都能收到 `session/event`，所以「完成 / 失败 / 中断」这一类
- * 判定只能在这里做。三件事的分工因此是：
+ * 判定只能在这里做。分工因此是：
  *
  *   - **任务完成 / 失败 / 中断** → 宿主侧判定（本模块），落进一个环形日志；
  *   - **需要授权 / 回答** → 浏览器侧直接读 `ctx.uiSession.pendingInteractions`，
- *     DSH 自己已经把待办发布到全局，不必再绕宿主一趟；
- *   - **余额 / 套餐阈值预警** → 浏览器侧算（它本来就在取余额与额度，复用同一条
- *     TTL 缓存即可），宿主只负责**存**这份配置。
+ *     DSH 自己已经把待办发布到全局，不必再绕宿主一趟。
+ *
+ * ## 余额与额度预警已整体取消（2.14.0）
+ *
+ * 用户明确要求**不要实时通知余额/额度**：那两件事是「想知道的时候去看一眼」，
+ * 而不是「必须被打断的事」。于是：
+ *
+ *   - 阈值配置（`warnBalance` / `warnQuotaPercent`）与本模块的归一化函数一起删除；
+ *   - 对应的两个开关（`notifyBalance` / `notifyQuota`）也删掉——开关留着却没有任何
+ *     阈值可设，只会让人以为功能坏了。
+ *
+ * 余额与额度改在**会话标签页**与**输入框费用条**里直接看（那是读数，不是提醒）。
  *
  * ## 宿主不落任何新文件
  *
@@ -58,12 +67,6 @@ export const MAX_AGENT_LABEL_CHARS = 80
 /** 环形日志容量。够覆盖「去开个会回来」的量级，又不会无限增长。 */
 export const JOURNAL_LIMIT = 100
 
-/** 阈值里允许出现的币种代码形状。 */
-const CURRENCY_RE = /^[A-Z][A-Z0-9]{1,7}$/
-
-/** 阈值允许的币种条目上限，防止异常请求把配置撑大。 */
-export const MAX_WARN_CURRENCIES = 12
-
 /**
  * 通知配置里的布尔字段清单。
  *
@@ -76,22 +79,17 @@ export const NOTIFY_BOOL_FIELDS = [
   'notifySubagent',
   'notifyError',
   'notifyInteraction',
-  'notifyBalance',
-  'notifyQuota',
   'notifyQuietFocused',
 ]
 
 /**
  * 通知配置默认值。
  *
- * 两个刻意的默认：
- *   - `warnBalance` 默认**空**。额度预警一上来就该安静，否则每个新用户都会被
- *     一条自己没设过的阈值提醒；面板上会说明「填一个数值才开始预警该币种」。
- *   - `warnQuotaPercent` 默认 90，与看板里既有的 `quotaTone()` 红色档一致——
- *     用户在进度条上看到的红色与收到提醒应当是同一件事。
- *
  * 冻结：`Preferences` 的默认值是**按引用**并入读结果的，任何一处误改都会污染
  * 默认值本身。冻结后误改会在严格模式下直接抛错，而不是静默改坏。
+ *
+ * 余额 / 额度阈值（`warnBalance` / `warnQuotaPercent`）**已整体删除**：那两项预警
+ * 不再是功能，余额改在会话标签页与费用条里直接看（见模块说明）。
  */
 export const NOTIFY_DEFAULTS = Object.freeze({
   notifyEnabled: true,
@@ -103,15 +101,11 @@ export const NOTIFY_DEFAULTS = Object.freeze({
   notifySubagent: true,
   notifyError: true,
   notifyInteraction: true,
-  notifyBalance: true,
-  notifyQuota: true,
   notifyQuietFocused: true,
   // 提示音：默认跟随系统（与浏览器/Windows 的默认行为一致，不改变现有观感）。
   // 其余取值由客户端解释，宿主只负责存一份干净的字符串。
   notifySound: 'system',
   notifySoundUrl: '',
-  warnBalance: Object.freeze({}),
-  warnQuotaPercent: 90,
 })
 
 /**
@@ -370,50 +364,15 @@ export class NotifyJournal {
 }
 
 /**
- * 归一化余额预警阈值表。
- *
- * 逐项校验而不是整体信任请求体：币种键必须像币种代码（这条正则同时挡掉
- * `__proto__` 这类会污染原型的键），数值必须是有限的非负数。**读不懂的条目
- * 直接丢弃**，而不是退化成 0——0 在这里意味着「余额一低于 0 就提醒」。
- * @param {unknown} value - 原始阈值表。
- * @returns {Record<string, number>} 干净的阈值表。
- */
-export function normalizeWarnBalance(value) {
-  const out = {}
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return out
-  let count = 0
-  for (const key of Object.keys(value)) {
-    if (count >= MAX_WARN_CURRENCIES) break
-    const currency = String(key).toUpperCase()
-    if (!CURRENCY_RE.test(currency)) continue
-    const amount = numberOrUndefined(value[key])
-    if (amount === undefined || amount < 0) continue
-    out[currency] = amount
-    count += 1
-  }
-  return out
-}
-
-/**
- * 归一化套餐额度预警百分比。
- *
- * 允许超过 100：官方额度用超时会给出 >100 的百分比，而「只在超限后提醒」
- * 是一个正当的用法。上限 1000 只是防呆。
- * @param {unknown} value - 原始值。
- * @returns {number} 0..1000 的阈值；0 表示关闭套餐预警。
- */
-export function normalizeQuotaPercent(value) {
-  if (value === null || value === undefined || value === '') return NOTIFY_DEFAULTS.warnQuotaPercent
-  const amount = Number(value)
-  if (!Number.isFinite(amount)) return NOTIFY_DEFAULTS.warnQuotaPercent
-  return Math.min(1000, Math.max(0, Math.round(amount * 10) / 10))
-}
-
-/**
  * 把任意（可能是残缺的、甚至是对手的）输入归一成一份完整配置。
  *
  * 始终返回**新对象**且只含已知键：调用方可以直接把它当补丁写盘，
  * 不必担心请求体里夹带的东西被存下来。
+ *
+ * 余额 / 额度阈值那几项**不再出现在结果里**：旧配置文件里残留的
+ * `warnBalance` / `warnQuotaPercent` / `notifyBalance` / `notifyQuota` 会在下一次
+ * 读取时被这里丢掉（白名单只认 {@link NOTIFY_BOOL_FIELDS} 与下面两个音效字段），
+ * 于是「配置文件里还留着上一版的阈值」不会让界面再冒出一个幽灵开关。
  * @param {unknown} raw - 原始输入，允许只给一部分字段。
  * @returns {object} 完整配置。
  */
@@ -423,8 +382,6 @@ export function normalizeNotify(raw) {
   for (const field of NOTIFY_BOOL_FIELDS) {
     out[field] = typeof source[field] === 'boolean' ? source[field] : NOTIFY_DEFAULTS[field]
   }
-  out.warnBalance = normalizeWarnBalance(source.warnBalance)
-  out.warnQuotaPercent = normalizeQuotaPercent(source.warnQuotaPercent)
   // 提示音两项是字符串而不是布尔，单独归一（见 normalizeSoundMode 的说明）。
   out.notifySound = normalizeSoundMode(source.notifySound)
   out.notifySoundUrl = normalizeSoundUrl(source.notifySoundUrl)

@@ -266,42 +266,647 @@ export const MODEL_RATES = {
   //
   // gpt-5.6-terra 是本机账本里**真实出现**的模型（provider: openai-codex），
   // 早先没有条目，它一直被按 Flash 兜底价标成「估算价」——数字有、只是错的。
+  // ⚠ 币种变更（v3）：OpenAI 官方价是**美元**，因此这里填**原价美元数**，
+  // 由 `currency: 'USD'` 标明，并在生效视图里按 `usdToCny()` 折成人民币参与合计。
+  // 早先这几个数被写死成「×7.2 的人民币值」——汇率一变就与用户自己的汇率不一致，
+  // 而且看不出那个 7.2 是从哪来的。现在汇率是用户可改的一项设置，界面会写「按汇率 X 折算」。
   'gpt-5.6-terra': {
     label: 'GPT-5.6 Terra',
     vendor: 'OpenAI',
     version: 'gpt-5.6-terra',
+    currency: 'USD',
     flat: true,
     contextWindow: 272_000,
     maxOutput: 128_000,
-    // $2.00 / $12.00 / cached $0.20
-    cacheHit: { peak: 1.44, idle: 1.44 },
-    cacheMiss: { peak: 14.4, idle: 14.4 },
-    output: { peak: 86.4, idle: 86.4 },
+    // 官方 Standard 短上下文：输入 $2.00 / 输出 $12.00 / 缓存命中 $0.20 / 30m 写入 $2.50
+    cacheHit: { peak: 0.2, idle: 0.2 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 12, idle: 12 },
+    cacheWrite: { peak: 2.5, idle: 2.5 },
   },
   'gpt-5.6-sol': {
     label: 'GPT-5.6 Sol',
     vendor: 'OpenAI',
     version: 'gpt-5.6-sol',
+    currency: 'USD',
     flat: true,
     contextWindow: 272_000,
     maxOutput: 128_000,
-    // $4.00 / $20.00 / cached $0.40
-    cacheHit: { peak: 2.88, idle: 2.88 },
-    cacheMiss: { peak: 28.8, idle: 28.8 },
-    output: { peak: 144, idle: 144 },
+    // $4.00 / $20.00 / 缓存命中 $0.40 / 30m 写入 $5.00（促销价，官方注明至 2026-11-30）
+    cacheHit: { peak: 0.4, idle: 0.4 },
+    cacheMiss: { peak: 4, idle: 4 },
+    output: { peak: 20, idle: 20 },
+    cacheWrite: { peak: 5, idle: 5 },
   },
   'gpt-5.6-luna': {
     label: 'GPT-5.6 Luna',
     vendor: 'OpenAI',
     version: 'gpt-5.6-luna',
+    currency: 'USD',
     flat: true,
     contextWindow: 272_000,
     maxOutput: 128_000,
-    // $0.20 / $1.20 / cached $0.02
-    cacheHit: { peak: 0.144, idle: 0.144 },
-    cacheMiss: { peak: 1.44, idle: 1.44 },
-    output: { peak: 8.64, idle: 8.64 },
+    // $0.20 / $1.20 / 缓存命中 $0.02 / 30m 写入 $0.25
+    cacheHit: { peak: 0.02, idle: 0.02 },
+    cacheMiss: { peak: 0.2, idle: 0.2 },
+    output: { peak: 1.2, idle: 1.2 },
+    cacheWrite: { peak: 0.25, idle: 0.25 },
   },
+  // ── OpenAI GPT-6 世代（美元 / 百万 token，Standard 档、短上下文 ≤272K）──────
+  // 来源：https://developers.openai.com/api/docs/pricing.md（截止 2026-11-13 抓取）
+  //
+  // 只录 **Standard 短上下文**：Batch 五折、Fast / Ultrafast 加价、长上下文
+  // （>272K）另有档位，而账本里没有这些标识，录进来只会让「按什么价算的」变成谜。
+  // 「30m write」是官方价目表里缓存写入那一档，与 DeepSeek 的 1.25× 规则不同源，
+  // 因此单独写成 `cacheWrite`（见 costOf）。
+  'gpt-6-astra': {
+    label: 'GPT-6 Astra',
+    vendor: 'OpenAI',
+    version: 'gpt-6-astra',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $10.00 / $50.00 / 缓存命中 $1.00 / 30m 写入 $12.50
+    cacheHit: { peak: 1, idle: 1 },
+    cacheMiss: { peak: 10, idle: 10 },
+    output: { peak: 50, idle: 50 },
+    cacheWrite: { peak: 12.5, idle: 12.5 },
+  },
+  'gpt-6.1-sol': {
+    label: 'GPT-6.1 Sol',
+    vendor: 'OpenAI',
+    version: 'gpt-6.1-sol',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $2.00 / $10.00 / 缓存命中 $0.10 / 30m 写入 $2.50
+    cacheHit: { peak: 0.1, idle: 0.1 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 10, idle: 10 },
+    cacheWrite: { peak: 2.5, idle: 2.5 },
+  },
+  'gpt-6.1-terra': {
+    label: 'GPT-6.1 Terra',
+    vendor: 'OpenAI',
+    version: 'gpt-6.1-terra',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $1.00 / $5.00 / 缓存命中 $0.05 / 30m 写入 $1.25
+    cacheHit: { peak: 0.05, idle: 0.05 },
+    cacheMiss: { peak: 1, idle: 1 },
+    output: { peak: 5, idle: 5 },
+    cacheWrite: { peak: 1.25, idle: 1.25 },
+  },
+  'gpt-6-luna': {
+    label: 'GPT-6 Luna',
+    vendor: 'OpenAI',
+    version: 'gpt-6-luna',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $0.10 / $0.50 / 缓存命中 $0.01 / 30m 写入 $0.125
+    cacheHit: { peak: 0.01, idle: 0.01 },
+    cacheMiss: { peak: 0.1, idle: 0.1 },
+    output: { peak: 0.5, idle: 0.5 },
+    cacheWrite: { peak: 0.125, idle: 0.125 },
+  },
+  'gpt-6-sol': {
+    label: 'GPT-6 Sol',
+    vendor: 'OpenAI',
+    version: 'gpt-6-sol',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $2.00 / $10.00 / 缓存命中 $0.20 / 30m 写入 $2.50
+    cacheHit: { peak: 0.2, idle: 0.2 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 10, idle: 10 },
+    cacheWrite: { peak: 2.5, idle: 2.5 },
+  },
+  'gpt-5.5': {
+    label: 'GPT-5.5',
+    vendor: 'OpenAI',
+    version: 'gpt-5.5',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $5.00 / $30.00 / 缓存命中 $0.50（官方未给 30m 写入价，写入按命中价的 12.5 倍估）
+    cacheHit: { peak: 0.5, idle: 0.5 },
+    cacheMiss: { peak: 5, idle: 5 },
+    output: { peak: 30, idle: 30 },
+  },
+  'gpt-5.4': {
+    label: 'GPT-5.4',
+    vendor: 'OpenAI',
+    version: 'gpt-5.4',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $2.50 / $15.00 / 缓存命中 $0.25
+    cacheHit: { peak: 0.25, idle: 0.25 },
+    cacheMiss: { peak: 2.5, idle: 2.5 },
+    output: { peak: 15, idle: 15 },
+  },
+  'gpt-5.4-mini': {
+    label: 'GPT-5.4 mini',
+    vendor: 'OpenAI',
+    version: 'gpt-5.4-mini',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $0.75 / $4.50 / 缓存命中 $0.075
+    cacheHit: { peak: 0.075, idle: 0.075 },
+    cacheMiss: { peak: 0.75, idle: 0.75 },
+    output: { peak: 4.5, idle: 4.5 },
+  },
+  'gpt-5.4-nano': {
+    label: 'GPT-5.4 nano',
+    vendor: 'OpenAI',
+    version: 'gpt-5.4-nano',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 272_000,
+    maxOutput: 128_000,
+    // $0.20 / $1.25 / 缓存命中 $0.02
+    cacheHit: { peak: 0.02, idle: 0.02 },
+    cacheMiss: { peak: 0.2, idle: 0.2 },
+    output: { peak: 1.25, idle: 1.25 },
+  },
+  // ── Anthropic Claude（美元 / 百万 token，官方 API 标准价）─────────────────
+  // 来源：https://docs.anthropic.com/en/docs/about-claude/pricing（2026-11-13 抓取）
+  //
+  // 官方表的口径是「Input / Output / 5m writes / 1h writes / Hits」：
+  //   cacheHit = Hits，cacheWrite = **5m writes**（1h 那一档更贵，账本里没有 TTL 信息，
+  //   因此统一按 5m 计——与 OpenAI 用 30m write 同一思路：取**最便宜的那一档写入**，
+  //   免得把「可能用了 1h」当成必然）。长上下文（>200K）另有加价档，未收录。
+  'claude-sonnet-5-5': {
+    label: 'Claude Sonnet 5.5',
+    vendor: 'Anthropic',
+    version: 'claude-sonnet-5-5',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // $2.00 / $10.00 / 5m 写入 $2.50 / 命中 $0.10
+    cacheHit: { peak: 0.1, idle: 0.1 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 10, idle: 10 },
+    cacheWrite: { peak: 2.5, idle: 2.5 },
+  },
+  'claude-opus-5-5': {
+    label: 'Claude Opus 5.5',
+    vendor: 'Anthropic',
+    version: 'claude-opus-5-5',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // $4.00 / $20.00 / 5m 写入 $5.00 / 命中 $0.20
+    cacheHit: { peak: 0.2, idle: 0.2 },
+    cacheMiss: { peak: 4, idle: 4 },
+    output: { peak: 20, idle: 20 },
+    cacheWrite: { peak: 5, idle: 5 },
+  },
+  'claude-haiku-5-5': {
+    label: 'Claude Haiku 5.5',
+    vendor: 'Anthropic',
+    version: 'claude-haiku-5-5',
+    currency: 'USD',
+    flat: true,
+    // 官方按**输入长度**分档（≤100K 与 >100K），账本里没有逐请求输入长度 →
+    // 只取最低档并标 tiered，界面注明「按最低档估算」。
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // ≤100K：$0.10 / $0.50 / 5m 写入 $0.125 / 命中 $0.01（>100K 是 5 倍价）
+    cacheHit: { peak: 0.01, idle: 0.01 },
+    cacheMiss: { peak: 0.1, idle: 0.1 },
+    output: { peak: 0.5, idle: 0.5 },
+    cacheWrite: { peak: 0.125, idle: 0.125 },
+  },
+  'claude-fable-5-2': {
+    label: 'Claude Fable 5.2',
+    vendor: 'Anthropic',
+    version: 'claude-fable-5-2',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // $8.00 / $40.00 / 5m 写入 $10.00 / 命中 $0.20
+    cacheHit: { peak: 0.2, idle: 0.2 },
+    cacheMiss: { peak: 8, idle: 8 },
+    output: { peak: 40, idle: 40 },
+    cacheWrite: { peak: 10, idle: 10 },
+  },
+  'claude-sonnet-4-6': {
+    label: 'Claude Sonnet 4.6',
+    vendor: 'Anthropic',
+    version: 'claude-sonnet-4-6',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // $3.00 / $15.00 / 5m 写入 $3.75 / 命中 $0.30
+    cacheHit: { peak: 0.3, idle: 0.3 },
+    cacheMiss: { peak: 3, idle: 3 },
+    output: { peak: 15, idle: 15 },
+    cacheWrite: { peak: 3.75, idle: 3.75 },
+  },
+  'claude-sonnet-4-5': {
+    label: 'Claude Sonnet 4.5',
+    vendor: 'Anthropic',
+    version: 'claude-sonnet-4-5',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // $3.00 / $15.00 / 5m 写入 $3.75 / 命中 $0.30
+    cacheHit: { peak: 0.3, idle: 0.3 },
+    cacheMiss: { peak: 3, idle: 3 },
+    output: { peak: 15, idle: 15 },
+    cacheWrite: { peak: 3.75, idle: 3.75 },
+  },
+  'claude-opus-4-6': {
+    label: 'Claude Opus 4.6',
+    vendor: 'Anthropic',
+    version: 'claude-opus-4-6',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // $5.00 / $25.00 / 5m 写入 $6.25 / 命中 $0.50
+    cacheHit: { peak: 0.5, idle: 0.5 },
+    cacheMiss: { peak: 5, idle: 5 },
+    output: { peak: 25, idle: 25 },
+    cacheWrite: { peak: 6.25, idle: 6.25 },
+  },
+  'claude-opus-4-5': {
+    label: 'Claude Opus 4.5',
+    vendor: 'Anthropic',
+    version: 'claude-opus-4-5',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // $5.00 / $25.00 / 5m 写入 $6.25 / 命中 $0.50
+    cacheHit: { peak: 0.5, idle: 0.5 },
+    cacheMiss: { peak: 5, idle: 5 },
+    output: { peak: 25, idle: 25 },
+    cacheWrite: { peak: 6.25, idle: 6.25 },
+  },
+  // ── Google Gemini（美元 / 百万 token，Gemini Developer API 标准价）──────────
+  // 来源：https://ai.google.dev/gemini-api/docs/pricing（2026-11-13 抓取）
+  //
+  // 注意两处**限时价**，官方页写明到期后翻倍，这里按「当前实际扣费」记：
+  //   gemini-4-carbon / gemini-4-argon：$2/$10/$0.10 至 2026-11-30，之后 $4/$20/$0.20
+  //   gemini-3.8-flash：$0.75/$3.75/$0.075 至 2026-12-31，之后 $1.50/$7.50/$0.15
+  // 取当期折后价与千问 qwen3.7-plus 同一口径（用户当前账单就是按它扣的）。
+  'gemini-4-carbon': {
+    label: 'Gemini 4 Carbon',
+    vendor: 'Google',
+    version: 'gemini-4-carbon',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 65_536,
+    // 限时价至 2026-11-30：$2.00 / $10.00 / 缓存命中 $0.10
+    cacheHit: { peak: 0.1, idle: 0.1 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 10, idle: 10 },
+  },
+  'gemini-4-argon': {
+    label: 'Gemini 4 Argon',
+    vendor: 'Google',
+    version: 'gemini-4-argon',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 65_536,
+    // 限时价至 2026-11-30：$2.00 / $10.00 / 缓存命中 $0.10
+    cacheHit: { peak: 0.1, idle: 0.1 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 10, idle: 10 },
+  },
+  'gemini-4-hydrogen': {
+    label: 'Gemini 4 Hydrogen',
+    vendor: 'Google',
+    version: 'gemini-4-hydrogen',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 65_536,
+    // $1.50 / $7.50 / 缓存命中 $0.075
+    cacheHit: { peak: 0.075, idle: 0.075 },
+    cacheMiss: { peak: 1.5, idle: 1.5 },
+    output: { peak: 7.5, idle: 7.5 },
+  },
+  'gemini-3.8-flash': {
+    label: 'Gemini 3.8 Flash',
+    vendor: 'Google',
+    version: 'gemini-3.8-flash',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 65_536,
+    // 限时价至 2026-12-31：$0.75 / $3.75 / 缓存命中 $0.075
+    cacheHit: { peak: 0.075, idle: 0.075 },
+    cacheMiss: { peak: 0.75, idle: 0.75 },
+    output: { peak: 3.75, idle: 3.75 },
+  },
+  'gemini-3.1-pro-preview': {
+    label: 'Gemini 3.1 Pro',
+    vendor: 'Google',
+    version: 'gemini-3.1-pro-preview',
+    currency: 'USD',
+    flat: true,
+    // 官方按 200K 输入分档，只有一档给了价（≤200K），按最低档记并标 tiered
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 65_536,
+    // ≤200K：$2.00 / $12.00 / 缓存命中 $0.20
+    cacheHit: { peak: 0.2, idle: 0.2 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 12, idle: 12 },
+  },
+  'gemini-2.5-pro': {
+    label: 'Gemini 2.5 Pro',
+    vendor: 'Google',
+    version: 'gemini-2.5-pro',
+    currency: 'USD',
+    flat: true,
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 65_536,
+    // ≤200K：$1.25 / $10.00 / 缓存命中 $0.125
+    cacheHit: { peak: 0.125, idle: 0.125 },
+    cacheMiss: { peak: 1.25, idle: 1.25 },
+    output: { peak: 10, idle: 10 },
+  },
+  'gemini-2.5-flash': {
+    label: 'Gemini 2.5 Flash',
+    vendor: 'Google',
+    version: 'gemini-2.5-flash',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 65_536,
+    // $0.30 / $2.50 / 缓存命中 $0.03（音频输入另有价，账本里分不出来，不单列）
+    cacheHit: { peak: 0.03, idle: 0.03 },
+    cacheMiss: { peak: 0.3, idle: 0.3 },
+    output: { peak: 2.5, idle: 2.5 },
+  },
+  // ── xAI Grok（美元 / 百万 token）────────────────────────────────────
+  // 来源：https://x.ai/api（2026-11-13 抓取；文档站把价目放在 Models 页，
+  // 该页由前端渲染，抓下来的 HTML 里是 `promptTextTokenPrice` 之类的原始字段，
+  // 单位不是美元本身——因此这里只收录**渲染文本里能直接读到**的那一条旗舰价）
+  'grok-4.7': {
+    label: 'Grok 4.7',
+    vendor: 'xAI',
+    version: 'grok-4.7',
+    currency: 'USD',
+    flat: true,
+    contextWindow: 500_000,
+    maxOutput: 128_000,
+    // $2.00 输入 / $6.00 输出；缓存命中 $0.50（官方价目字段为输入价的 25%）
+    cacheHit: { peak: 0.5, idle: 0.5 },
+    cacheMiss: { peak: 2, idle: 2 },
+    output: { peak: 6, idle: 6 },
+  },
+  // ── MiniMax（元 / 百万 token，官方定价概览页）────────────────────────
+  // 来源：https://platform.minimaxi.com/document/price（2026-11-13 抓取）
+  'minimax-m3.1-flash': {
+    label: 'MiniMax M3.1 Flash',
+    vendor: 'MiniMax',
+    version: 'MiniMax-M3.1-Flash',
+    flat: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // ¥1.00 输入 / ¥4.00 输出 / 缓存读取 ¥0.10
+    cacheHit: { peak: 0.1, idle: 0.1 },
+    cacheMiss: { peak: 1, idle: 1 },
+    output: { peak: 4, idle: 4 },
+  },
+  'minimax-m3': {
+    label: 'MiniMax M3',
+    vendor: 'MiniMax',
+    version: 'MiniMax-M3',
+    flat: true,
+    // 官方按输入长度分档（≤512K / >512K），且标注「永久五折」：
+    // 这里取 ≤512K 的**折后价**（当前实际扣费），并标 tiered。
+    tiered: true,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    // ≤512K 折后：¥2.10 / ¥8.40 / 缓存读取 ¥0.42
+    cacheHit: { peak: 0.42, idle: 0.42 },
+    cacheMiss: { peak: 2.1, idle: 2.1 },
+    output: { peak: 8.4, idle: 8.4 },
+  },
+}
+
+/**
+ * 各家**官方定价页**。价目必须有出处——凭记忆写的价在界面上看不出来，只是错的。
+ *
+ * 抓取与核对的时间见 {@link RATES_AS_OF}；每次改价都要同时改这两处。
+ * 抓不到官方价的厂商（本轮：Kimi 的价格表由前端渲染、豆包/火山方舟整站要 JS、
+ * Mistral 的 API 价目页未给出逐模型表）**不收录**，宁可让它们继续显示「估算价」，
+ * 也不写一个猜的数字——那正是本项目最忌惮的失败形态。
+ */
+const VENDOR_SOURCES = {
+  DeepSeek: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing/',
+  智谱: 'https://docs.bigmodel.cn/cn/guide/start/pricing',
+  千问: 'https://www.alibabacloud.com/help/zh/model-studio/model-pricing',
+  OpenAI: 'https://developers.openai.com/api/docs/pricing.md',
+  Anthropic: 'https://docs.anthropic.com/en/docs/about-claude/pricing',
+  Google: 'https://ai.google.dev/gemini-api/docs/pricing',
+  xAI: 'https://x.ai/api',
+  MiniMax: 'https://platform.minimaxi.com/document/price',
+}
+
+/** 本轮价目的采集 / 核对截止月份（逐条可用 `asOf` 覆盖，如限时价）。 */
+export const RATES_AS_OF = '2026-11'
+
+/**
+ * 给内置价目补齐 `currency` / `asOf` / `source`。
+ *
+ * 逐条重复写三个出处字段既啰嗦又容易漏，而「哪一条没有出处」这件事必须**一眼可查**：
+ * 缺了就由厂商表兜着，界面上永远能点开原始定价页。
+ * @param {object} table - 价目表（原地修改）。
+ * @returns {void}
+ */
+function stampRateProvenance(table) {
+  for (const rates of Object.values(table)) {
+    if (rates.currency === undefined) rates.currency = 'CNY'
+    if (rates.asOf === undefined) rates.asOf = RATES_AS_OF
+    if (rates.source === undefined) rates.source = VENDOR_SOURCES[rates.vendor] ?? ''
+  }
+}
+
+stampRateProvenance(MODEL_RATES)
+
+/**
+ * USD → CNY 的默认汇率。
+ *
+ * 为什么要它：官方价目只有一部分是人民币（DeepSeek / 智谱 / 千问 / MiniMax），
+ * 其余（OpenAI / Anthropic / Google / xAI）官方**只给美元**。看板要把它们加在
+ * 一起就必须换汇，而汇率只能由用户定——写死 7.2 的后果是数字对不上他自己的账单，
+ * 且界面上看不出那个 7.2 从哪来。
+ */
+export const DEFAULT_USD_TO_CNY = 7.3
+
+/** 生效中的汇率（用户可改，见 {@link setUsdToCny}）。 */
+let USD_TO_CNY = DEFAULT_USD_TO_CNY
+
+/**
+ * 当前生效的 USD → CNY 汇率。
+ * @returns {number} 汇率。
+ */
+export function usdToCny() {
+  return USD_TO_CNY
+}
+
+/**
+ * 设置汇率并重建生效视图。
+ *
+ * 非法值（非数字 / ≤0）**回落到默认值**而不是保留旧值：汇率是「用户以为的那一个」，
+ * 静默沿用旧值会让他以为改成功了。调用方（设置界面）在保存前已做校验并会报错，
+ * 这里只是最后一道防线。
+ * @param {number|string} value - 新汇率。
+ * @returns {number} 实际生效的汇率。
+ */
+export function setUsdToCny(value) {
+  const amount = Number(value)
+  const next = Number.isFinite(amount) && amount > 0 ? amount : DEFAULT_USD_TO_CNY
+  if (next !== USD_TO_CNY) {
+    USD_TO_CNY = next
+    rebuildRateViews()
+  }
+  return USD_TO_CNY
+}
+
+/**
+ * 提供商倍率（**中转加价**）：`provider 路由名 → 倍数`。
+ *
+ * 为什么要有：用户常常经由中转站调用官方模型，那家在官方价上加价（如 1.2 倍）。
+ * 官价估算回答的是「如果走官方要多少钱」，加上这一层才答得上「我实际被扣了多少」。
+ * 默认 1（不改变任何数字）；只影响**金额**，不影响用量与归属。
+ */
+let MARKUP_VIEW = Object.freeze({})
+
+/**
+ * 生效中的提供商倍率表（只读用途）。
+ * @returns {Record<string, number>} 提供商路由名 → 倍数。
+ */
+export function activeMarkup() {
+  return MARKUP_VIEW
+}
+
+/**
+ * 取某个提供商的倍率。
+ *
+ * 认不出来（没配过 / 值非法）一律返回 **1**：倍率是「用户额外声明的信息」，
+ * 缺省就该是「不加价」，而不是猜一个。
+ * @param {string} provider - 提供商路由名（`commandcode` / `workbuddy-cn` …）。
+ * @returns {number} 倍数（≥1 的实数；用户也可以填 <1 表示折扣）。
+ */
+export function markupOf(provider) {
+  const name = String(provider ?? '').trim()
+  if (name === '') return 1
+  const value = MARKUP_VIEW[name]
+  return Number.isFinite(value) && value > 0 ? value : 1
+}
+
+/**
+ * 设置提供商倍率。
+ * @param {Record<string, number>|undefined} map - 提供商 → 倍数。
+ * @returns {void}
+ */
+export function setMarkup(map) {
+  const next = {}
+  for (const [provider, value] of Object.entries(map ?? {})) {
+    const name = String(provider ?? '').trim()
+    const amount = Number(value)
+    if (name === '' || !Number.isFinite(amount) || amount <= 0) continue
+    next[name] = amount
+  }
+  MARKUP_VIEW = Object.freeze(next)
+}
+
+/** 金额保留 6 位小数：换汇会产生 14.599999999 这种尾巴，累加后会与明细差一分钱。 */
+function money(value) {
+  const amount = Number(value)
+  return Number.isFinite(amount) ? Math.round(amount * 1e6) / 1e6 : 0
+}
+
+/**
+ * 把一个价档对按汇率换算。
+ * @param {{peak:number,idle:number}|undefined} pair - 原币价档。
+ * @param {number} fx - 汇率。
+ * @returns {{peak:number,idle:number}|undefined} 人民币价档。
+ */
+function convertPair(pair, fx) {
+  if (pair === null || pair === undefined) return pair
+  return { peak: money(pair.peak * fx), idle: money(pair.idle * fx) }
+}
+
+/**
+ * 把一条价目折成**人民币**（计价与展示的唯一口径）。
+ *
+ * 三条设计约束：
+ *   1) **人民币条目原样返回同一个对象**——`pricingOf(未知模型).rates` 与
+ *      `MODEL_RATES['deepseek-flash']` 是同一个引用，闸门按引用钉死过这件事；
+ *      而且 30 多条人民币条目没必要每次都复制一遍。
+ *   2) **原币数字不丢**：折算后的条目带 `native`（原币价档）与 `sourceCurrency`，
+ *      界面才能如实写「官方 $2.00 / 百万 token，按汇率 7.3 折算 ¥14.60」。
+ *   3) **只折算、不改标签**：label / vendor / flat / tiered / asOf / source 原样带过去。
+ * @param {object} rates - 价目条目。
+ * @param {number} fx - USD → CNY 汇率。
+ * @returns {object} 人民币条目。
+ */
+export function cnyRates(rates, fx = USD_TO_CNY) {
+  const currency = typeof rates?.currency === 'string' ? rates.currency : 'CNY'
+  if (currency === 'CNY' || currency === undefined) return rates
+  const converted = {
+    ...rates,
+    currency: 'CNY',
+    sourceCurrency: currency,
+    fx,
+    native: {
+      currency,
+      cacheHit: rates.cacheHit,
+      cacheMiss: rates.cacheMiss,
+      output: rates.output,
+      ...(rates.cacheWrite === undefined ? {} : { cacheWrite: rates.cacheWrite }),
+    },
+    cacheHit: convertPair(rates.cacheHit, fx),
+    cacheMiss: convertPair(rates.cacheMiss, fx),
+    output: convertPair(rates.output, fx),
+  }
+  if (rates.cacheWrite !== undefined) converted.cacheWrite = convertPair(rates.cacheWrite, fx)
+  return converted
+}
+
+/**
+ * 把一整张价目表折成人民币视图（自定义条目也参与折算）。
+ * @param {object} table - 原币价目表。
+ * @param {number} fx - 汇率。
+ * @returns {Record<string, object>} 人民币价目表。
+ */
+export function cnyRateTable(table, fx = USD_TO_CNY) {
+  const out = {}
+  for (const [key, rates] of Object.entries(table ?? {})) {
+    if (rates === null || typeof rates !== 'object') continue
+    out[key] = cnyRates(rates, fx)
+  }
+  return out
 }
 
 /**
@@ -371,6 +976,21 @@ export const MODEL_ALIASES = {
   'openai/gpt-5.6-sol': 'gpt-5.6-sol',
   'openai/gpt-5.6-luna': 'gpt-5.6-luna',
   'gpt-5.6-terra-2026': 'gpt-5.6-terra',
+  // ── 其余厂商：只加「规范化之后仍对不上」的那些写法 ─────────────────
+  //
+  // 大多数写法由 normalizeModel 的三层（小写 / `提供商/` 前缀 / canonicalOf）
+  // 与部署后缀那一步自动覆盖，不必在这里逐条罗列：
+  //   `anthropic/claude-sonnet-5-5`、`claude-sonnet-5.5`、`Claude Sonnet 5.5`
+  //   都会落到 `claude-sonnet-5-5`；`google/gemini-3.8-flash` 同理。
+  // 这里只列**同一模型的不同代号**——那种对应关系机器猜不出来，必须显式写。
+  'claude-3-5-sonnet': 'claude-sonnet-4-5',
+  'claude-3-5-sonnet-latest': 'claude-sonnet-4-5',
+  // Gemini 的官方 id 有时带 `-preview` 之外的日期后缀，而价目表只收正式 id：
+  // 这类「同一模型的预览版」按正式版计价，免得整段用量落兜底。
+  'gemini-3.1-pro': 'gemini-3.1-pro-preview',
+  // MiniMax 的对外叫法与 id 大小写不同（`MiniMax-M3` / `minimax-m3`），
+  // 规范化已能覆盖；这里补的是文档里出现过的带档位写法。
+  'minimax-m3.1': 'minimax-m3.1-flash',
 }
 
 /**
@@ -569,20 +1189,55 @@ buildFamilyIndex(MODEL_RATES)
 export const CANONICAL_COLLISIONS = Object.freeze([...BUILTIN_INDEX.collisions])
 
 /**
- * 当前生效的价目表：内置表 + 用户补充的条目（见 {@link setCustomRates}）。
+ * 当前生效的价目表：内置表 + 用户补充的条目（见 {@link setCustomRates}），
+ * **并且已经折成人民币**。
  *
  * 之所以要一层「视图」而不是直接用 MODEL_RATES：用户想给一个价目表里没有的模型
  * （比如某个新发布的模型）补一个官方价，不该改源码、更不该重新构建。因此运行时
  * 可换一整套合并后的表，而 MODEL_RATES 始终是那份**内置**事实，供测试与
  * 「哪些是内置」的判断使用。
+ *
+ * 「折成人民币」是同一次重建里做的事：USD 条目必须换汇后才能与人民币条目相加，
+ * 而汇率是可变的（{@link setUsdToCny}）。把它留在 `costOf` / 每个界面上各做一次，
+ * 就会出现「合计按一个汇率、明细按另一个」——那种差异在界面上完全看不出来。
  */
 let RATES_VIEW = MODEL_RATES
 let ALIASES_VIEW = MODEL_ALIASES
 let INDEX_VIEW = BUILTIN_INDEX
 /** 用户补充的模型键（用于界面标注「自定义价」）。 */
 let CUSTOM_KEYS = new Set()
+/** 上一次应用的**原币**自定义条目：汇率变化时要用它重建视图。 */
+let CUSTOM_INPUT = {}
 
-/** 当前生效的价目表（只读用途）。 */
+/**
+ * 重建生效视图（内置 + 自定义 → 合并且折成人民币）。
+ *
+ * 归一索引与族索引必须**一起**重建：用户新加的键要能被 `normalizeModel` 认出来，
+ * 否则那份价永远落不到任何一行上——界面上表现为「我明明配了价，金额还是估算」。
+ * @returns {void}
+ */
+function rebuildRateViews() {
+  const entries = Object.entries(CUSTOM_INPUT)
+  const merged = entries.length === 0 ? MODEL_RATES : { ...MODEL_RATES, ...CUSTOM_INPUT }
+  // 外币条目必须换汇后才能与人民币条目相加。人民币条目在 `cnyRates()` 里**原样返回
+  // 同一个对象**，因此 `RATES_VIEW['deepseek-flash']` 与 `MODEL_RATES['deepseek-flash']`
+  // 仍是同一个引用——闸门按引用钉过这条，界面也靠它区分「内置」与「自定义」。
+  const hasForeign = Object.values(merged).some((rate) => rate?.currency === 'USD')
+  RATES_VIEW = hasForeign ? cnyRateTable(merged, USD_TO_CNY) : merged
+  ALIASES_VIEW = MODEL_ALIASES
+  CUSTOM_KEYS = new Set(entries.map(([key]) => key))
+  // 内置索引与用户条目一起重建：两者可能规范化后撞车（如自定义 'glm-53' 撞上
+  // 内置 'glm-5.3'），此时新索引会把这个形式删掉——归一认不出，而不是按错价。
+  INDEX_VIEW = entries.length === 0 ? BUILTIN_INDEX : buildIndex(merged, MODEL_ALIASES)
+  // 族索引同理：用户补的价要能接住带部署后缀的路由名，
+  // 否则「我明明配了 glm-5.3-flash，`...-local` 却还是估算价」。
+  buildFamilyIndex(merged)
+}
+
+/**
+ * 当前生效的价目表（只读用途，**已折成人民币**）。
+ * @returns {Record<string, object>} 价目表。
+ */
 export function activeRates() { return RATES_VIEW }
 
 /** 该模型键的价是否来自用户补充（而不是内置表）。 */
@@ -638,10 +1293,28 @@ export function validateCustomRates(input) {
       if (peak === undefined || idle === undefined) return undefined
       return { peak, idle }
     }
-    const cacheHit = pick('cacheHit')
+    // 缓存命中价**可以整项省略**：很多模型（或用户自己配的）没有缓存优惠，
+    // 逼着填一个 0 只会增加出错机会。省略即按 0 计；写了但值不合法仍然报错。
+    // 另外两档（未命中 / 输出）必须写：少了它们，这条价目没有任何金额含义。
+    const cacheHit = entry.cacheHit === undefined ? { peak: 0, idle: 0 } : pick('cacheHit')
     const cacheMiss = pick('cacheMiss')
     const output = pick('output')
     if (cacheHit === undefined || cacheMiss === undefined || output === undefined) continue
+    /**
+     * 币种：可写 `"currency": "USD"` 表示这几个数字是**美元**，读取时按当前汇率折算。
+     * 认不出的币种**明确报错**，而不是当成人民币——那会把 $2 当 ¥2 算，差 7 倍多。
+     */
+    let currency = 'CNY'
+    if (entry.currency !== undefined) {
+      const declared = String(entry.currency).trim().toUpperCase()
+      if (declared === 'CNY' || declared === 'USD') currency = declared
+      else {
+        errors.push(`${where} 的 currency 只能是 CNY 或 USD，实际 ${JSON.stringify(entry.currency)}`)
+        continue
+      }
+    }
+    const cacheWrite = entry.cacheWrite === undefined ? undefined : pick('cacheWrite')
+    if (entry.cacheWrite !== undefined && cacheWrite === undefined) continue
     const isFlat = cacheHit.peak === cacheHit.idle
       && cacheMiss.peak === cacheMiss.idle
       && output.peak === output.idle
@@ -649,11 +1322,15 @@ export function validateCustomRates(input) {
       label: typeof entry.label === 'string' && entry.label !== '' ? entry.label : key,
       vendor: typeof entry.vendor === 'string' ? entry.vendor : '自定义',
       version: typeof entry.version === 'string' ? entry.version : '',
+      currency,
       flat: isFlat,
       ...(entry.tiered === true ? { tiered: true } : {}),
+      asOf: typeof entry.asOf === 'string' && entry.asOf !== '' ? entry.asOf : '自定义',
+      ...(typeof entry.source === 'string' && entry.source !== '' ? { source: entry.source } : {}),
       cacheHit,
       cacheMiss,
       output,
+      ...(cacheWrite === undefined ? {} : { cacheWrite }),
     }
   }
   return { rates, errors }
@@ -668,26 +1345,16 @@ export function validateCustomRates(input) {
  * @returns {void}
  */
 export function setCustomRates(customRates) {
-  const entries = Object.entries(customRates ?? {})
-  if (entries.length === 0) {
-    RATES_VIEW = MODEL_RATES
-    ALIASES_VIEW = MODEL_ALIASES
-    INDEX_VIEW = BUILTIN_INDEX
-    buildFamilyIndex(MODEL_RATES)
-    CUSTOM_KEYS = new Set()
-    return
+  CUSTOM_INPUT = {}
+  for (const [key, entry] of Object.entries(customRates ?? {})) {
+    if (entry !== null && typeof entry === 'object' && !Array.isArray(entry)) CUSTOM_INPUT[key] = entry
   }
-  const merged = { ...MODEL_RATES, ...customRates }
-  RATES_VIEW = merged
-  ALIASES_VIEW = MODEL_ALIASES
-  CUSTOM_KEYS = new Set(entries.map(([key]) => key))
-  // 内置索引与用户条目一起重建：两者可能规范化后撞车（如自定义 'glm-53' 撞上
-  // 内置 'glm-5.3'），此时新索引会把这个形式删掉——归一认不出，而不是按错价。
-  INDEX_VIEW = buildIndex(merged, MODEL_ALIASES)
-  // 族索引同理：用户补的价要能接住带部署后缀的路由名，
-  // 否则「我明明配了 glm-5.3-flash，`...-local` 却还是估算价」。
-  buildFamilyIndex(merged)
+  rebuildRateViews()
 }
+
+// 模块初始化时先建一次视图：内置表里已经有 `currency: 'USD'` 的条目，
+// 不折一次的话 `activeRates()` / `ratesOf()` 会把美元数字直接当人民币用。
+rebuildRateViews()
 
 /**
  * 把模型名归一：旧名与带日期的版本名折叠到价目表里的键。
@@ -814,18 +1481,33 @@ export function pricingOf(model) {
       key,
       label: FALLBACK_RATES.label,
       vendor: FALLBACK_RATES.vendor ?? '未知',
+      // 兜底价永远是人民币（FALLBACK 是 Flash），因此这里不带外币痕迹。
+      currency: 'CNY',
     }
   }
   return {
     rates,
     known: true,
     tiered: rates.tiered === true,
+    // 契约（v3）里这一项叫 `tierNote`，而内部一直用 `tiered: true` 表达（闸门按它断言）。
+    // 两者都给：内部约定不动，交付形状与契约对齐——界面不必猜该读哪一个。
+    ...(rates.tiered === true ? { tierNote: '按最低档' } : {}),
     // 这一份价来自用户补充的价目文件，而不是内置表：界面据此标注，
     // 免得「自定义价」看起来像官方内置口径。
     custom: CUSTOM_KEYS.has(key),
     key,
     label: rates.label,
     vendor: rates.vendor ?? '',
+    // 交付给界面的价一律是人民币；`currency` 恒为 CNY，而 `sourceCurrency`
+    // 与 `native` 说明它原来是美元、按哪个汇率折过来的（界面据此写「按汇率 X 折算」）。
+    currency: 'CNY',
+    ...(rates.sourceCurrency === undefined ? {} : {
+      sourceCurrency: rates.sourceCurrency,
+      fx: rates.fx,
+      native: rates.native,
+    }),
+    asOf: rates.asOf,
+    source: rates.source,
   }
 }
 
@@ -1100,26 +1782,33 @@ export function periodState(epochMs, timeZone = DEFAULT_TIMEZONE) {
  * 口径正确性的关键：历史用量必须按它当时处于高峰还是空闲来计价，
  * 不能把整段用量套同一个折扣。
  *
- * ## 缓存写入按 1.25 × 命中价计（差点一直漏掉）
- *
- * 官方对 DeepSeek 的缓存写入口径是「按标准输入价的 1.25 倍」；而价目表里
- * `cacheHit` 是**命中**价（标准输入的 10%）。因此写入不能直接乘 `cacheHit`，
- * 折成命中价的倍率是 12.5 倍——用 12.5 × cacheHit 来表达。
+ * ## 缓存写入（cacheWrite）不能漏，也不能一律按 12.5 × 命中价
  *
  * 早先这里**完全没算 cacheWrite**：长会话里写缓存的那部分成本被静默漏掉，
- * 金额偏小且不报错——正是本项目最忌讳的那类错。现在显式计入。
+ * 金额偏小且不报错——正是本项目最忌讳的那类错。补上时用的是 DeepSeek 的口径
+ * （写入 = 1.25 × 标准输入价 = 12.5 × 命中价，因为 DeepSeek 命中价恰是输入价的 10%）。
+ *
+ * 但那个 12.5 倍是 **DeepSeek 的关系，不是通用关系**：Anthropic 的命中价是输入价的
+ * 5%（12.5 倍会把写入算成一半），OpenAI 的命中价因型号而异。因此价目条目可以显式
+ * 给出 `cacheWrite`（官方「5m writes」/「30m write」那一档），**有就用它**，
+ * 没有才退回 DeepSeek 那条 12.5 倍的口径。这条退路只对 DeepSeek 与千问成立
+ * （千问官方口径就是「命中 = 输入 10%、写入 = 输入 125%」）。
+ *
  * @param {{cacheHit:number,cacheMiss:number,cacheWrite?:number,output:number}} usage - token 数。
- * @param {object} rates - 价目表条目。
+ * @param {object} rates - 价目表条目（**人民币**；外币已在视图里折算）。
  * @param {'peak'|'idle'} period - 该笔用量所属时段。
  * @returns {number} 金额（元）。
  */
 export function costOf(usage, rates, period) {
   const million = 1_000_000
+  const written = Number(usage.cacheWrite ?? 0) / million
+  const writeRate = rates.cacheWrite === undefined
+    ? rates.cacheHit[period] * 12.5
+    : rates.cacheWrite[period]
   return (
     (Number(usage.cacheHit ?? 0) / million) * rates.cacheHit[period]
     + (Number(usage.cacheMiss ?? 0) / million) * rates.cacheMiss[period]
-    // 缓存写入 = 1.25 × 标准输入价；cacheHit 是 0.1 × 标准输入价 → 12.5 倍。
-    + (Number(usage.cacheWrite ?? 0) / million) * rates.cacheHit[period] * 12.5
+    + written * writeRate
     + (Number(usage.output ?? 0) / million) * rates.output[period]
   )
 }
