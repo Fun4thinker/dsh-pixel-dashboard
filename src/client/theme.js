@@ -416,17 +416,29 @@ const DASHBOARD = `
 .px-user:hover { box-shadow: var(--px-elev-2); border-color: var(--px-line-2); }
 .px-user-avatar {
   flex: none;
+  position: relative;
   width: 34px; height: 34px;
   display: grid; place-items: center;
   border-radius: 10px;
+  overflow: hidden;
   background: var(--px-whale-soft);
 }
-/* 未登录：头像底板退成中性层，鲸鱼转灰 —— 它是**占位**，不该像已登录的某人 */
+/* 真实头像：铺满底板，裁成同一圆角；失败时（img 被 display:none）下面的鲸鱼露出来。 */
+.px-user-avatar > img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+}
+/* 未登录：底板退成中性层让「这是占位」可读，但**鲸鱼保持彩色**（用户要求不置灰）。 */
 .px-user.off .px-user-avatar { background: var(--px-layer-2); }
 .px-whale { display: block; }
-.px-whale-muted { opacity: 0.5; filter: grayscale(1); }
 .px-user-main { display: grid; gap: 2px; min-width: 0; flex: 1 1 auto; }
-.px-user-name { font-size: 11px; font-weight: 560; color: var(--px-muted); letter-spacing: 0.06em; }
+.px-user-name {
+  font-size: 11px; font-weight: 560; color: var(--px-muted); letter-spacing: 0.06em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.px-user-contact { font-size: 10.5px; color: var(--px-muted); letter-spacing: 0.02em; }
 .px-user-amounts { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .px-user-amount { display: inline-flex; align-items: baseline; gap: 3px; font-variant-numeric: tabular-nums; }
 .px-user-amount > b { font-size: 24px; font-weight: 650; letter-spacing: -0.01em; color: var(--px-ink); line-height: 1.1; }

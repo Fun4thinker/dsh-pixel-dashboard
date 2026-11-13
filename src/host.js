@@ -1983,6 +1983,10 @@ export default {
     const balance = new BalanceService({
       credentials: () => ctx.get('credentials'),
       settings: () => ctx.get('settings'),
+      // 「当前登录的 DeepSeek 账号」：头像 / 昵称 / 余额 / 官方链接都从它来。
+      // 惰性读取（旧宿主、web 端未登录时它是 undefined），缺失时 BalanceService
+      // 自动退回按 API Key 查 /user/balance 的老路径。
+      account: () => ctx.get('deepseekAccount'),
       prefs,
     })
 

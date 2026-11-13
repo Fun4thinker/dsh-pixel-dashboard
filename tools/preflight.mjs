@@ -994,9 +994,12 @@ assert.deepEqual(
 // 「一定要给出一个可解释的原因」＋「绝不能把凭据本身漏出来」。
 const PLAN_FAILURE_REASONS = ['no-key', 'rejected', 'request-failed', 'unsupported']
 for (const provider of plansPayload.providers) {
-  assert.equal(provider.ok, false, `${provider.id} 未配 Key 时不应报成功`)
+  // **不断言 ok === false。** 这台机器上 codex / opencode 的登录态文件真的存在，
+  // 网络通的时候它们取数会**成功**（ok: true）——那是真实数据，不是缺陷。
+  // 断言必须与网络状态解耦，否则「有网 / 没网」会给出两种闸门结果。
+  assert.equal(typeof provider.ok, 'boolean', `${provider.id} 应给出 ok 布尔值`)
   assert.ok(
-    PLAN_FAILURE_REASONS.includes(provider.reason),
+    provider.ok === true || PLAN_FAILURE_REASONS.includes(provider.reason),
     `${provider.id} 的失败原因应可解释（${PLAN_FAILURE_REASONS.join(' / ')}），实际 ${provider.reason}`,
   )
   assert.ok(Array.isArray(provider.windows), `${provider.id} 的 windows 应是数组`)
