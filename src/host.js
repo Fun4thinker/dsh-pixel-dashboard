@@ -875,6 +875,29 @@ export class UsageCatalog {
   }
 
   /**
+   * 用**现有快照**回答，过期就在后台补一次刷新（stale-while-revalidate）。
+   *
+   * ## 为什么需要它（用户报「每次读明细都要重新加载，打开好慢」）
+   *
+   * `read()` 的语义是「过期就同步重建」。而一次重建要重扫全部会话日志
+   * （本机 400+ 会话），**这几秒的等待会落在用户点开明细的那一刻**——
+   * 因为 `/dsh-pixel/session` 每次都会调 `read()`。
+   *
+   * 明细的本质是「历史用量」，它不需要秒级新鲜度；拿一份 20 秒前的快照
+   * 完全够用。因此这里改成：有快照就**立刻返回**，同时（不阻塞）踢一次后台重建。
+   * 用户看到的是「瞬间打开」，数字最多落后一个 TTL。
+   * @returns {object|undefined} 现有快照；从未构建过时是 undefined。
+   */
+  peekStale() {
+    if (this.snapshot === undefined) return undefined
+    if (Date.now() - this.snapshotAt >= SNAPSHOT_TTL_MS && this.inflight === undefined) {
+      // 后台刷新：失败也不能影响这次返回（结果下次再用）。
+      this.read().catch(() => {})
+    }
+    return this.snapshot
+  }
+
+  /**
    * 单会话明细：供会话标签页（`conversation.view` 的「费用」）使用。
    *
    * ## 为什么不复用 `/data`
@@ -894,7 +917,17 @@ export class UsageCatalog {
    * @returns {Promise<object|undefined>} undefined 表示这条会话不存在。
    */
   async readSessionDetail(id) {
-    const data = await this.read()
+    /**
+     * **先用现有快照，别让用户等一次全量重建。**
+     *
+     * 明细是历史数据，不需要秒级新鲜度；而 `read()` 在 TTL 过期时会同步重建
+     * （重扫全部会话日志，实测几秒）。点开明细那一刻等这几秒，正是用户报的
+     * 「每次读明细都要重新加载、打开好慢」。
+     *
+     * 因此这里 `peekStale()`：有快照立刻用（并在后台踢一次刷新）；
+     * 只有**冷启动从未构建过**时才真的等一次重建。
+     */
+    const data = this.peekStale() ?? await this.read()
     const session = (data.sessions ?? []).find((row) => row.id === id)
     if (session === undefined) return undefined
     const detail = this.sessionDetails?.get(id) ?? { byModel: {}, byDay: {} }
