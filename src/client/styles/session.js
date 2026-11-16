@@ -40,6 +40,23 @@ export const SESSION_CSS = `
 .px-sv * { box-sizing: border-box; }
 .px-sv-num { font-variant-numeric: tabular-nums; }
 
+/* ── 「费用」页挂载期间收起输入框 ─────────────────────────────────
+ *
+ * 用户问：「费用标签页中，底下为什么还有对话框」。原因是 DSH 的会话视图把
+ * composer 常驻在滚动区末尾——所有 view（chat / trajectory / context / 费用）
+ * 都共用它。dsh-context 的「上下文」页给出的做法是：**该页挂载时给滚动区打一个
+ * 标记，由 CSS 把 composer seat 收起来**。这里照同一套做法。
+ *
+ * 两条不能省的约束：
+ *   1) **审批 / 计划确认必须留着。** 那是安全边界——把它们一起藏掉，
+ *      用户就看不到也点不了「允许 / 拒绝」。后面的 :not(:has(...)) 正是为此。
+ *   2) 标记放在**我们自己的类**上（.px-tab-surface），由组件挂载/卸载时增删，
+ *      所以切回对话页时输入框原样回来；这条规则也只在这一个类存在时生效。
+ */
+[data-conversation-scroll].px-tab-surface > [data-composer-seat]:not(:has([data-approval-key])):not(:has([data-plan-review-key])) {
+  display: none;
+}
+
 /* 通栏的几类：抬头、含表格的那张卡、脚注、空态与降级态。
    容器已改成纵向 flex，通栏是默认行为；这两条保留是为了兼容 .px-sv-card-wide
    这个显式标记（卡片自身仍不该被挤成半栏）。 */
@@ -449,48 +466,63 @@ export const SESSION_CSS = `
   text-align: right;
 }
 
-/* ── 账户 ─────────────────────────────────────────────────────── */
-.px-sv-account {
+/* ── 提供商（一条会话可能同时用多家） ─────────────────────────────
+   一家一行：名称（+ 路由名） / 用了哪些模型 / 花了多少。
+   刻意**不**是卡片：这一页已经有 hero 与卡片，再给每家套一张就是「卡片套卡片」；
+   行与行之间用一条虚线分开，读起来是同一个列表。 */
+.px-sv-providers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
-.px-sv-account-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
+.px-sv-provider {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--px-line);
 }
-.px-sv-account-label {
-  color: var(--px-ink-2);
-  font-size: 12px;
-}
-/* 余额/额度是这一页第二重要的数字：22px，比正文大一档，比抬头金额小一档。 */
-.px-sv-account-value {
-  font-size: 22px;
-  font-weight: 700;
-  line-height: 1.2;
-  letter-spacing: -0.01em;
-}
-/* 不可用是状态：一个红点 + 墨色文字。
-   不把「不可用」整串染红——浅色的 --px-tone-red 在白底上只有 4.02:1，
-   14px 的文字达不到 AA；红点是非文字元素（要求 3:1），4.02 足够。 */
-.px-sv-account-unavailable .px-sv-account-value {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+.px-sv-provider:last-child { border-bottom: 0; padding-bottom: 0; }
+.px-sv-provider-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.px-sv-provider-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.px-sv-provider-name {
+  font-size: 12.5px;
+  font-weight: 650;
   color: var(--px-ink);
-  font-size: 15px;
-  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.px-sv-account-unavailable .px-sv-account-value::before {
-  content: '';
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--px-tone-red);
+/* 路由名（aa）与外显名（my-bridge）不同时才出现：排查「这是哪一家」要对着设置看。
+   描边小胶囊而不是实色底——这一页的规则是「有边界 ≠ 是一块色块」。 */
+.px-sv-provider-route {
+  flex: none;
+  padding: 0 6px;
+  font-family: var(--px-num-font);
+  font-size: 10.5px;
+  color: var(--px-muted);
+  background: transparent;
+  border: 1px solid var(--px-line);
+  border-radius: var(--px-r-pill);
 }
-.px-sv-account .px-sv-meter { width: 100%; }
+.px-sv-provider-models {
+  font-size: 11px;
+  color: var(--px-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.px-sv-provider-cost {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--px-ink);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ── 团队成员 ─────────────────────────────────────────────────── */
 .px-sv-member {
@@ -672,7 +704,6 @@ export const SESSION_CSS = `
 
 @media (max-width: 460px) {
   .px-sv-model { max-width: 9ch; }
-  .px-sv-account-value { font-size: 20px; }
   .px-sv-card { padding: 12px; }
 }
 

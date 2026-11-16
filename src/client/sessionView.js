@@ -15,7 +15,7 @@
  * | 1 | 四枚 hero：估算金额 / 总 Token / 模型耗时 / 工具调用 | 「图二」的主打指标，带语义色左边条 |
  * | 2 | 耗时堆叠条 + 计价时段 + 用量构成 | 等待模型(黄)/模型回复(蓝)/工具执行(绿)；右边两张并排填满 |
  * | 3 | 逐模型明细（通栏） | 钱具体花在哪几款模型上 |
- * | 4 | 逐日花费 + 账户 + 请求分布 | 三块并排，右侧不再有「第三行右边一大片空白」 |
+ * | 4 | 逐日花费 + 提供商 + 请求分布 | 三块并排，右侧不再有「第三行右边一大片空白」；提供商按「一家一行」列出（一条会话可能同时用多家） |
  *
  * **行是写死的，列由媒体查询收缩**（见 `styles/session.js`）：早先用 `auto-fit`
  * 让宽度决定列数，于是某一行的卡片数量与列数对不上，右边空出半屏——用户的原话是
@@ -28,7 +28,7 @@
  * | {@link fetchSession} | 纯取数 | 只负责把 HTTP 的四种失败**分类**（见下），不做文案 |
  * | {@link sessionCostModel} | 纯函数 | 把宿主负载折成「这一页要显示的每个数字与每句说明」 |
  * | {@link SessionCostPanel} | 纯展示 | 只摆位置，一个数字都不算 |
- * | {@link SessionCostView} | 容器 | 取数、定时刷新、把余额/套餐与当前模型来源对上 |
+ * | {@link SessionCostView} | 容器 | 取数、定时刷新（**不再查账户**，见其 JSDoc） |
  *
  * 这样拆是因为 `renderToStaticMarkup` **不执行 effect**：容器在闸门里永远停在
  * 「加载中」，若把文案与计算写在容器里，其余状态就永远没被验过。
@@ -67,11 +67,7 @@
  */
 
 import React from 'react'
-import { resolveAccount } from './account.js'
-import { fetchBalance } from './balance.js'
 import { formatCny, formatDurationMs, formatTokens, shortDate } from './format.js'
-import { fetchPlans } from './plans.js'
-import { useSelectedPlan } from './planView.js'
 // 「图二」那套彩色富信息的两个零件：hero 卡（左侧色条）与三色耗时堆叠条。
 // 与看板共用同一份实现（sessionDetailView.js），两处视觉不会各写一版。
 import { HeroCard, TimingBreakdownView } from './sessionDetailView.js'
@@ -644,6 +640,40 @@ export function sessionCostModel(payload) {
   const title = typeof session.title === 'string' && session.title !== '' ? session.title : ''
   const workspace = typeof session.workspace === 'string' ? session.workspace : ''
 
+  /**
+   * 这条会话用到的提供商（**一家一行**），以及每家下面用到的模型。
+   *
+   * 用户的要求：「一个会话可能涉及到多个模型/提供商」——因此这里按提供商分组，
+   * 每组列出模型与金额，而不是只挑一个「当前来源」。
+   *
+   * 这一块**不再回答「账户余额是多少」**：插件只认得官方与少数几家套餐，
+   * 认不出就回落官方余额，那个数字会被读成「我在用的那家还剩多少钱」——
+   * 用户的判断是「不需要识别来源账户，直接显示供应商名称即可」。
+   */
+  const providerGroups = []
+  for (const entry of entries) {
+    const route = String(entry?.provider ?? '')
+    const label = String(entry?.providerLabel ?? '') || route || '来源未知'
+    let group = providerGroups.find((row) => row.route === route)
+    if (group === undefined) {
+      group = { route, label, models: [], amount: 0, priced: true }
+      providerGroups.push(group)
+    }
+    const modelName = String(entry?.label ?? entry?.rollup ?? entry?.key ?? '未知模型')
+    if (!group.models.includes(modelName)) group.models.push(modelName)
+    const amount = maybeNumber(entry?.cost?.standard)
+    if (amount !== undefined) group.amount += amount
+    if (entry?.priced === false) group.priced = false
+  }
+  // 花得多的排在前面：这一块的用途是「这条会话的钱流向了谁」。
+  providerGroups.sort((a, b) => b.amount - a.amount)
+  for (const group of providerGroups) {
+    group.amountText = formatCny(group.amount)
+    /** 路由名与外显名不同时一并给出（`my-bridge` / `aa`），便于对着设置排查。 */
+    group.routeText = group.route === '' || group.route === group.label ? '' : group.route
+    group.modelText = group.models.join('、')
+  }
+
   return {
     // 抬头：标题为空时给一句占位，而不是让抬头只剩一个金额
     title,
@@ -686,6 +716,8 @@ export function sessionCostModel(payload) {
     hitRateText: hitRate === undefined ? undefined : `${(hitRate * 100).toFixed(1)}%`,
     // 明细
     models,
+    /** 本条会话用到的提供商（一家一行：`{route,label,models,amountText,...}`）。 */
+    providerGroups,
     modelsTotal,
     modelsTotalText,
     hasWrite: models.some((row) => (row.buckets?.write ?? 0) > 0),
@@ -856,77 +888,48 @@ function StateCard(props) {
 }
 
 /**
- * 账户一节：按当前模型来源绑定**一个**账户（余额或某家套餐）。
+ * 提供商一节：这条会话用了哪几家、各花了多少、各用了哪些模型。
  *
- * 与费用条那一枚同一套判据（{@link resolveAccount}），所以两处不会各说各话。
- * 取不到时写明原因，**绝不显示 0**——「余额查不到」被写成「¥0」会让用户以为钱没了。
+ * ## 为什么不再显示「账户余额 / 套餐额度」
  *
- * 这里的两处换算（百分比取整、0..1 归一）是纯展示换算：账户数据来自另一个接口，
- * 不属于 {@link sessionCostModel} 的负载，因此没法在模型层算。
- * @param {object} props - account。
+ * 这一块原来回答的是「当前模型来源的账户还剩多少」。但插件只认得 DeepSeek 官方
+ * 与少数几家套餐，认不出来源就回落到官方余额并标「推断」——用户实测看到的却是
+ * 一块写着「DeepSeek 官方余额」的卡片，而他明明在用 `my-bridge`。
+ *
+ * 用户的结论很明确：**不要回落到官方余额，直接显示供应商名称即可**。
+ * 而「一个会话可能涉及多个模型 / 提供商」，所以这里改成一家一行：名字、模型、金额。
+ *
+ * 账户相关的数据（余额 / 套餐）因此**不再在这个页面取**——少两条网络请求，
+ * 也少一处「这个数字到底属于谁」的误读。
+ * @param {object} props - groups（`sessionCostModel().providerGroups`）。
  * @returns {object} React 元素。
  */
-function AccountBlock(props) {
-  const { account } = props
-  if (account === undefined || account === null || account.kind === 'none') {
-    return h('p', { className: 'px-sv-empty' }, '当前模型来源没有可显示的账户信息（既没有官方余额，也没有这一家的套餐额度）。')
+function ProviderList(props) {
+  const groups = Array.isArray(props.groups) ? props.groups : []
+  if (groups.length === 0) {
+    return h('p', { className: 'px-sv-empty' }, '这条会话还没有产生任何计费用量，因此还没有提供商信息。')
   }
-
-  if (account.kind === 'balance') {
-    return h(
-      'div',
-      { className: 'px-sv-account' },
-      h(
-        'div',
-        { className: 'px-sv-account-head' },
-        h('span', { className: 'px-sv-account-label' }, 'DeepSeek 官方余额'),
-        // 来源认不出、退回官方余额时要说清这是**推断**，否则读的人会以为这就是他在用的账户。
-        account.source === 'fallback' ? h('span', { className: 'px-sv-tag' }, '推断') : null,
-      ),
-      h('b', { className: 'px-sv-num px-sv-account-value' }, account.text),
-      h('p', { className: 'px-sv-card-foot' },
-        '来自官方余额接口，由本机宿主用 DSH 自己的 Key 查询，Key 不离开本机。'),
-    )
-  }
-
-  if (account.kind === 'plan') {
-    const percent = Number(account.plan?.percent)
-    const known = Number.isFinite(percent)
-    return h(
-      'div',
-      { className: 'px-sv-account' },
-      h(
-        'div',
-        { className: 'px-sv-account-head' },
-        h('span', { className: 'px-sv-account-label' }, account.fullLabel ?? account.label),
-        // 「手动指定」是**选中**状态，正是强调色该出现的两处之一。
-        account.source === 'selected'
-          ? h('span', { className: 'px-sv-tag px-sv-tag-accent' }, '手动指定')
-          : null,
-      ),
-      h('b', { className: 'px-sv-num px-sv-account-value' }, known ? `${percent.toFixed(1)}%` : DASH),
-      h(Meter, {
-        share: known ? Math.min(1, Math.max(0, percent / 100)) : undefined,
-        // 红色只在真的逼近上限时出现；其余时候这条轨道是中性色。
-        tone: known && percent >= 75 ? 'warn' : undefined,
-      }),
-      h('p', { className: 'px-sv-card-foot' },
-        `${account.plan?.window?.label ?? '当前'}窗口额度已用。来自厂商内部接口，仅供参照。`),
-    )
-  }
-
-  // unavailable：必须给出原因
   return h(
-    'div',
-    { className: 'px-sv-account px-sv-account-unavailable' },
-    h(
-      'div',
-      { className: 'px-sv-account-head' },
-      h('span', { className: 'px-sv-account-label' }, account.label ?? '账户'),
-    ),
-    h('b', { className: 'px-sv-account-value' }, '不可用'),
-    h('p', { className: 'px-sv-card-foot' },
-      `${account.reason ?? '暂时取不到数据'}。切换模型或修好凭据后会自动恢复。`),
+    'ul',
+    { className: 'px-sv-providers' },
+    groups.map((group) => h(
+      'li',
+      { key: group.route === '' ? group.label : group.route, className: 'px-sv-provider' },
+      h(
+        'div',
+        { className: 'px-sv-provider-main' },
+        h(
+          'div',
+          { className: 'px-sv-provider-head' },
+          h('b', { className: 'px-sv-provider-name' }, group.label),
+          // 路由名与外显名不同时一并给出：排查「这条路由是哪一家」时要对着设置看。
+          group.routeText === '' ? null : h('code', { className: 'px-sv-provider-route' }, group.routeText),
+          group.priced ? null : h('span', { className: 'px-sv-tag' }, '含估算价'),
+        ),
+        h('span', { className: 'px-sv-provider-models', title: group.modelText }, group.modelText),
+      ),
+      h('b', { className: 'px-sv-num px-sv-provider-cost' }, group.amountText),
+    )),
   )
 }
 
@@ -939,7 +942,7 @@ function AccountBlock(props) {
  * @returns {object} React 元素。
  */
 export function SessionCostPanel(props) {
-  const { model, account, phase = 'ready', error, onRetry, staleError } = props
+  const { model, phase = 'ready', error, onRetry, staleError } = props
   const state = SESSION_STATES.includes(phase) ? phase : 'ready'
 
   if (state !== 'ready' || model === undefined) {
@@ -953,6 +956,7 @@ export function SessionCostPanel(props) {
   const showWrite = model.hasWrite === true
   const models = model.models
   const days = model.days
+  const providerGroups = Array.isArray(model.providerGroups) ? model.providerGroups : []
 
   return h(
     'section',
@@ -1149,11 +1153,15 @@ export function SessionCostPanel(props) {
         h('p', { className: 'px-sv-card-foot' }, '条长按这几天里最贵的一天归一。'),
       ),
 
-      // 账户
+      // 提供商：一条会话可能同时用多家（用户明确要求按「多家」展示）。
+      // 这一块**不再取任何账户数据**——见 ProviderList 的说明。
       h(
         PanelCard,
-        { title: '当前模型来源的账户', note: '按这条会话正在用的来源绑定' },
-        h(AccountBlock, { account }),
+        {
+          title: '本条会话的提供商',
+          note: providerGroups.length === 0 ? '还没有计费记录' : `${providerGroups.length} 家`,
+        },
+        h(ProviderList, { groups: providerGroups }),
       ),
 
       // 请求分布：峰/闲两段（与看板详情那条水平条同一种表达）。
@@ -1212,16 +1220,17 @@ export function SessionCostPanel(props) {
 }
 
 /**
- * 槽位组件：取数 + 定时刷新 + 把账户与当前模型来源对上。
+ * 槽位组件：取数 + 定时刷新。
  *
  * 作为 `conversation.view` 的槽位项渲染，因此会收到该槽位的标准属性
- * （`sessionId`、`useProjection` 等）。切换会话时 `sessionId` 变化会立刻重取。
+ * （`sessionId` 等）。切换会话时 `sessionId` 变化会立刻重取。
  *
- * ## 三种数据源各取各的
+ * ## 只取一条数据源
  *
- * 会话明细（`/dsh-pixel/session`）、余额（`/dsh-pixel/balance`）、套餐
- * （`/dsh-pixel/plans`）互不依赖：任一坏掉都不该把另外两个拖成空白。账户那一块
- * 与输入框费用条同一套判据（{@link resolveAccount}），因此两处不会各说各话。
+ * 只有会话明细（`/dsh-pixel/session`）。**这一页不再查账户余额与套餐额度**：
+ * 用户的要求是「不要回落到官方余额，直接显示供应商名称即可」——插件认不出来源时
+ * 那个回落数字会被读成「我在用的那家还剩多少钱」，而它属于另一家账户。
+ * 少这两条请求也顺带让这一页更快。
  *
  * ## `props.data` 是给闸门的直通口
  *
@@ -1236,9 +1245,9 @@ export function SessionCostPanel(props) {
  *
  * ## 定时器只在页面可见时跑
  *
- * 标签页切到后台时清掉 interval：一个看不见的面板每 30 秒请求一次宿主纯属浪费
- * （宿主那次调用要碰账本聚合）。切回来时先刷新一次再重新起表。
- * @param {object} props - 槽位标准属性（含 sessionId / useProjection / data）。
+ * 标签页切到后台时清掉 interval：一个看不见的面板每 30 秒请求一次宿主纯属浪费。
+ * 切回来时先刷新一次再重新起表。
+ * @param {object} props - 槽位标准属性（含 sessionId / data）。
  * @returns {object} React 元素。
  */
 export function SessionCostView(props) {
@@ -1252,7 +1261,6 @@ export function SessionCostView(props) {
       : { phase: 'ready', data: cached, error: '' }
   })
   const [nonce, setNonce] = useState(0)
-  const [accountData, setAccountData] = useState({ balance: undefined, plans: undefined })
 
   const reload = useCallback(() => { setNonce((value) => value + 1) }, [])
 
@@ -1337,32 +1345,42 @@ export function SessionCostView(props) {
     }
   }, [sessionId, nonce, injected])
 
+  /**
+   * 「费用」页挂载期间收起输入框（详见 styles/session.js 里那条规则的注释）。
+   *
+   * 用**类**而不是内联 style：真正的显隐规则在样式表里（要同时保留审批提示），
+   * 组件只负责「这一页现在是活动的」这个事实。卸载即撤销，对话页原样回来。
+   *
+   * 滚动区可能晚于本组件出现（首帧在它内部，但父级切换时会重建），
+   * 因此找不到就在下一帧再试一次；拿到后不再重试，避免空转。
+   */
   useEffect(() => {
-    if (injected !== undefined) return undefined
-    if (typeof sessionId !== 'string' || sessionId === '') return undefined
-    let cancelled = false
-    fetchBalance({})
-      .then((payload) => { if (!cancelled) setAccountData((prev) => ({ ...prev, balance: payload })) })
-      .catch(() => { if (!cancelled) setAccountData((prev) => ({ ...prev, balance: undefined })) })
-    fetchPlans({})
-      .then((payload) => { if (!cancelled) setAccountData((prev) => ({ ...prev, plans: payload })) })
-      .catch(() => { if (!cancelled) setAccountData((prev) => ({ ...prev, plans: undefined })) })
-    return () => { cancelled = true }
-  }, [sessionId, injected])
-
-  // 当前会话正在用的模型路由（DSH 逐请求记录的事实）。读不到时 resolveAccount
-  // 会走它自己的回落链，而不是随便挑一个账户显示。
-  const selection = props?.useProjection?.('modelSelection')
-  const selectedPlan = useSelectedPlan()
-  const account = useMemo(
-    () => resolveAccount({
-      selection,
-      balance: accountData.balance,
-      plans: accountData.plans,
-      selectedPlan,
-    }),
-    [selection, accountData.balance, accountData.plans, selectedPlan],
-  )
+    if (typeof document === 'undefined') return undefined
+    let marked
+    let frame
+    const schedule = (fn) => {
+      if (typeof requestAnimationFrame === 'function') {
+        frame = requestAnimationFrame(fn)
+        return
+      }
+      // jsdom / 极端环境没有 rAF：同步重试一次即可，不必为它引入定时器。
+      fn()
+    }
+    const mark = (attempt) => {
+      const scroller = document.querySelector('[data-conversation-scroll]')
+      if (scroller === null) {
+        if (attempt < 3) schedule(() => { mark(attempt + 1) })
+        return
+      }
+      scroller.classList.add('px-tab-surface')
+      marked = scroller
+    }
+    mark(0)
+    return () => {
+      if (frame !== undefined && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame)
+      marked?.classList.remove('px-tab-surface')
+    }
+  }, [sessionId])
 
   const payload = injected !== undefined ? injected : state.data
   const model = useMemo(() => sessionCostModel(payload), [payload])
@@ -1372,7 +1390,6 @@ export function SessionCostView(props) {
 
   return h(SessionCostPanel, {
     model,
-    account,
     phase,
     error: state.error,
     // ready 但带着错误 = 「后台刷新失败，显示的是缓存」：面板据此加一行说明，

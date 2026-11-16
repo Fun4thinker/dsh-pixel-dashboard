@@ -97,10 +97,27 @@ export async function fetchDashboard(options = {}) {
   const onAbort = () => { controller.abort() }
   options.signal?.addEventListener('abort', onAbort, { once: true })
   try {
-    const url = options.refresh === true ? `${DATA_URL}?refresh=1` : DATA_URL
-    const response = await fetch(url, { signal: controller.signal, headers: { accept: 'application/json' } })
+    /**
+     * 三个查询参数各管一件事：
+     *   - `refresh=1`：同步重建（用户明确要一份最新的，例如点「重试」）；
+     *   - `rev=<上次的 generatedAt>`：**没变就别传整份数据**。看板为了「不用点刷新
+     *     也是最新的」会定期回来看一眼，而整份数据 700 KB；带上版本号后，宿主
+     *     没变化时只回 `{ unchanged: true }`（几十字节）。
+     * 两者互斥：强制刷新时不带 rev。
+     */
+    const query = options.refresh === true
+      ? '?refresh=1'
+      : (typeof options.rev === 'string' && options.rev !== ''
+        ? `?rev=${encodeURIComponent(options.rev)}`
+        : '')
+    const response = await fetch(`${DATA_URL}${query}`, {
+      signal: controller.signal,
+      headers: { accept: 'application/json' },
+    })
     if (!response.ok) throw new Error(`看板数据请求失败：HTTP ${response.status}`)
     const data = await response.json()
+    // 「没变」是一种**成功**，不是数据：调用方据此保留现有页面，什么都不用重画。
+    if (data !== null && data.unchanged === true) return { unchanged: true, rev: data.rev }
     return {
       ...data,
       compat: {

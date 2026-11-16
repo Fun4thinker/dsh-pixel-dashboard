@@ -25,7 +25,7 @@ import { PriceSettingsButton, PriceSettingsView } from './priceSettings.js'
 // 「图二」那套彩色详情视图（hero 卡 / 耗时堆叠条 / 明细行）从本文件抽到
 // sessionDetailView.js：会话标签页的费用页也要用同一份实现，两处共用才不会漂移。
 // 这里保留 `export { SessionDetail }` 是为了不破坏既有 import（渲染闸门就按它取）。
-import { SessionDetail } from './sessionDetailView.js'
+import { SessionDetail, TimingBreakdownView } from './sessionDetailView.js'
 import {
   balanceAvailable,
   balanceStatus,
@@ -110,6 +110,18 @@ const RANGES = [
 ]
 
 /**
+ * 看板轮询间隔。
+ *
+ * 宿主的 `/data` 是 stale-while-revalidate：**立刻**返回上一份快照，同时在后台
+ * 补刷新（见 lib/host.js 的 UsageCatalog.read）。所以这里要定期回来接一次。
+ *
+ * 3 秒听起来很勤，但代价很小：请求带 `rev=<上次的 generatedAt>`，宿主没变时只回
+ * `{ unchanged: true }`（几十字节），页面一个节点都不重画。这才是「不用点刷新、
+ * 数据也一直是最新的」那种手感——而不是每 30 秒拉一次 700 KB。
+ */
+const DASHBOARD_REFRESH_MS = 3_000
+
+/**
  * 「构成」维度的四段：缓存命中 / 未命中 / 写入 / 输出。
  *
  * **恰好四段，且四段之和等于总量。** 账本里的计费 token 是
@@ -150,6 +162,18 @@ const TREND_DIMENSIONS = [
 const TREND_SERIES_LIMIT = 5
 
 /**
+ * 「消费 Top 会话」的排序维度。
+ *
+ * 三个维度回答三个不同问题，所以是**切换**而不是并列：谁最花钱 / 谁最耗时间 /
+ * 谁最耗 token。默认「花费」——看板首先回答「钱花在哪」。
+ */
+const TOP_SORTS = [
+  { id: 'cost', label: '花费' },
+  { id: 'duration', label: '耗时' },
+  { id: 'tokens', label: 'Token' },
+]
+
+/**
  * 消费趋势的两条序列：官方价 / 我的价。
  *
  * **并列而不是叠加**：两根柱子回答的是同一个问题的两个答案（「按官方价多少」
@@ -177,6 +201,7 @@ const PREF_DEFAULT = {
   trendDim: 'model',
   showMyRate: false,
   range: '30',
+  topSort: 'cost',
 }
 
 /**
@@ -477,7 +502,7 @@ function WhaleAvatar(props) {
  * @returns {object} React 元素。
  */
 function UserBalanceCard(props) {
-  const { payload, error, busy, totalSpend } = props
+  const { payload, error, busy } = props
   const rows = Array.isArray(payload?.balances) ? payload.balances : []
   /** 三种判据任一成立即算未登录（账号服务 / 旧 reason / 新 signedIn）。 */
   const signedIn = payload?.signedIn !== false
@@ -496,14 +521,13 @@ function UserBalanceCard(props) {
    *
    * 优先人民币钱包——它是主账户；接口若同时给多币种，这里**不做汇率换算**，
    * 直接取人民币那一个，其余币种不进这一格（避免把两个币种加成一个假数）。
-   * 赠送金与累计消费降级成角落小字：它们是注释，不是主角。
+   * 赠送金降级成角落小字：它是注释，不是主角。
    */
   const wallets = Array.isArray(payload?.wallets) ? payload.wallets : rows
   const primary = wallets.find((row) => row?.currency === 'CNY')
     ?? wallets.find((row) => Number.isFinite(Number(row?.total)))
   const bonusRows = Array.isArray(payload?.bonusWallets) ? payload.bonusWallets : []
   const bonus = bonusRows.reduce((sum, row) => sum + (Number(row?.total) || 0), 0)
-  const spend = Number.isFinite(Number(totalSpend)) ? Number(totalSpend) : undefined
 
   const state = (() => {
     if (failed) return { text: `余额读取失败：${error}`, tone: 'warn' }
@@ -525,23 +549,38 @@ function UserBalanceCard(props) {
   const contact = typeof account?.contact === 'string' && account.contact !== '' ? account.contact : ''
 
   /**
-   * 角落小字：赠送金与累计消费。两个都可能没有（未登录 / 无赠送 / 账本为空），
-   * 只显示拿得到的那部分；都没有就整行不渲染，不留一条空白。
+   * 角落小字：只放**官方返回**的东西。
+   *
+   * **累计消费刻意不在这里了。** 官网那个「累计消费」是实际账单口径，而插件早先
+   * 显示的是「本机账本按各模型官方单价估算的合计」——两个数回答的不是同一个问题，
+   * 并排放在同一个账户卡里，用户一定会以为其中一个错了（实测反馈）。我们拿不到
+   * 官方口径的累计消费（`/user/balance` 与账号服务都不返回它），所以这里**不再
+   * 用本地估算冒充它**。
+   *
+   * 若将来宿主/账号服务真的交下累计消费（`totalSpend`），就照它显示——那才是
+   * 「只用官方返回的」。看板自己的估算仍在「消费趋势」与「费用估算」卡片里，
+   * 那里标的是本机估算口径。
    */
+  const officialSpend = Number.isFinite(Number(payload?.totalSpend))
+    ? Number(payload.totalSpend)
+    : undefined
   const extra = []
   if (signedIn && bonus > 0) extra.push(`赠送 ${formatCny(bonus)}`)
-  if (spend !== undefined && spend > 0) extra.push(`累计消费 ${formatCny(spend)}`)
+  if (signedIn && officialSpend !== undefined && officialSpend > 0) {
+    extra.push(`累计消费 ${formatCny(officialSpend)}`)
+  }
 
   return h('div', { className: `px-user${signedIn ? '' : ' off'}`, 'aria-label': 'DeepSeek 官方账户' },
-    // 右上角：官网入口（用户要求固定在这里）
+    // 右上角：官网入口。**指向「用量」页**（用户要求）：人们点进来想看的是
+    // 「我用了多少 = 花了多少」，而 top_up 只回答「怎么充钱」。
     h('a', {
       className: 'px-user-link',
-      href: typeof links.topUpUrl === 'string' && links.topUpUrl !== ''
-        ? links.topUpUrl
+      href: typeof links.usageUrl === 'string' && links.usageUrl !== ''
+        ? links.usageUrl
         : 'https://platform.deepseek.com/usage',
       target: '_blank',
       rel: 'noreferrer',
-      title: '在 DeepSeek 官网查看余额、用量与充值',
+      title: '在 DeepSeek 官网查看用量与账单（实际账单以官网为准）',
     }, signedIn ? '更多 ↗' : '去登录 ↗'),
     /**
      * 左主区 = 钱的读数，右主区 = 头像。
@@ -562,7 +601,7 @@ function UserBalanceCard(props) {
         ? null
         : h('span', {
           className: 'px-user-sub',
-          title: '赠送金来自官方钱包；累计消费是本机按各模型官方单价估算的合计，不是实际账单',
+          title: '赠送金来自官方钱包；本机估算不放在这里，实际账单以官网为准',
         }, extra.join(' · '))),
     h('span', { className: 'px-user-avatar' },
       avatarUrl !== '' ? h('img', {
@@ -704,11 +743,33 @@ export function Dashboard() {
   // 共用一个 busy 会让开关与删除互相干扰，而删除最要紧的正是防连点。
   const [credentials, setCredentials] = useState({ payload: undefined, error: '' })
 
-  const load = useCallback((refresh) => {
-    setState((prev) => ({ ...prev, status: prev.data === null ? 'loading' : 'refreshing' }))
-    fetchDashboard({ refresh })
-      .then((data) => { setState({ status: 'ready', data, error: '' }) })
-      .catch((error) => { setState({ status: 'error', data: null, error: String(error?.message ?? error) }) })
+  /**
+   * 取一次看板数据。
+   *
+   * @param {boolean} refresh - 真 = 带 `refresh=1`（宿主同步重建，连会话清单一起重列）。
+   * @param {boolean} [silent] - 真 = 定时轮询：不显示「刷新中」、失败不清空页面，
+   *   并带上 `rev` 让宿主在没变化时只回几十字节。
+   */
+  const revRef = useRef('')
+  const load = useCallback((refresh, silent = false) => {
+    if (silent !== true) {
+      setState((prev) => ({ ...prev, status: prev.data === null ? 'loading' : 'refreshing' }))
+    }
+    const rev = silent === true ? revRef.current : ''
+    fetchDashboard({ refresh, rev })
+      .then((data) => {
+        // 宿主说「没变」：保留现有页面，什么都不重画（省一次整页图表重建）。
+        if (data !== null && data.unchanged === true) return
+        revRef.current = String(data?.generatedAt ?? '')
+        setState({ status: 'ready', data, error: '' })
+      })
+      .catch((error) => {
+        setState((prev) => (silent === true
+          // 轮询失败保留已有页面：把看板换成一屏错误，只因为一次后台轮询没回来，
+          // 是最不划算的一种「刷新」。
+          ? prev
+          : { status: 'error', data: null, error: String(error?.message ?? error) }))
+      })
   }, [])
 
   const loadBalance = useCallback((refresh) => {
@@ -797,6 +858,30 @@ export function Dashboard() {
     return () => { cancelled = true }
   }, [])
 
+  /**
+   * 轮询：把宿主后台补好的那份快照接过来。
+   *
+   * **不能省。** 宿主为了不让人等，改成「先给旧快照、后台再算新的」；如果不回来取，
+   * 屏幕上就永远停着打开那一刻的数字（用户会以为看板坏了）。这里静默更新：
+   * 不显示「刷新中」、失败也不清空页面。
+   *
+   * ## 间隔跟着宿主能力走
+   *
+   * 3 秒的前提是宿主支持 `?rev=`（没变化只回几十字节）。旧宿主不认识这个参数，
+   * 3 秒一次就是每 3 秒拉 700 KB、还要触发一次全量重建——对它必须退到 30 秒。
+   */
+  const supportsDeltaRev = Array.isArray(state.data?.capabilities)
+    && state.data.capabilities.includes('deltaRev')
+  useEffect(() => {
+    const tick = () => {
+      // 页面在后台时不必轮询：用户看不见，而一次真实的变更回来后 3 秒内也会补上。
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      load(false, true)
+    }
+    const handle = setInterval(tick, supportsDeltaRev ? DASHBOARD_REFRESH_MS : 30_000)
+    return () => { clearInterval(handle) }
+  }, [load, supportsDeltaRev])
+
   useEffect(() => {
     const handle = setInterval(() => { setNow(Date.now()) }, 1000)
     return () => { clearInterval(handle) }
@@ -882,6 +967,12 @@ export function View(props) {
   const [modelLimit, setModelLimit] = usePref('modelLimit', normalizeModelLimit)
   const normalizeShowMyRate = useCallback((raw) => prefBool(raw, PREF_DEFAULT.showMyRate), [])
   const [showMyRate, setShowMyRate] = usePref('showMyRate', normalizeShowMyRate)
+  /** 「消费 Top 会话」的排序维度：花费 / 耗时 / Token（默认花费）。 */
+  const normalizeTopSort = useCallback(
+    (raw) => prefEnum(raw, TOP_SORTS.map((item) => item.id), PREF_DEFAULT.topSort),
+    [],
+  )
+  const [topSort, setTopSort] = usePref('topSort', normalizeTopSort)
   /** 「展开全部」是一次性的查看动作，不进偏好：下次打开仍然先看精简视图。 */
   const [expandAll, setExpandAll] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -1043,21 +1134,47 @@ export function View(props) {
     return { standard: priceByModel(subset, data.pricing).standard, count: Object.keys(subset).length }
   }, [modelFocus.rest, rangeByModel, data.pricing])
 
-  /** 消费 Top 会话：按花费降序取前 8，点击进入该会话。 */
+  /**
+   * 消费 Top 会话：按当前排序维度取前 8。
+   *
+   * 三个维度都来自 `/data` 的会话行（`cost.standard` / `timing.totalMs` /
+   * `totals.local`），客户端不额外取数。耗时那一维**只对有 step 计时的会话有效**：
+   * 缺 `timing` 的会话排到最后并显示 `—`，而不是当成 0 秒排第一。
+   */
   const topSessions = useMemo(() => {
     const sessions = Array.isArray(data.sessions) ? data.sessions : []
     const numeric = (value) => (value === undefined || value === null || !Number.isFinite(Number(value))
       ? undefined
       : Number(value))
+    const metricOf = (row) => (topSort === 'duration'
+      ? row.duration
+      : (topSort === 'tokens' ? row.tokens : row.cost))
     return sessions
       .map((session) => ({
         session,
         cost: numeric(session?.cost?.standard),
         tokens: numeric(session?.totals?.local),
+        duration: numeric(session?.timing?.totalMs),
       }))
-      .sort((a, b) => ((b.cost ?? 0) - (a.cost ?? 0)) || ((b.tokens ?? 0) - (a.tokens ?? 0)))
+      .sort((a, b) => {
+        const left = metricOf(a)
+        const right = metricOf(b)
+        // 缺这个维度的排最后（`?? -1`），而不是当成 0 混进前几名。
+        return ((right ?? -1) - (left ?? -1))
+          || ((b.cost ?? 0) - (a.cost ?? 0))
+          || ((b.tokens ?? 0) - (a.tokens ?? 0))
+      })
       .slice(0, 8)
-  }, [data.sessions])
+  }, [data.sessions, topSort])
+
+  /**
+   * 时间投入：窗口内有交集的所有会话，按会话整体相加（见 {@link timeInvestStats}）。
+   * 用 Set 传给纯函数，避免每行都线性查一次窗口键。
+   */
+  const timeInvest = useMemo(
+    () => timeInvestStats(data.sessions, new Set(points.map((point) => point.key))),
+    [data.sessions, points],
+  )
 
   // 切换监看的套餐：直接写共享存储，看板与输入框下方那一枚同时跟着变。
   const onSelectPlan = useCallback((planId) => { planViewStore().select(planId) }, [])
@@ -1098,14 +1215,14 @@ export function View(props) {
             `DSH · ${overview.sessions} 个会话 · 更新于 ${new Date(data.generatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`))),
       h('div', { className: 'px-topbar-actions' },
         h(Segmented, { options: RANGES, value: rangeId, onChange: setRangeId }),
-        h('button', {
-          type: 'button',
-          className: 'px-btn small',
-          disabled: refreshing,
-          onClick: onRefresh,
-        },
-        h('span', { className: refreshing ? 'px-spin' : undefined }, '⟳'),
-        refreshing ? '刷新中' : '刷新'),
+        /**
+         * **没有「刷新」按钮**（用户要求：与 dsh-context 的标签页一样，不该需要它）。
+         *
+         * 数据新鲜度由两条链路保证，而不是靠用户点：
+         *   - 宿主：每条会话事件都会把对应会话标脏，后台每 3 秒补一次重建；
+         *   - 页面：每 3 秒带 `rev` 回来看一眼，没变化时只传几十字节。
+         * 保留一个「手动重建」按钮只会让人以为「不点它数据就不新」。
+         */
         // 设置是**弹层**而不是页面上的一块：通知、单价、显示偏好都是「偶尔改一次」
         // 的东西，常驻在正文里会占掉用户每次都要滚过去的高度。
         h('button', {
@@ -1123,9 +1240,9 @@ export function View(props) {
         payload: balance,
         error: balanceError,
         busy: balanceBusy,
-        // 累计消费：官网有这个数，但账号接口没有。这里用本机账本的
-        // **按官方单价估算**的累计金额（口径写在 title 里，不冒充实际账单）。
-        totalSpend: Number(data.cost?.standard ?? 0),
+        // 累计消费**不再由本地账本估算**：官网是实际账单口径，本地是按官方单价
+        // 估的，两个数放在同一张账户卡里必然对不上（用户实测反馈）。
+        // 官方接口目前不返回这个数，因此这一格只显示余额与赠送金。
       }),
       h(StatCard, {
         tone: 'blue',
@@ -1355,16 +1472,38 @@ export function View(props) {
             onRatesSaved,
           })))),
 
+    // ── 时间投入 ──────────────────────────────────────────────────
+    // 回答「时间去哪了」。它放在「消费 Top 会话」之前：先看总量、再看是谁花的，
+    // 与上一张卡（费用明细）形成「钱 / 时间」两个并行的口径，而不是塞进概览行
+    // ——那里已经有四张卡，再加一张会把数字挤成两行。
+    h(Panel, {
+      title: '时间投入',
+      tone: 'yellow',
+      delay: 400,
+      extra: timeInvest.timed === 0
+        ? `${range.label} · 暂无计时`
+        : `${range.label} · ${timeInvest.timed} 个会话有计时`,
+    },
+    h(TimeInvestCard, { stats: timeInvest }),
+    // 口径只写在卡片里一句：它是「机器干活的时间」，不是墙钟，也不是上班时长。
+    h('p', { className: 'px-time-note' },
+      '等待 + 回复 + 工具三段都来自每个会话的 step 计时；跨会话相加是「模型干活的总量」，不是墙钟时间。',
+      '窗口按会话整体计入（会话的最后活跃日落在窗口内即算），不按天切分。')),
+
     // ── 消费 Top 会话 ──────────────────────────────────────────────
-    // 完整会话清单不再留在看板（它进会话标签页），这里只留「花得最多的几条」，
-    // 点击进去看那条会话的账——看板要回答的是「花在哪」，不是「一共有几条会话」。
+    // 完整会话清单不再留在看板（它进会话标签页），这里只留「最靠前的几条」。
+    // 排序维度可切换（花费 / 耗时 / Token）：它们回答三个不同问题，因此是切换
+    // 而不是并列；默认「花费」——看板首先回答「钱花在哪」。
     h(Panel, {
       title: '消费 Top 会话',
       tone: 'blue',
-      delay: 420,
-      extra: `共 ${Array.isArray(data.sessions) ? data.sessions.length : 0} 个会话 · 按花费排序`,
+      delay: 440,
+      extra: h('div', { className: 'px-top-sorts' },
+        h('span', { className: 'px-panel-extra' },
+          `共 ${Array.isArray(data.sessions) ? data.sessions.length : 0} 个会话`),
+        h(Segmented, { options: TOP_SORTS, value: topSort, onChange: setTopSort })),
     },
-    h(TopSessions, { rows: topSessions, timezone: data.timezone, teams: data.teams })),
+    h(TopSessions, { rows: topSessions, timezone: data.timezone, teams: data.teams, sort: topSort })),
 
     // 底部口径说明：只留**会改变读数理解**的两句（多厂商单价怎么来、金额是什么口径）。
     // 详细的计费口径属于 README，天天摆在读数下面只会让人先跨过它才能看到数字。
@@ -1399,6 +1538,112 @@ export function View(props) {
 }
 
 /**
+ * 把「窗口内的会话」折成一组**时间投入**数字。
+ *
+ * ## 口径（与「费用」页那张时间卡同一个来源）
+ *
+ * 每个会话的 `timing` 来自宿主逐 step 的计时：等待模型（ttft）+ 模型回复（gen）+
+ * 工具执行（tools），`totalMs` 就是这三段之和（见 lib/timing.js）。这里把它们
+ * **按会话相加**。因此：
+ *
+ *   - 它是「模型干活的总量」，**不是墙钟时间**——两个会话并行跑时，墙钟只过了一小时，
+ *     而这里是两小时。这正是「我在这上面耗了多少机器时间」这个问题的答案。
+ *   - 窗口归属按**会话整体**计入：会话的 `days` 与窗口有交集就算进来，不按天切分。
+ *     按天切分需要宿主在日志里按日累计耗时，那是另一件事（见 AGENT.md 第 12 节）。
+ *
+ * ## 为什么单独抽成纯函数
+ *
+ * `renderToStaticMarkup` 不执行 effect，整页静态渲染里只能看到「有没有这张卡」；
+ * 真实的加总逻辑得能拿合成数据直接断言，所以这里做成纯函数并导出给闸门用。
+ * @param {object[]} sessions - `/data` 的 `sessions[]`。
+ * @param {Set<string>|string[]} dayKeys - 窗口内的日期键（`YYYY-MM-DD`）。
+ * @returns {{sessions:number,timed:number,ttftMs:number,genMs:number,toolsMs:number,totalMs:number,turns:number,toolCalls:number,maxTurnMs:number,avgTurnMs:number|undefined}}
+ *   窗口内会话数、**有 step 计时的**会话数，以及各段毫秒。
+ */
+export function timeInvestStats(sessions, dayKeys) {
+  const keys = dayKeys instanceof Set ? dayKeys : new Set(Array.isArray(dayKeys) ? dayKeys : [])
+  const list = Array.isArray(sessions) ? sessions : []
+  const inWindow = list.filter((session) => (
+    Array.isArray(session?.days) && session.days.some((day) => keys.has(day))
+  ))
+  let ttftMs = 0
+  let genMs = 0
+  let toolsMs = 0
+  let totalMs = 0
+  let turns = 0
+  let toolCalls = 0
+  let maxTurnMs = 0
+  let timed = 0
+  for (const session of inWindow) {
+    const total = Number(session?.timing?.totalMs ?? 0)
+    // 没有 step 计时的会话（旧宿主 / 旧日志）只计入「窗口内会话数」，
+    // 不参与求和——把 0 当成「跑得很快」会让平均值偏低。
+    if (!Number.isFinite(total) || total <= 0) continue
+    timed += 1
+    ttftMs += Number(session?.timing?.ttftMs ?? 0)
+    genMs += Number(session?.timing?.genMs ?? 0)
+    toolsMs += Number(session?.timing?.toolsMs ?? 0)
+    totalMs += total
+    // 平均每轮只除以**有计时的那些轮次**，否则分母里混进没计时的会话会偏小。
+    turns += Number(session?.turns ?? 0)
+    toolCalls += Number(session?.toolCalls ?? 0)
+    const longest = Number(session?.maxTurnMs ?? 0)
+    if (Number.isFinite(longest) && longest > maxTurnMs) maxTurnMs = longest
+  }
+  return {
+    sessions: inWindow.length,
+    timed,
+    ttftMs,
+    genMs,
+    toolsMs,
+    totalMs,
+    turns,
+    toolCalls,
+    maxTurnMs,
+    avgTurnMs: turns > 0 ? totalMs / turns : undefined,
+  }
+}
+
+/**
+ * 「时间投入」卡：三色耗时条 + 三个补充数字。
+ *
+ * 三色条直接复用会话页那一份 {@link TimingBreakdownView}（等待=黄 / 回复=蓝 /
+ * 工具=绿），两处口径与配色因此不会漂移。它自己带「总时长 + 平均每轮」，
+ * 右边补上「轮次 / 工具调用 / 最久一轮 / 有计时的会话」，正好覆盖用户想要的几项。
+ * @param {object} props - stats（{@link timeInvestStats} 的结果）。
+ * @returns {object} React 元素。
+ */
+function TimeInvestCard(props) {
+  const { stats } = props
+  if (stats.timed === 0) {
+    return h('p', { className: 'px-muted' },
+      stats.sessions === 0
+        ? '这段窗口里还没有会话，跑一轮对话之后这里会显示时间都花在哪。'
+        : '这段窗口里的会话没有 step 计时（更早版本的日志，或来自其它设备的历史），因此看不出时间去向。')
+  }
+  const figure = (label, value) => h('div', { className: 'px-time-figure', key: label },
+    h('span', { className: 'px-time-figure-label' }, label),
+    h('b', { className: 'px-time-figure-value' }, value))
+  return h('div', { className: 'px-time' },
+    // 左：三色堆叠条 + 图例（含总时长与平均每轮）
+    h('div', { className: 'px-time-main' },
+      h(TimingBreakdownView, {
+        timing: {
+          ttftMs: stats.ttftMs,
+          genMs: stats.genMs,
+          toolsMs: stats.toolsMs,
+          turns: stats.turns,
+        },
+      })),
+    // 右：四个补充数字。竖排在最右，不与左栏的图例抢同一行。
+    h('div', { className: 'px-time-figures' },
+      figure('轮次', String(stats.turns)),
+      figure('工具调用', String(stats.toolCalls)),
+      figure('最久一轮', stats.maxTurnMs > 0 ? formatDurationMs(stats.maxTurnMs) : '—'),
+      figure('有计时的会话', `${stats.timed}/${stats.sessions}`)))
+}
+
+/**
  * 会话的显示名：与 DSH 侧栏同一条回落链。
  *
  * 持久标题 → 工作目录末段 → 会话 id 片段。旧宿主不返回 `title`，只有 `workspace`，
@@ -1427,7 +1672,7 @@ function sessionTitleOf(session) {
  * @returns {object} React 元素。
  */
 function TopSessions(props) {
-  const { rows, timezone, teams } = props
+  const { rows, timezone, teams, sort = 'cost' } = props
   /**
    * 展开哪一条（**不跳转会话**）。
    *
@@ -1486,64 +1731,94 @@ function TopSessions(props) {
   }
 
   if (!Array.isArray(rows) || rows.length === 0) {
-    return h('p', { className: 'px-muted' }, '还没有会话记录。跑一轮对话之后这里会按花费排出前几名。')
+    return h('p', { className: 'px-muted' }, '还没有会话记录。跑一轮对话之后这里会排出前几名。')
   }
 
-  return h('div', { className: 'px-table-wrap' },
-    h('table', { className: 'px-table px-top-session-table' },
-      h('thead', null,
-        h('tr', null,
-          h('th', null, '会话'),
-          h('th', { className: 'px-num' }, '花费'),
-          h('th', { className: 'px-num' }, 'Token'),
-          h('th', null, '最后活跃'))),
-      h('tbody', null,
-        rows.map(({ session, cost, tokens }) => {
-          const title = sessionTitleOf(session)
-          const id = String(session?.id ?? '')
-          const lastAt = Number(session?.lastAt ?? 0) || Number(session?.createdAt ?? 0)
-          const isOpen = expanded !== '' && expanded === id
-          return [
-            h('tr', {
-              key: id !== '' ? id : title,
-              className: `px-top-session-row${isOpen ? ' open' : ''}`,
-              onClick: () => { toggle(id) },
-            },
-            h('td', null,
-              // 标题是一枚按钮：整行可点只是鼠标方便，**键盘可达**靠它
-              // （`<span onClick>` 的话 Tab 永远到不了这一行）。
-              h('button', {
-                type: 'button',
-                className: 'px-session-open',
-                'aria-expanded': isOpen,
-                title: `${title}\n${id}`,
-                onClick: (event) => { event.stopPropagation(); toggle(id) },
-              },
-              // 展开指示：小三角随状态旋转，说明「这里能点开」。
-              h('i', { className: `px-caret${isOpen ? ' open' : ''}`, 'aria-hidden': 'true' }),
-              h('span', null, title)),
-              session?.live === true ? h('span', { className: 'px-badge ok' }, '进行中') : null),
-            h('td', { className: 'px-num' },
-              cost === undefined ? h('span', { className: 'px-muted' }, '—') : formatCny(cost)),
-            h('td', { className: 'px-num' },
-              tokens === undefined ? h('span', { className: 'px-muted' }, '—') : formatTokens(tokens)),
-            h('td', null, lastAt > 0 ? formatDateTime(lastAt, timezone) : h('span', { className: 'px-muted' }, '—'))),
-            isOpen
-              ? h('tr', { key: `${id}-detail`, className: 'px-top-session-detail-row' },
-                h('td', { colSpan: 4 },
-                  // 「图二」那一套：四枚彩色 hero + 三色耗时堆叠条 + 峰/闲明细 + 请求分布。
-                  // 用户明确要它回来（「之前那种版本都挺好看的」），所以这里用完整版。
-                  // 下面**不再**追加逐模型金额小表：那块与这里的合计/逐日/请求分布重复
-                  // （用户问「底部为啥会有同样的数据重复显示」），已整块删除。
-                  h(SessionDetail, {
-                    key: 'rich',
-                    lead: session,
-                    members: membersOfSession(session),
-                    timezone,
-                  })))
-              : null,
-          ]
-        }))))
+  /**
+   * 当前排序维度对应的取值与显示格式。
+   *
+   * 三个维度共用同一张列表与同一根条：条只做**相对比较**，具体读数在它上面的
+   * 那个数字里。缺这个维度的会话显示 `—`、条为空——不能当成 0 画成「很短」。
+   */
+  const metricOf = (row) => {
+    if (sort === 'duration') return row.duration
+    if (sort === 'tokens') return row.tokens
+    return row.cost
+  }
+  const metricText = (value) => {
+    if (value === undefined) return '—'
+    if (sort === 'duration') return formatDurationMs(value)
+    if (sort === 'tokens') return formatTokens(value)
+    return formatCny(value)
+  }
+  /**
+   * 条的基准：**当前维度最大的那一条**。
+   *
+   * 按合计归一（而不是绝对值）会让第一名永远占满、其余按比例缩短，读者一眼就能
+   * 比出相对差距；用固定刻度则在数值普遍很小时全部缩成一条线。
+   */
+  const maxMetric = rows.reduce((max, row) => {
+    const value = metricOf(row)
+    return value !== undefined && Number.isFinite(value) && value > max ? value : max
+  }, 0)
+
+  /**
+   * 版式：**列表**，不是表格（见 theme.js 里 .px-top-* 的注释）。
+   *
+   * 早先是 <table>，展开行里再嵌一整套 hero 卡片：面板（白）→ 表头（奶油）
+   * → 行（白）→ 展开行（奶油）→ hero 卡（白），四层底色来回跳，用户原话是
+   * 「卡片层级奇怪」。现在一层分隔线 + 一块同底的展开区，里面不再浮起新卡片。
+   */
+  return h('div', { className: 'px-top' },
+    rows.map(({ session, cost, tokens, duration }, index) => {
+      const title = sessionTitleOf(session)
+      const id = String(session?.id ?? '')
+      const lastAt = Number(session?.lastAt ?? 0) || Number(session?.createdAt ?? 0)
+      const isOpen = expanded !== '' && expanded === id
+      const metric = metricOf({ cost, tokens, duration })
+      const share = metric === undefined || maxMetric <= 0 ? 0 : Math.max(0.03, metric / maxMetric)
+      // 第二行的三项事实：token / 最后活跃 / 耗时（缺哪个就少哪一段）。
+      // 当前维度已经显示在上面时，meta 里就不再重复它。
+      const meta = []
+      if (sort !== 'tokens' && tokens !== undefined) meta.push(formatTokens(tokens))
+      if (sort !== 'duration' && duration !== undefined) meta.push(formatDurationMs(duration))
+      if (lastAt > 0) meta.push(formatDateTime(lastAt, timezone))
+      return h('div', {
+        key: id !== '' ? id : title,
+        className: `px-top-item${isOpen ? ' open' : ''}`,
+      },
+      h('button', {
+        type: 'button',
+        className: 'px-top-main',
+        'aria-expanded': isOpen,
+        title: `${title}\n${id}`,
+        onClick: () => { toggle(id) },
+      },
+      // 名次：不算信息量，但它是「Top」这件事本身的可读形式。
+      h('span', { className: 'px-top-rank', 'aria-hidden': 'true' }, String(index + 1).padStart(2, '0')),
+      h('span', { className: 'px-top-copy' },
+        h('span', { className: 'px-top-title' }, title,
+          session?.live === true ? h('span', { className: 'px-top-live' }, '进行中') : null),
+        meta.length === 0 ? null : h('span', { className: 'px-top-meta' }, meta.join(' · '))),
+      h('span', { className: 'px-top-amount' },
+        h('b', null, metricText(metric)),
+        // 相对条：只做比较，不承载精确读数（精确值就在它上面）。
+        h('i', { className: 'px-top-share', 'aria-hidden': 'true' },
+          h('span', { style: { width: `${Math.round(share * 100)}%` } }))),
+      // 展开指示：小三角随状态旋转，说明「这里能点开」。
+      h('i', { className: `px-caret${isOpen ? ' open' : ''}`, 'aria-hidden': 'true' })),
+      isOpen
+        ? h('div', { className: 'px-top-detail' },
+          // 「图二」那一套：四枚彩色 hero + 三色耗时堆叠条 + 峰/闲明细 + 请求分布。
+          // 下面**不再**追加逐模型金额小表：那块与这里的合计/逐日/请求分布重复。
+          h(SessionDetail, {
+            key: 'rich',
+            lead: session,
+            members: membersOfSession(session),
+            timezone,
+          }))
+        : null)
+    }))
 }
 
 /**

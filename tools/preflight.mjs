@@ -236,6 +236,21 @@ assert.ok(Array.isArray(payload.capabilities), '响应应含 capabilities 数组
 for (const name of REQUIRED_CAPABILITIES) {
   assert.ok(payload.capabilities.includes(name), `capabilities 缺少 ${name}`)
 }
+// `?rev=` 的增量答复：页面为了「不用点刷新也最新」会每 3 秒回来看一眼，
+// 没变化时必须只回几十字节——否则就是在反复传 700 KB。
+assert.ok(payload.capabilities.includes('deltaRev'),
+  'capabilities 应声明 deltaRev（客户端据此才敢高频轮询）')
+{
+  const rev = String(payload.generatedAt)
+  const replay = await call(dataRoute, 'GET', `/dsh-pixel/data?rev=${encodeURIComponent(rev)}`)
+  const body = JSON.parse(replay.body)
+  assert.equal(body.unchanged, true, '快照没变时 ?rev= 应只回 { unchanged: true }')
+  assert.equal(body.rev, rev, '回包里要带回版本号，便于客户端对齐')
+  // 版本对不上时必须给整份数据，而不是「反正都是旧的」。
+  const stale = await call(dataRoute, 'GET', '/dsh-pixel/data?rev=0')
+  const staleBody = JSON.parse(stale.body)
+  assert.ok(Array.isArray(staleBody.sessions), 'rev 对不上时应回整份数据（含 sessions）')
+}
 assert.equal(payload.overview.sessions, 0, '无 persistence 时会话数应为 0')
 assert.ok(Array.isArray(payload.days), '响应应含 days 数组')
 assert.equal(payload.heatmap.days, 371, '热力图应覆盖 371 天')

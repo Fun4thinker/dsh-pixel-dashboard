@@ -2395,6 +2395,19 @@ must(css.includes('tabular-nums'), '数字应保留 tabular-nums，保证并排�
     !/(?:^|[},])\s*body\s*\{[^}]*background(?:-image)?\s*:/.test(cssNoComments),
     '不得再给 body 铺底纹——那正是被移除的皮肤（看板整页的底色由 .px-root 自己给）',
   )
+
+  // 「费用」页收起输入框的规则：**审批提示必须留着**。
+  // 这条规则按 dsh-context 的 context 页同一做法写（给滚动区打自己的类），
+  // 但少一个 :not(:has([data-approval-key])) 就等于把「允许 / 拒绝」一起藏了——
+  // 那是安全边界，不是版面问题。
+  must(
+    /\[data-conversation-scroll\]\.px-tab-surface\s*>\s*\[data-composer-seat\][^{]*:not\(:has\(\[data-approval-key\]\)\)/.test(cssNoComments),
+    '「费用」页收起输入框时，必须保留含审批提示（data-approval-key）的 composer',
+  )
+  must(
+    cssNoComments.includes(':not(:has([data-plan-review-key]))'),
+    '「费用」页收起输入框时，必须保留含计划确认（data-plan-review-key）的 composer',
+  )
 }
 
 // ── 费用详情面板的样式 ─────────────────────────────────────────────
@@ -3762,20 +3775,67 @@ must(
   }
   must(!css.includes('.px-notify-threshold'), '样式里不该还留着 .px-notify-threshold* 死样式')
 
-  // 2) 会话清单整表已移入会话标签页；看板只留「消费 Top 会话」精简表。
-  //    这里钉住三件事：表在（且只有这一张）、最多 8 行、标题是可聚焦按钮。
-  //    少一条，用户就再也点不进那条会话——而那是这张表唯一的用途。
-  const topCount = (html.match(/px-top-session-row/g) ?? []).length
-  must(html.includes('px-top-session-table'), '看板应有「消费 Top 会话」表')
-  must(topCount > 0 && topCount <= 8, `Top 会话应取前 8 名，实际 ${topCount} 行`)
-  // 标题必须是可聚焦按钮：整行可点只是鼠标方便，键盘用户要靠它。
-  // 注意它现在**不跳转会话**，只原地展开该会话的费用明细（用户要求改的），
+  // 2) 会话清单整表已移入会话标签页；看板只留「消费 Top 会话」**列表**
+  //    （v3.2 起由表格改成列表：表格的展开行里再嵌 hero 卡，形成「卡片套卡片」，
+  //    用户反馈「卡片层级奇怪」）。这里钉四件事：列表在、最多 8 条、
+  //    每条的整行是可聚焦、带 aria-expanded 的按钮、花费条只作相对比较。
+  const topCount = (html.match(/class="px-top-item/g) ?? []).length
+  must(html.includes('class="px-top"'), '看板应有「消费 Top 会话」列表')
+  must(topCount > 0 && topCount <= 8, `Top 会话应取前 8 名，实际 ${topCount} 条`)
+  // 整行是按钮：鼠标点哪都行，键盘用户 Tab 得到。
+  // 它**不跳转会话**，只原地展开该会话的费用明细（用户要求改的），
   // 所以这里断言的是按钮 + `aria-expanded`，而不是「点了会 openSession」。
-  must(/<button[^>]*class="[^"]*px-session-open[^>]*aria-expanded="false"/.test(html),
-    'Top 会话的标题必须是带 aria-expanded 的按钮（键盘可达，且能表达展开状态）')
+  must(/<button[^>]*class="[^"]*px-top-main[^>]*aria-expanded="false"/.test(html),
+    'Top 会话的整行必须是带 aria-expanded 的按钮（键盘可达，且能表达展开状态）')
+  must(html.includes('px-top-share'), 'Top 会话每条都要有相对花费条，否则「Top」只能靠读数字比较')
+  must(!html.includes('px-top-session-table'),
+    'Top 会话不该再用表格：展开行里的嵌套卡片正是「层级奇怪」的来源')
   // 完整清单不再铺在看板上：它的分身（SessionTable / SessionDetail）只在会话标签页里用。
   must((html.match(/px-session-row/g) ?? []).length === 0,
     '完整会话清单不该再渲染在看板上（它已移入会话标签页，看板只留 Top 8）')
+
+  // 2b) 时间投入：窗口内**按会话整体**相加；没有 step 计时的会话只计数、不参与求和。
+  //     这条同时钉住「平均每轮的分母」——把没计时的会话也除进去会让平均值偏低。
+  {
+    const { timeInvestStats } = await import(
+      pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
+    must(typeof timeInvestStats === 'function',
+      'dashboard.js 应导出 timeInvestStats（纯函数，闸门直接验口径）')
+    const stats = timeInvestStats([
+      {
+        id: 'a',
+        days: ['2026-11-10'],
+        timing: { ttftMs: 1000, genMs: 2000, toolsMs: 500, totalMs: 3500 },
+        turns: 2, toolCalls: 5, maxTurnMs: 2000,
+      },
+      {
+        id: 'b',
+        days: ['2026-11-11', '2026-11-12'],
+        timing: { ttftMs: 500, genMs: 500, toolsMs: 0, totalMs: 1000 },
+        turns: 1, toolCalls: 2, maxTurnMs: 1000,
+      },
+      // 窗口外：一天都不在窗口里，必须完全不计入。
+      {
+        id: 'c',
+        days: ['2026-10-01'],
+        timing: { ttftMs: 900, genMs: 900, toolsMs: 900, totalMs: 2700 },
+        turns: 9, toolCalls: 9, maxTurnMs: 900,
+      },
+      // 窗口内但没有 step 计时：计入会话数、不计入时长与轮次。
+      { id: 'd', days: ['2026-11-10'] },
+    ], ['2026-11-10', '2026-11-11'])
+    must(stats.sessions === 3, `窗口内应有 3 个会话（a/b/d），实际 ${stats.sessions}`)
+    must(stats.timed === 2, `只有 2 个会话有 step 计时，实际 ${stats.timed}`)
+    must(stats.totalMs === 4500, `窗口内总耗时应为 4500 ms，实际 ${stats.totalMs}`)
+    must(stats.ttftMs === 1500 && stats.genMs === 2500 && stats.toolsMs === 500,
+      `三段之和要分别对齐，实际 ${stats.ttftMs}/${stats.genMs}/${stats.toolsMs}`)
+    must(stats.turns === 3 && stats.toolCalls === 7, '轮次与工具调用只累加有计时的会话')
+    must(stats.maxTurnMs === 2000, `最久一轮应取最大值 2000，实际 ${stats.maxTurnMs}`)
+    must(stats.avgTurnMs === 1500, `平均每轮 = 4500 / 3，实际 ${stats.avgTurnMs}`)
+    must(html.includes('时间投入'), '看板应有「时间投入」卡片')
+    must(html.includes('>耗时<'), 'Top 会话应能按「耗时」排序（分段控件里有这一项）')
+    must(html.includes('px-time'), '时间投入卡应带 .px-time 结构类')
+  }
 
   // 3) 设置弹层默认关闭：整页静态渲染里**一个**弹层节点都不该有。
   //    关闭态不渲染是有意的（留空壳会挡住下面的点击，而界面上看不出来）。
@@ -3831,6 +3891,120 @@ must(html.includes('platform.deepseek.com/usage'), '余额横条必须给出官�
   must(notSignedIn.includes('未登录官方账号'), '没登录官方账号时应明说「未登录」，而不是显示 0 余额')
   must(notSignedIn.includes('DEEPSEEK_API_KEY'), '未登录时应点出缺哪个凭据引用名')
   must(!notSignedIn.includes('¥0.00'), '未登录时不得显示 ¥0（「不知道」与「余额为 0」是两件事）')
+}
+
+// ── 账户卡：累计消费只用官方返回的；「更多」指向用量页 ──────────────────
+// 用户报过「累计消费与官网不一样」：早先显示的是本机账本按官方单价估算的合计，
+// 而官网是实际账单口径——两个数并排放在同一张卡里必然对不上。官方接口目前不返回
+// 这个数，因此**不显示**；将来官方交了（`totalSpend`）才照实显示。
+{
+  must(!html.includes('累计消费'),
+    '账户卡不得再拿本地估算冒充官方「累计消费」——官方没返回就不显示')
+  const withOfficialSpend = renderToStaticMarkup(React.createElement(View, {
+    data: payload,
+    now: payload.generatedAt,
+    refreshing: false,
+    onRefresh: () => {},
+    balance: {
+      enabled: true,
+      signedIn: true,
+      balances: [{ currency: 'CNY', total: 12.34 }],
+      totalSpend: 99,
+      links: {
+        usageUrl: 'https://platform.deepseek.com/usage',
+        topUpUrl: 'https://platform.deepseek.com/top_up',
+      },
+    },
+    onToggleBalance: () => {},
+    plans: { enabled: true, providers: [] },
+    onTogglePlans: () => {},
+  }))
+  must(withOfficialSpend.includes('累计消费 ¥99.00'),
+    '官方真的交了累计消费时必须照实显示（这才是「只用官方返回的」）')
+  must(/<a[^>]*href="https:\/\/platform\.deepseek\.com\/usage"[^>]*>更多/.test(withOfficialSpend),
+    '「更多 ↗」必须指向官网**用量**页——点进来的人想看的是「用了多少」')
+  must(!withOfficialSpend.includes('/top_up'),
+    '「更多 ↗」不得指向充值页（那是另一件事，用户要的是用量）')
+}
+
+// ── 会话标签页「费用」：账户块必须说清「来源是哪一家」──────────────────
+// 用户报过：这一块永远显示「DeepSeek 官方」，可他明明在用第三方路由
+// （实测 provider=aa / 外显名 my-bridge）。根因是标题写死、来源不显示。
+// 这条同时钉住「模型层交出路由名→外显名映射」与「面板把它画出来」。
+{
+  const sessionTab = await import(pathToFileURL(join(root, 'lib', 'client', 'sessionView.js')).href)
+  const { SessionCostPanel, sessionCostModel } = sessionTab
+  must(typeof sessionCostModel === 'function', 'sessionView.js 应导出 sessionCostModel')
+  must(typeof SessionCostPanel === 'function', 'sessionView.js 应导出 SessionCostPanel')
+
+  const tabTotals = {
+    cacheHit: 1000, cacheMiss: 100, cacheWrite: 0, output: 50, local: 1150, requests: 2,
+    peak: { cacheHit: 1000, cacheMiss: 100, cacheWrite: 0, output: 50, local: 1150, requests: 2 },
+    idle: { cacheHit: 0, cacheMiss: 0, cacheWrite: 0, output: 0, local: 0, requests: 0 },
+  }
+  const tabPayload = {
+    generatedAt: payload.generatedAt,
+    session: {
+      id: 'session-tab-demo',
+      title: '演示会话',
+      workspace: 'demo',
+      live: false,
+      turns: 2,
+      toolCalls: 3,
+      totals: tabTotals,
+      cost: { standard: 0.5, peak: 0.5, idle: 0, ifAllIdle: 0.4, saved: 0.1 },
+      timing: { ttftMs: 1000, genMs: 2000, toolsMs: 500, turns: 2 },
+      maxTurnMs: 2000,
+    },
+    entries: [{
+      key: 'deepseek-flash@aa',
+      rollup: 'deepseek-flash',
+      provider: 'aa',
+      providerLabel: 'my-bridge',
+      label: 'deepseek-v4.1-flash',
+      vendor: 'DeepSeek',
+      priced: true,
+      totals: tabTotals,
+      cost: { standard: 0.5, peak: 0.5, idle: 0, ifAllIdle: 0.4, saved: 0.1 },
+    }],
+    days: [{ key: '2026-11-16', totals: tabTotals, cost: { standard: 0.5 } }],
+    cost: { standard: 0.5, peak: 0.5, idle: 0, ifAllIdle: 0.4, saved: 0.1 },
+    pricing: {
+      currency: 'CNY',
+      unit: 'per-million-tokens',
+      models: {
+        'deepseek-flash@aa': {
+          rates: {
+            label: 'DeepSeek Flash',
+            currency: 'CNY',
+            cacheHit: { peak: 0.04, idle: 0.02 },
+            cacheMiss: { peak: 2, idle: 1 },
+            output: { peak: 8, idle: 4 },
+          },
+          markup: 1,
+          currency: 'CNY',
+        },
+      },
+    },
+  }
+  const tabModel = sessionCostModel(tabPayload)
+  // 一条会话可能同时走多家：模型层必须按「提供商」分组交出全部条目。
+  must(Array.isArray(tabModel.providerGroups) && tabModel.providerGroups[0]?.route === 'aa',
+    '模型层要交出一条会话用到的全部提供商（按家分组）')
+  must(tabModel.providerGroups[0]?.label === 'my-bridge',
+    `外显名要取 DSH 设置里那一条（my-bridge），实际 ${JSON.stringify(tabModel.providerGroups[0])}`)
+  must(tabModel.providerGroups[0]?.models.includes('deepseek-v4.1-flash'),
+    '每家提供商下面要列出这条会话用到的模型')
+  must(tabModel.providerGroups[0]?.amountText === '¥0.500',
+    `每家要给出自己的金额，实际 ${tabModel.providerGroups[0]?.amountText}`)
+
+  const tabHtml = renderToStaticMarkup(React.createElement(SessionCostPanel, { model: tabModel }))
+  must(tabHtml.includes('my-bridge'),
+    `提供商一节必须显示供应商名称，实际：${tabHtml.slice(0, 800)}`)
+  must(tabHtml.includes('本条会话的提供商'), '这一节的标题应说明它列的是本条会话的提供商')
+  // 用户明确要求：不要回落到官方余额，也不需要识别来源账户。
+  must(!tabHtml.includes('DeepSeek 官方余额') && !tabHtml.includes('官方余额'),
+    '这一页不得再显示「官方余额」——那条回落数字会被读成「我在用的那家还剩多少钱」')
 }
 
 // ── 会话清单：第一列必须是**预览标题**（与侧栏同源），不是会话 id ──
@@ -5017,6 +5191,12 @@ function buildPayload(options = {}) {
         models: ['deepseek-flash@deepseek-official'],
         days: [days[0].key],
         live: true,
+        // 时间投入那一块要真的算出东西来：三段耗时 + 轮次 / 工具 / 最久一轮。
+        timing: { ttftMs: 120_000, genMs: 300_000, toolsMs: 60_000, steps: 36, totalMs: 480_000 },
+        steps: 36,
+        toolCalls: 24,
+        maxTurnMs: 90_000,
+        lastAt: start + 3_600_000,
       },
       {
         id: 'session-0f0271ab-540a-4ab4-a3d4-c5b8b1a986a0',

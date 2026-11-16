@@ -15,7 +15,7 @@
  */
 import { homedir } from 'node:os'
 import { rename, readFile, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import {
   DEFAULT_TIMEZONE,
   MODEL_RATES,
@@ -158,10 +158,59 @@ const CAPABILITIES = [
   // 与逐日花费。旧宿主没有这条路由（404），那时会话标签页显示「当前宿主不支持
   // 这条明细」而不是空白——降级必须可见。
   'sessionDetail',
+  // `/data?rev=<generatedAt>`：宿主在快照没变时只回 `{ unchanged: true }`。
+  // 客户端据此才可以高频轮询（否则每 3 秒要传 700 KB）；旧宿主不认识这个参数，
+  // 客户端会退回到 30 秒一次的低频轮询——**别让旧宿主被 3 秒一次的全量请求打爆**。
+  'deltaRev',
 ]
 
 /** 快照缓存有效期：会话日志只在使用后变化，短缓存即可挡住频繁刷新。 */
 const SNAPSHOT_TTL_MS = 20_000
+
+/**
+ * 后台重建的最小间隔。
+ *
+ * ## 为什么必须节流（实测：打开看板要等 5–8 秒）
+ *
+ * `session/flush` / `session/disposed` 与一轮对话里的通知事件都会让快照失效，
+ * 而本地实测一次**真实重建**要 5–8 秒（DSH 的 `persistence.list()` 要逐份
+ * 读会话日志头，本机 414 个会话约 6 秒；插件自己的聚合只有 300 ms）。
+ *
+ * 现在失效只打一个 `dirty` 标记，读请求**立刻返回上一份快照**，重建挪到后台；
+ * 加上 {@link LIST_TTL_MS} 之后，后台重建不再重读会话清单，实测约 300 ms，
+ * 因此可以每 3 秒补一次——数据最多落后几秒，而用户一次都不用等。
+ */
+const SNAPSHOT_REBUILD_MS = 3_000
+
+/**
+ * 会话清单（`persistence.list()`）的缓存时长。
+ *
+ * **这是「每次重建 5–8 秒」剩下的最后一块。** 清单要逐份读日志头，本机约 6 秒；
+ * 而一次对话的绝大多数变化只是「某条会话又多了几条事件」——那种变化由
+ * `session/event` 直接告诉我们（见 {@link UsageCatalog.noteSessionEvent}），
+ * 根本不需要重读清单。
+ *
+ * 因此清单缓存 60 秒：期间重建只重读**确实有事件到达的那几条**会话；
+ * 新会话由实时事件里的会话头补进来；一分钟后再重新列一次兜底。
+ */
+const LIST_TTL_MS = 60_000
+
+/**
+ * 会话级派生缓存（`session-cache.json`，本机约 14 MB）的最小写盘间隔。
+ *
+ * 重建现在几分钟内可能跑很多次，每次都把这 14 MB 重写一遍是纯浪费；
+ * 它只服务于「重启后第一次扫描」，30 秒一次足够。
+ */
+const CACHE_SAVE_MIN_MS = 30_000
+
+/**
+ * 磁盘快照的最小写盘间隔。
+ *
+ * 快照约 1 MB（整份看板数据 + 逐会话明细）。活跃会话里后台重建每 15 秒跑一次，
+ * 每次都写盘就等于每分钟写 4 MB——纯属浪费，而它只服务于「下次启动的第一眼」。
+ * 一分钟一次足够，代价最多是重启后看到的数据旧一分钟（界面上有「更新于」）。
+ */
+const SNAPSHOT_SAVE_MIN_MS = 60_000
 
 /** 单次读取的事件条数。 */
 const READ_CHUNK = 500
@@ -189,6 +238,14 @@ const AGENT_FACT_LIMIT = 500
  * 这个坑已经踩过一次（加 timing 时，用户看到「模型耗时 —」）。
  */
 const CACHE_SCHEMA = 2
+
+/**
+ * 磁盘快照（整份看板数据 + 逐会话明细）的格式版本。
+ *
+ * 与 {@link CACHE_SCHEMA} 分开命名、但同源：前者管「会话级派生结果的形状」，
+ * 这里管「整份快照」。两者的任一变化都必须让旧文件失效，因此取值跟着它走。
+ */
+const SNAPSHOT_FILE_VERSION = CACHE_SCHEMA
 
 /** 空用量累加器：总量 + 分时段。 */
 function emptyUsage() {
@@ -795,6 +852,71 @@ export class UsageCatalog {
     this.snapshotAt = 0
     this.inflight = undefined
     /**
+     * 整份看板快照的**磁盘副本**。
+     *
+     * 会话级缓存只解决「不用重读日志」，但一次重建仍要 5–8 秒（DSH 的
+     * `persistence.list()` 要逐份读日志头）。真正让「刚启动时点开看板」也瞬间
+     * 有数据的做法是：把上一轮算好的整份快照连同逐会话明细一起落盘，
+     * 启动后先把它当「旧数据」立即交出去，再在后台重建。
+     *
+     * 代价只在这份文件上（本机约 1 MB，写盘延迟合并 2 秒），而收益是
+     * **重启后第一次打开不再等一次全量扫描**。
+     *
+     * 文件名带上账本的文件名（`usage-ledger.jsonl.snapshot.json`）而不是固定的
+     * `snapshot.json`：同一目录里可能有**不同的账本**（测试、`DSH_PIXEL_LEDGER`
+     * 指到别处、多套环境共用临时目录）。固定名字会让 A 账本的快照被 B 账本
+     * 的实例读走，那是**静默的错数据**——不是「慢一点」。
+     */
+    this.snapshotFile = path === undefined
+      ? undefined
+      : join(dirname(path), `${basename(path)}.snapshot.json`)
+    /** 上一次写盘的时刻（见 SNAPSHOT_SAVE_MIN_MS）。 */
+    this.snapshotSavedAt = 0
+    /**
+     * 会话清单缓存（`{ at, snapshots }`）。
+     *
+     * 见 {@link LIST_TTL_MS}：一次 `persistence.list()` 要 6 秒，而绝大多数
+     * 重建只是「某条会话多了几条事件」。缓存它，重建就只剩重读那条会话 + 聚合。
+     * @type {{at:number, snapshots:object[]}|undefined}
+     */
+    this.listCache = undefined
+    /**
+     * 实时会话头（id → header），来自 `session/event` 的 Session 对象。
+     *
+     * 清单缓存期间**新建的会话不在缓存里**，但它们的事件已经在流里了；
+     * 用这张表把它们的会话头补进本轮扫描，新建会话才能立刻出现在看板上。
+     * @type {Map<string, object>}
+     */
+    this.liveHeaders = new Map()
+    /**
+     * 实时会话的合成 revision（id → 字符串）。
+     *
+     * 清单里没有它，就得自己造一个**稳定**的指纹：稳定才会在读过一次之后命中
+     * 派生缓存，不会每轮都重读；变化由 {@link liveDirty} 显式驱动。
+     * @type {Map<string, string>}
+     */
+    this.liveRevisions = new Map()
+    /**
+     * 自上次扫描以来**有新事件**的会话 id。
+     *
+     * 判据直接来自事件流（`session/event`），比重新读 414 份日志头便宜得多，
+     * 而且精确到「哪一条会话变了」。
+     * @type {Set<string>}
+     */
+    this.liveDirty = new Set()
+    /** 会话级缓存上一次写盘的时刻（见 CACHE_SAVE_MIN_MS）。 */
+    this.cacheSavedAt = 0
+    /** 快照「脏」标记：有会话日志变化，但不必立刻重建（见 SNAPSHOT_REBUILD_MS）。 */
+    this.dirty = false
+    /** 上一次真实构建完成的时刻，用于节流后台重建。 */
+    this.lastBuildAt = 0
+    /** 节流用的定时器（unref，不阻止进程退出）。 */
+    this.rebuildTimer = undefined
+    /** 磁盘快照的一次性读取 promise（并发请求共用）。 */
+    this.snapshotLoad = undefined
+    /** 磁盘快照是否已经尝试读过（含读失败）。 */
+    this.snapshotTried = false
+    /**
      * 单会话明细（会话 id → 取整后的逐模型 / 逐日用量）。
      *
      * 与 `snapshot` 同一生命周期：`build()` 生成快照时一起写这里。
@@ -802,12 +924,190 @@ export class UsageCatalog {
      * @type {Map<string, {byModel:object, byDay:object}>|undefined}
      */
     this.sessionDetails = undefined
+    /** 会话明细是否与当前快照配套（磁盘快照恢复时为 true；重建后仍为 true）。 */
+    this.sessionDetailsReady = false
   }
 
-  /** 让下一次请求重新扫盘。 */
+  /**
+   * 标记快照过期。
+   *
+   * **不再清空快照。** 清空意味着下一次读请求必须同步重建（实测 5–8 秒），
+   * 而会话一轮对话里会触发很多次失效（`session/flush` 就是每次落盘的检查点）。
+   * 现在只打脏标记：读请求立刻返回上一份快照，重建交给后台并节流。
+   */
   invalidate() {
-    this.snapshot = undefined
-    this.snapshotAt = 0
+    this.dirty = true
+  }
+
+  /**
+   * 记下「这条会话刚有新事件」。
+   *
+   * ## 为什么不再重扫清单
+   *
+   * `persistence.list()` 要逐份读 414 份日志头（本机 6 秒），而它换来的信息
+   * 只有「谁变了」。事件流本身就知道谁变了——这条监听器挂在 `session/event`
+   * 上，对**所有**会话都收得到（这正是通知功能已经依赖的事实）。
+   *
+   * 因此：把会话头抄下来（新建会话不在清单缓存里）、把 id 记进脏集合，
+   * 让下一轮重建只重读这几条。判据从「读 414 份头」降成「一次 Set.add」。
+   * @param {object} session - DSH 的 Session（有 id / header）。
+   * @param {object} event - 该条事件（这里只当作「有变化」的信号）。
+   * @returns {void}
+   */
+  noteSessionEvent(session, event) {
+    void event
+    const id = String(session?.id ?? session?.header?.id ?? '')
+    if (id === '') return
+    const header = session?.header
+    if (header !== null && typeof header === 'object') this.liveHeaders.set(id, header)
+    this.liveDirty.add(id)
+    this.dirty = true
+  }
+
+  /**
+   * 忘掉一条已销毁的会话的实时线索。
+   *
+   * 不清的话，`liveHeaders` 会把已删除的会话重新塞进每一轮扫描，而
+   * `liveDirty` 会只增不减。
+   * @param {string} id - 会话 id。
+   * @returns {void}
+   */
+  forgetSession(id) {
+    const key = String(id ?? '')
+    if (key === '') return
+    this.liveHeaders.delete(key)
+    this.liveRevisions.delete(key)
+    this.liveDirty.delete(key)
+  }
+
+  /**
+   * 本轮快照的版本号（客户端用它做「没变就别传 700 KB」）。
+   * @returns {number|undefined} 快照的生成时刻；没有快照时 undefined。
+   */
+  snapshotRev() {
+    return this.snapshot === undefined ? undefined : Number(this.snapshot.generatedAt ?? 0)
+  }
+
+  /**
+   * 取会话清单（带缓存，见 {@link LIST_TTL_MS}）。
+   * @param {object} persistence - sessionPersistence。
+   * @returns {Promise<object[]>} 快照清单。
+   */
+  async listSnapshotsCached(persistence) {
+    const now = Date.now()
+    if (this.listCache === undefined || now - this.listCache.at >= LIST_TTL_MS) {
+      this.listCache = { at: now, snapshots: await this.listSnapshots(persistence) }
+    }
+    return this.listCache.snapshots
+  }
+
+  /**
+   * 从磁盘恢复整份快照（只在进程内第一次读时做一次）。
+   *
+   * 坏文件一律当没有——缓存只负责快，不负责正确；读不出来就走真实扫描。
+   * @returns {Promise<void>} 完成。
+   */
+  async loadSnapshotFile() {
+    if (this.snapshotTried) return
+    this.snapshotTried = true
+    if (this.snapshotFile === undefined) return
+    try {
+      const text = await readFile(this.snapshotFile, 'utf8')
+      const parsed = JSON.parse(text)
+      if (parsed?.version !== SNAPSHOT_FILE_VERSION) return
+      const payload = parsed?.payload
+      if (payload === null || typeof payload !== 'object') return
+      // 已经有一次真实构建抢先完成时不覆盖它（更快也更准）。
+      if (this.snapshot !== undefined) return
+      this.snapshot = payload
+      this.snapshotAt = Number(parsed.builtAt ?? 0) || 0
+      const details = parsed?.details
+      if (details !== null && typeof details === 'object') {
+        this.sessionDetails = new Map(Object.entries(details))
+        this.sessionDetailsReady = true
+      }
+      // 磁盘上的这份必然是旧的：先交旧数据，后台补一次新的。
+      this.dirty = true
+    } catch {
+      // 没有文件 / 损坏 / 版本不符：都按「没有」处理。
+    }
+  }
+
+  /**
+   * 把整份快照（连同逐会话明细）落盘，供下次启动立即使用。
+   *
+   * 延迟 2 秒合并写一次：一次重建只写一次盘。写失败只是「下次启动慢一点」，
+   * 绝不能影响这次请求。
+   * @param {object|undefined} snapshot - 刚构建好的快照。
+   * @param {Map<string, object>|undefined} details - 与之配套的逐会话明细。
+   * @returns {void}
+   */
+  scheduleSnapshotSave(snapshot, details) {
+    if (this.snapshotFile === undefined || snapshot === undefined) return
+    const now = Date.now()
+    if (now - (this.snapshotSavedAt ?? 0) < SNAPSHOT_SAVE_MIN_MS) return
+    // 先记账再写：写失败时也要等到下一个窗口再试，避免每次重建都重写一遍。
+    this.snapshotSavedAt = now
+    const body = {
+      version: SNAPSHOT_FILE_VERSION,
+      builtAt: this.snapshotAt,
+      payload: snapshot,
+      ...(details === undefined ? {} : { details: Object.fromEntries(details) }),
+    }
+    const timer = setTimeout(() => {
+      const tmp = `${this.snapshotFile}.tmp`
+      writeFile(tmp, JSON.stringify(body), 'utf8')
+        .then(() => rename(tmp, this.snapshotFile))
+        .catch(() => {
+          // 写不进去不影响任何读数。
+        })
+    }, 2000)
+    timer?.unref?.()
+  }
+
+  /**
+   * 采用一份新构建的快照：更新内存、清脏标记、落盘。
+   * @param {object} snapshot - 构建结果。
+   * @returns {object} 同一份快照。
+   */
+  adoptSnapshot(snapshot) {
+    this.snapshot = snapshot
+    this.snapshotAt = Date.now()
+    this.lastBuildAt = this.snapshotAt
+    this.dirty = false
+    this.sessionDetailsReady = true
+    this.scheduleSnapshotSave(snapshot, this.sessionDetails)
+    return snapshot
+  }
+
+  /**
+   * 后台补一次重建（并发合并 + 节流）。
+   *
+   * 「有快照就先给快照」的前提是不能把进程拖住：这里永不抛错、永不阻塞调用方，
+   * 失败只是下一次再试。
+   * @param {number} now - 当前时刻。
+   * @returns {void}
+   */
+  revalidate(now) {
+    if (this.inflight !== undefined) return
+    const wait = SNAPSHOT_REBUILD_MS - (now - this.lastBuildAt)
+    if (wait > 0) {
+      if (this.rebuildTimer !== undefined) return
+      this.rebuildTimer = setTimeout(() => {
+        this.rebuildTimer = undefined
+        if (!this.dirty && Date.now() - this.snapshotAt < SNAPSHOT_TTL_MS) return
+        this.revalidate(Date.now())
+      }, Math.max(500, wait))
+      this.rebuildTimer?.unref?.()
+      return
+    }
+    this.inflight = this.build(now)
+      .then((snapshot) => this.adoptSnapshot(snapshot))
+      .catch(() => {
+        // 后台重建失败：保留旧快照，下一次再试（失败原因由手动刷新那条路呈现）。
+        return this.snapshot
+      })
+      .finally(() => { this.inflight = undefined })
   }
 
   /**
@@ -838,6 +1138,10 @@ export class UsageCatalog {
   /** 把会话级缓存写回磁盘（延迟合并，扫描结束后调一次）。 */
   scheduleCacheSave() {
     if (this.cacheFile === undefined || this.cacheDirty) return
+    const now = Date.now()
+    // 见 CACHE_SAVE_MIN_MS：重建很频繁，这 14 MB 不该每次重建都重写一遍。
+    if (now - this.cacheSavedAt < CACHE_SAVE_MIN_MS) return
+    this.cacheSavedAt = now
     this.cacheDirty = true
     this.cacheSaveTimer = setTimeout(() => {
       this.cacheDirty = false
@@ -855,19 +1159,39 @@ export class UsageCatalog {
   }
 
   /**
-   * 读取看板数据（TTL 缓存；并发请求共用同一次扫描）。
+   * 读取看板数据（stale-while-revalidate；并发请求共用同一次扫描）。
+   *
+   * ## 语义（这轮为「打开要等 5–8 秒」重写）
+   *
+   * | 情形 | 行为 |
+   * |---|---|
+   * | 有快照 + 没脏 + 没过期 | 立刻返回快照（几毫秒） |
+   * | 有快照 + 脏 / 过期 | **立刻返回旧快照**，后台节流重建（见 revalidate） |
+   * | 没有快照（进程刚起） | 先试磁盘快照，有就立刻返回 |
+   * | 强制刷新（`refresh: true`） | 同步重建——用户点「刷新」时期望拿到新数字 |
+   *
+   * 早先的语义是「过期就同步重建」，而一次重建实测 5–8 秒（DSH 的 list()
+   * 要逐份读日志头），且 session/flush 会不断让它过期，于是几乎每次打开
+   * 都在等一次全量扫描。这正是用户报的「用量看板和费用标签页要等一段时间」。
+   * @param {{refresh?:boolean}} [options] - refresh 为真时绕过缓存同步重建。
    * @returns {Promise<object>} 看板数据。
    */
-  async read() {
+  async read(options = {}) {
+    await this.loadSnapshotFile()
     const now = Date.now()
-    if (this.snapshot !== undefined && now - this.snapshotAt < SNAPSHOT_TTL_MS) return this.snapshot
+    if (options.refresh !== true && this.snapshot !== undefined) {
+      if (this.dirty || now - this.snapshotAt >= SNAPSHOT_TTL_MS) this.revalidate(now)
+      return this.snapshot
+    }
     if (this.inflight !== undefined) return this.inflight
+    // 显式刷新（用户点「重试」/ 需要一份最新的清单）时连清单一起重列：
+    // 否则「刷新」只是用旧清单再算一遍，新会话仍然看不见。
+    if (options.refresh === true) {
+      this.listCache = undefined
+      this.liveDirty.clear()
+    }
     this.inflight = this.build(now)
-      .then((snapshot) => {
-        this.snapshot = snapshot
-        this.snapshotAt = Date.now()
-        return snapshot
-      })
+      .then((snapshot) => this.adoptSnapshot(snapshot))
       .finally(() => {
         this.inflight = undefined
       })
@@ -875,24 +1199,19 @@ export class UsageCatalog {
   }
 
   /**
-   * 用**现有快照**回答，过期就在后台补一次刷新（stale-while-revalidate）。
+   * 用**现有快照**回答，过期/变脏就在后台补一次刷新（stale-while-revalidate）。
    *
    * ## 为什么需要它（用户报「每次读明细都要重新加载，打开好慢」）
    *
-   * `read()` 的语义是「过期就同步重建」。而一次重建要重扫全部会话日志
-   * （本机 400+ 会话），**这几秒的等待会落在用户点开明细的那一刻**——
-   * 因为 `/dsh-pixel/session` 每次都会调 `read()`。
-   *
-   * 明细的本质是「历史用量」，它不需要秒级新鲜度；拿一份 20 秒前的快照
-   * 完全够用。因此这里改成：有快照就**立刻返回**，同时（不阻塞）踢一次后台重建。
-   * 用户看到的是「瞬间打开」，数字最多落后一个 TTL。
+   * 明细的本质是「历史用量」，它不需要秒级新鲜度。这里永远不阻塞：有快照就
+   * 立刻返回，同时（不阻塞）踢一次后台重建。
    * @returns {object|undefined} 现有快照；从未构建过时是 undefined。
    */
   peekStale() {
     if (this.snapshot === undefined) return undefined
-    if (Date.now() - this.snapshotAt >= SNAPSHOT_TTL_MS && this.inflight === undefined) {
+    if (this.dirty || Date.now() - this.snapshotAt >= SNAPSHOT_TTL_MS) {
       // 后台刷新：失败也不能影响这次返回（结果下次再用）。
-      this.read().catch(() => {})
+      this.revalidate(Date.now())
     }
     return this.snapshot
   }
@@ -927,8 +1246,40 @@ export class UsageCatalog {
      * 因此这里 `peekStale()`：有快照立刻用（并在后台踢一次刷新）；
      * 只有**冷启动从未构建过**时才真的等一次重建。
      */
-    const data = this.peekStale() ?? await this.read()
-    const session = (data.sessions ?? []).find((row) => row.id === id)
+    // 「这次调用到底有没有真的重建过」按 lastBuildAt 判断：`read()` 在没有快照时
+    // 也可能只是从磁盘快照恢复（那样它是**瞬间**的，不该被当成「已经重建过」，
+    // 否则下面那句「快照里没有这条会话」就失去了一次补救的机会）。
+    const buildMark = this.lastBuildAt
+    let data = this.peekStale()
+    let rebuilt = false
+    if (data === undefined) {
+      // 冷启动且磁盘上也没有快照：这一次只能等真实重建。
+      data = await this.read()
+      rebuilt = this.lastBuildAt !== buildMark
+    } else if (this.sessionDetails === undefined || this.sessionDetailsReady !== true) {
+      // 有快照但明细没恢复（磁盘快照里没带明细）：等一次同步重建。
+      // 不这样的话这一页会显示「¥0」，而它其实只是明细还没到——那是静默的错数。
+      data = await this.read({ refresh: true })
+      rebuilt = true
+    }
+    const findSession = (snapshot) => (snapshot.sessions ?? []).find((row) => row.id === id)
+    let session = findSession(data)
+    if (session === undefined && !rebuilt) {
+      /**
+       * 快照里找不到这条会话：它可能是**刚创建的**，而快照最多落后十几秒
+       * （stale-while-revalidate 的代价）。这时若直接回 404「会话不存在」，
+       * 用户打开新建会话的「费用」页会看到一句错话。
+       *
+       * 但也不能无条件重建：真的已被删除的会话会让每次打开都白等一次全量扫描。
+       * 判据取「DSH 认为它还活着」或「快照本来就脏了」——两者都说明值得等一次。
+       */
+      const live = this.sessions?.()?.get?.(id) !== undefined
+      if (live || this.dirty) {
+        data = await this.read({ refresh: true })
+        rebuilt = true
+        session = findSession(data)
+      }
+    }
     if (session === undefined) return undefined
     const detail = this.sessionDetails?.get(id) ?? { byModel: {}, byDay: {} }
     // 模型显示名 / 提供商名：`data.models` 里已经算好，直接按复合键索引。
@@ -1036,7 +1387,26 @@ export class UsageCatalog {
    */
   async collect(now) {
     const persistence = this.persistence()
-    const snapshots = persistence === undefined ? [] : await this.listSnapshots(persistence)
+    const listed = persistence === undefined ? [] : await this.listSnapshotsCached(persistence)
+    /**
+     * 清单 + **实时补进来的新会话**。
+     *
+     * 清单缓存 60 秒，期间新建的会话不在里面；但它们的事件已经在流里，
+     * `liveHeaders` 收着它们的会话头。这里补成与清单同形状的一项
+     * （`revision` 用稳定合成值，见 liveRevisions），于是后续逻辑不用区分两种来源。
+     */
+    const snapshots = [...listed]
+    const known = new Set(listed.map((row) => String(row?.header?.id ?? '')))
+    for (const [id, header] of this.liveHeaders) {
+      if (known.has(id)) continue
+      let revision = this.liveRevisions.get(id)
+      if (revision === undefined) {
+        revision = `live:${id}`
+        this.liveRevisions.set(id, revision)
+      }
+      snapshots.push({ header, revision })
+      known.add(id)
+    }
     // 模型 / 提供商显示名目录：每次扫描重建一次（设置里改了模型名立刻反映到看板上）。
     const directory = await buildModelDirectory(this.llm())
     /** @type {object[]} */
@@ -1070,14 +1440,24 @@ export class UsageCatalog {
       // 会话清单里的日期与看板的日行对不上（生产里它是常量，但缓存不该靠这个假设）。
       const fingerprint = `v${CACHE_SCHEMA}:${String(snapshot.revision ?? '')}:${snapshot.eventCount ?? ''}:${snapshot.sizeBytes ?? ''}@${timezone}`
       const cached = this.cache.get(id)
+      /**
+       * **有事件到达就强制重读，不等指纹。**
+       *
+       * 清单缓存期间，`snapshot.revision` 是旧的：这条会话的日志明明变了，
+       * 指纹却不变。事件流已经告诉我们「谁变了」（`liveDirty`），
+       * 因此这里以它为准——这是「数据也是最新的」那半句话的实现。
+       */
+      const forced = this.liveDirty.has(id)
       // 缓存里存的是**派生结果**（记录 / 轮次数 / 标题 / 归日 / 名册），
       // 不是原始事件——见 readSession 的说明：留事件本身会让常驻内存随历史线性增长。
       let derived
-      if (cached !== undefined && cached.fingerprint === fingerprint) {
+      if (cached !== undefined && cached.fingerprint === fingerprint && !forced) {
         derived = cached
       } else {
         derived = { fingerprint, ...(await readSession(persistence, id, timezone)) }
         this.cache.set(id, derived)
+        // 读成功才清脏标记：抛错时留给下一轮重试。
+        this.liveDirty.delete(id)
       }
 
       const sessionDays = derived.days
@@ -1138,6 +1518,14 @@ export class UsageCatalog {
         // 父会话已被删除 / 不在本机：链断了，但仍然归到已知的最高祖先。
         ...(placement.detached ? { detached: true } : {}),
       })
+    }
+
+    /**
+     * 不在本轮清单里的脏标记（会话已被删除 / 已不在本机）别留着——
+     * 那个集合没有天然的上界，留着只会随着会话删建一直涨。
+     */
+    for (const id of this.liveDirty) {
+      if (!known.has(id)) this.liveDirty.delete(id)
     }
 
     // 这一轮扫描补上了新会话/新事件就落盘，下次启动直接复用（见 scheduleCacheSave）。
@@ -2008,6 +2396,25 @@ export default {
       llm: () => ctx.get('llm'),
     })
 
+    /**
+     * 启动后**后台预热一次快照**。
+     *
+     * 为什么：全新安装 / 升级后的第一轮没有磁盘快照，第一次点开看板仍要等一次
+     * 全量扫描（实测 5–8 秒）。这里在插件起来 3 秒后悄悄跑一次：不阻塞启动、
+     * 不挡任何请求；用户点开时快照已经在了。结果同时落盘，之后的重启都不用再等。
+     *
+     * 延迟 3 秒是刻意的：让 DSH 自己的启动流程（恢复会话、装载前端）先走完——
+     * 抢在它前面做一次全量重扫，只会让两边都变慢。
+     */
+    ctx.effect(() => {
+      const timer = setTimeout(() => {
+        // 预热失败无所谓：下一次真实请求会照常重建（错误由那条路径呈现）。
+        Promise.resolve(catalog.read()).catch(() => {})
+      }, 3000)
+      timer?.unref?.()
+      return () => { clearTimeout(timer) }
+    }, 'pixel-dashboard: 预热快照')
+
     // 开关存储两个功能**共用**：各写各的文件会互相覆盖（读—改—写竞态）。
     const prefs = new Preferences(resolvePrefsPath(), { balanceEnabled: true, plansEnabled: true, ...NOTIFY_DEFAULTS })
 
@@ -2532,16 +2939,29 @@ export default {
           return
         }
         const url = new URL(req.url ?? '/', 'http://localhost')
-        if (url.searchParams.get('refresh') === '1') catalog.invalidate()
-        let body
+        // 手动刷新（`refresh=1`）走**同步重建**：用户点「重试」/ 明确要一份最新数据时，
+        // 连会话清单一起重列（见 UsageCatalog.read）。常规读取走 stale-while-revalidate。
+        const force = url.searchParams.get('refresh') === '1'
+        /**
+         * `?rev=<上次拿到的 generatedAt>`：**没变就回一个几十字节的答复**。
+         *
+         * 看板要「不用点刷新也一直是最新的」，就得经常回来看一眼；而整份数据
+         * 700 KB，每 3 秒传一遍纯属浪费（还要重新渲染一整页图表）。
+         * 客户端带上自己那份版本号，宿主比对后只回 `{ unchanged: true }`。
+         */
+        const rev = url.searchParams.get('rev')
+        let payload
         try {
-          body = JSON.stringify(await catalog.read())
+          payload = await catalog.read({ refresh: force })
         } catch (error) {
           res.statusCode = 500
           res.setHeader('content-type', 'application/json; charset=utf-8')
           res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }))
           return
         }
+        const body = rev !== null && rev !== '' && String(catalog.snapshotRev()) === rev
+          ? JSON.stringify({ unchanged: true, rev })
+          : JSON.stringify(payload)
         res.statusCode = 200
         res.setHeader('content-type', 'application/json; charset=utf-8')
         res.setHeader('cache-control', 'no-store')
@@ -2549,11 +2969,13 @@ export default {
       },
     })
 
-    // 会话提交/关闭后数据会变：标记失效，下一次请求重扫。
+    // 会话提交/关闭后数据会变：标记失效（下一次读先给旧快照、后台再补）。
     ctx.on('session/flush', () => {
       catalog.invalidate()
     })
-    ctx.on('session/disposed', () => {
+    ctx.on('session/disposed', (session) => {
+      // 已删除的会话别留在「实时会话头」里，否则它会一直被重新塞进扫描。
+      catalog.forgetSession(session?.id)
       catalog.invalidate()
     })
 
@@ -2574,6 +2996,14 @@ export default {
     ctx.on('session/event', (session, event) => {
       try {
         const sessionId = String(session?.id ?? session?.header?.id ?? '')
+        /**
+         * **先喂看板**：把「谁刚有新事件」记下来（一次 Set.add + 抄一份会话头）。
+         *
+         * 这是「数据也是最新的」那半句话的来源：看板重建不再重扫 414 份日志头，
+         * 只重读这几条确实变了的会话。放在最前面是因为它与通知无关——
+         * 哪怕下面 `noticeOf` 抛错被 catch 掉，看板也不该因此停在旧数字上。
+         */
+        catalog.noteSessionEvent(session, event)
         // 先抄下来「谁是子智能体、叫什么」——`turn/end` 走到下面时就要用，
         // 而这两类事件本身很小（见 agentNames 的说明）。
         rememberAgentFact(sessionId, event)

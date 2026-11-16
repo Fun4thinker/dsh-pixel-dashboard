@@ -714,10 +714,10 @@ await check('时区变了要让派生缓存失效（days 是按站点时区归�
   assert.deepEqual(beijing.sessions[0].days, ['2026-09-11'], '北京时间下应归到次日')
 
   zone = 'UTC'
-  // 必须绕开那个 20 秒快照缓存：`read()` 在 TTL 内直接返回上一份快照，
+  // 必须绕开快照缓存：`read()` 在快照可用时直接返回上一份（stale-while-revalidate），
   // 不走 collect()，那样这条用例根本测不到指纹（第一版就踩了这个坑）。
-  catalog.invalidate()
-  const utc = await catalog.read()
+  // 现在用 `refresh: true` 强制同步重建。
+  const utc = await catalog.read({ refresh: true })
   assert.deepEqual(utc.sessions[0].days, ['2026-09-10'], '换时区后必须重新归日，不得复用旧缓存')
 })
 
@@ -743,14 +743,141 @@ await check('缓存命中时不重读日志，且派生结果与重扫一致', a
   })
   const first = await catalog.read()
   assert.equal(opens, 1, '首次扫描应读一次会话')
-  // 指纹没变 → 复用派生结果，不得重读日志
-  catalog.invalidate()
-  const second = await catalog.read()
+  // 指纹没变 → 复用派生结果，不得重读日志。
+  // 这里必须 `refresh: true`：常规 read() 现在直接返回旧快照（stale-while-revalidate），
+  // 那样连 collect() 都不会跑，这条用例就测不到「缓存命中」了。
+  const second = await catalog.read({ refresh: true })
   assert.equal(opens, 1, '指纹未变时刷新不得重读会话日志')
   // 复用缓存得到的数字必须与首次完全一致（派生结果没丢信息）
   assert.deepEqual(second.overview.totals, first.overview.totals, '复用缓存的聚合结果不得漂移')
   assert.deepEqual(second.sessions, first.sessions, '会话元信息不得漂移')
   assert.deepEqual(second.models, first.models, '模型条目不得漂移')
+})
+
+console.log('快照：先给旧数据 + 后台重建（打开看板不再等全量扫描）')
+
+/**
+ * 慢速假 persistence：模拟 DSH 的 `persistence.list()` 逐份读会话日志头
+ * （本机 414 个会话实测约 6 秒）。
+ *
+ * 只慢 40ms 是刻意的：这里的判据是「有没有被调用」，不是墙钟时长——
+ * 用秒数做断言会在快机器上「通过」、在慢机器上闪断。
+ * @param {string} id - 会话 id。
+ * @param {object[]} events - 该会话的事件。
+ * @param {number} delayMs - list() 的延迟。
+ * @param {{calls:number}} counter - 调用计数。
+ * @returns {object} 假 persistence。
+ */
+function slowPersistence(id, events, delayMs, counter) {
+  return {
+    async list() {
+      counter.calls += 1
+      await new Promise((resolve) => { setTimeout(resolve, delayMs) })
+      return [{ header: { id, createdAt: events[0].time, cwd: 'D:\\blog' }, revision: 'r1', eventCount: events.length }]
+    },
+    async open() {
+      return {
+        async read(offset = 0) { return { events: events.slice(offset) } },
+        async close() {},
+      }
+    },
+  }
+}
+
+const snapshotLedger = ledgerFor('snapshot-swr')
+const snapshotId = `warm-${process.pid}`
+const snapshotLog = [message(1, now, 'deepseek-flash', { input: 1000, output: 100 })]
+
+await check('失效后普通读立即返回旧快照；只有强制刷新才同步重建', async () => {
+  const counter = { calls: 0 }
+  const subject = new UsageCatalog({
+    persistence: () => slowPersistence(snapshotId, snapshotLog, 40, counter),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: snapshotLedger,
+  })
+  const first = await subject.read()
+  assert.equal(counter.calls, 1, '冷启动应真的扫一次')
+  // `session/flush` / `session/disposed` 都会走到这里：只打脏标记，不许丢快照。
+  subject.invalidate()
+  const stale = await subject.read()
+  assert.equal(counter.calls, 1,
+    '失效后的普通读必须立即返回旧快照，不得同步重建（否则用户每次打开看板都要等几秒）')
+  assert.equal(stale, first, '普通读返回的应是同一份快照')
+  const forced = await subject.read({ refresh: true })
+  assert.equal(counter.calls, 2, '强制刷新（用户点「刷新」）才同步重建')
+  assert.notEqual(forced, first, '强制刷新必须产出新快照')
+})
+
+await check('磁盘快照让「重启后第一次打开」立刻有数据（连全量 list() 都不用跑）', async () => {
+  // 快照是延迟 2 秒的合并写：等它落盘，再模拟「新进程读同一个账本目录」。
+  await new Promise((resolve) => { setTimeout(resolve, 2300) })
+  const counter = { calls: 0 }
+  const restarted = new UsageCatalog({
+    persistence: () => slowPersistence(snapshotId, snapshotLog, 40, counter),
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: snapshotLedger,
+  })
+  const warm = await restarted.read()
+  assert.equal(counter.calls, 0, '重启后第一次读不该跑一次全量 list()——那正是 5–8 秒的等待')
+  assert.equal(warm.sessions.length, 1, '磁盘快照里应带那条会话')
+  // 明细必须跟快照一起恢复：只恢复快照会让「费用」页显示 ¥0（静默的错数）。
+  const detail = await restarted.readSessionDetail(snapshotId)
+  assert.ok(detail !== undefined, '会话明细必须与快照一起恢复')
+  assert.equal(detail.entries.length, 1, '会话明细里的逐模型条目也要在')
+  rmSync(snapshotLedger, { force: true })
+  rmSync(`${snapshotLedger}.snapshot.json`, { force: true })
+})
+
+await check('会话事件只重读那一条会话，不重新列清单（否则每次重建都要 6 秒）', async () => {
+  let listCalls = 0
+  let opens = 0
+  const liveLog = [message(1, now, 'deepseek-flash', { input: 1000, output: 100 })]
+  const persistence = {
+    async list() {
+      listCalls += 1
+      return [{ header: { id: 'live-1', createdAt: now, cwd: 'D:\\blog' }, revision: 'r1', eventCount: liveLog.length, sizeBytes: 100 }]
+    },
+    async open() {
+      opens += 1
+      return {
+        async read(offset = 0) { return { events: liveLog.slice(offset) } },
+        async close() {},
+      }
+    },
+  }
+  const subject = new UsageCatalog({
+    persistence: () => persistence,
+    sessions: () => undefined,
+    timezone: () => DEFAULT_TIMEZONE,
+    ledgerPath: ledgerFor('live-update'),
+  })
+  await subject.read()
+  assert.equal(listCalls, 1, '首轮列一次清单')
+  assert.equal(opens, 1, '首轮读一次会话日志')
+
+  // 没有任何事件时再建一次：指纹没变 → 不重读、不重列。
+  const idle = await subject.build(Date.now())
+  assert.equal(listCalls, 1, '没有变化时不得重新列清单')
+  assert.equal(opens, 1, '没有变化时不得重读日志')
+  assert.equal(idle.sessions.length, 1)
+
+  // 事件流说这条会话变了：只重读这一条，清单仍然用缓存。
+  subject.noteSessionEvent({ id: 'live-1', header: { id: 'live-1', cwd: 'D:\\blog' } }, { type: 'assistant/message' })
+  const changed = await subject.build(Date.now())
+  assert.equal(listCalls, 1, '事件驱动的重建不该重新列清单（那 6 秒正是要省掉的）')
+  assert.equal(opens, 2, '只该重读收到事件的那一条会话')
+  assert.equal(changed.sessions.length, 1)
+
+  // 新建会话：清单缓存里还没有它，靠实时会话头补进来。
+  subject.noteSessionEvent({ id: 'live-2', header: { id: 'live-2', cwd: 'D:\\new' } }, { type: 'session/title' })
+  const fresh = await subject.build(Date.now())
+  assert.equal(listCalls, 1, '新会话不该逼出一次重新列清单')
+  assert.equal(opens, 3, '新会话要被读一次')
+  assert.ok(fresh.sessions.some((row) => row.id === 'live-2'), '新会话必须出现在清单里')
+  rmSync(ledgerFor('live-update'), { force: true })
+  rmSync(`${ledgerFor('live-update')}.snapshot.json`, { force: true })
 })
 
 console.log('ledger：本机用量账本')
