@@ -16,6 +16,7 @@
 import { ACCOUNTS_CSS } from './styles/accounts.js'
 import { PRICING_CSS } from './styles/pricing.js'
 import { SESSION_CSS } from './styles/session.js'
+import { REVIEW_CSS } from './styles/review.js'
 
 /*
  * 这里**不该再有** PIXEL_THEMES / PALETTE_OVERRIDES 一类东西。
@@ -1318,6 +1319,15 @@ const DASHBOARD = `
 }
 .px-detail * { box-sizing: border-box; }
 .px-detail-tone-purple { --px-accent: var(--px-tone-purple); }
+.px-detail-tone-green { --px-accent: var(--px-tone-green); }
+.px-detail { max-height: min(520px, calc(100dvh - 24px)); overflow-y: auto; overscroll-behavior: contain; }
+.px-detail-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; margin-bottom: 11px; padding: 3px; border-radius: 8px; background: color-mix(in srgb, var(--px-ink) 5%, transparent); }
+.px-detail-tabs button { min-height: 27px; border: 0; border-radius: 6px; padding: 3px 10px; color: var(--px-detail-label); background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
+.px-detail-tabs button[aria-selected='true'] { color: var(--px-ink); background: var(--px-surface); font-weight: 650; box-shadow: 0 1px 3px color-mix(in srgb, var(--px-ink) 12%, transparent); }
+.px-detail-tabs button:focus-visible { outline: none; box-shadow: var(--px-ring); }
+.px-detail .px-detail-row-wrap { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+.px-detail-row-wrap .px-detail-row-meter { display: none; }
+.px-detail-row-wrap .px-detail-row-value { white-space: normal; text-align: left; font-weight: 500; }
 .px-detail-tone-red { --px-accent: var(--px-tone-red); }
 
 /* 抬头：色点 + 标题 + 「估算」角标 + 右侧大号金额。
@@ -1335,7 +1345,7 @@ const DASHBOARD = `
   border-radius: 50%;
   background: var(--px-accent);
 }
-.px-detail-title { color: var(--px-ink); font-size: 12.5px; font-weight: 620; }
+.px-detail-title { min-width: 0; overflow-wrap: anywhere; color: var(--px-ink); font-size: 12.5px; font-weight: 620; }
 .px-detail-badge {
   align-self: center;
   padding: 0 5px;
@@ -1462,14 +1472,21 @@ const DASHBOARD = `
    早先在插槽内部用绝对定位 + right，那个 right 是相对**图标槽**解析的，
    文字因此怎么都离不开柱状图标。portal 到 row 之后这个问题从结构上消失。
 
-   颜色一律走 --px-* 令牌（--px-tone-green / --px-tone-red 已在深浅两套里
-   各自定义），因此深色模式下会自动换成更亮的那一支，不会糊在暗底上。 */
+   图标继承宿主颜色，倒计时消费宿主深浅色语义令牌并混入正文色保证小字可读；
+   仅消费令牌，不注册主题或修改宿主的行、选中态与焦点样式。 */
 
-/* 图标槽里的内容容器：只放柱状图图标。 */
+/* 图标槽只提供被动内容；整行选中底色、悬停和焦点环完全由宿主负责。 */
 .px-panel-entry {
   display: inline-flex;
   align-items: center;
-  pointer-events: none;
+  justify-content: center;
+  flex: none;
+  color: inherit;
+  line-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 /* 倒计时文字：row 里的普通 flex 项；margin-left: auto 把它推到行尾，
@@ -1479,16 +1496,16 @@ const DASHBOARD = `
   padding-left: 8px;
   white-space: nowrap;
   flex: none;
-  pointer-events: none;
-  font-family: var(--px-num-font);
+  cursor: inherit;
+  font-family: inherit;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
-  letter-spacing: 0.2px;
+  letter-spacing: 0;
 }
-/* 两个时期各一色：红 = 高峰（正贵着）、绿 = 空闲（正便宜） */
-.px-period-tone-red { color: var(--px-tone-red); }
-.px-period-tone-green { color: var(--px-tone-green); }
+/* 只消费宿主令牌；绿500过亮不宜直接作11px正文，混入正文色保持两套主题可读。 */
+.px-period-tone-red { color: color-mix(in srgb, var(--dsw-alias-state-error-primary, var(--px-tone-red)) 50%, var(--dsw-alias-label-primary, var(--px-ink))); }
+.px-period-tone-green { color: color-mix(in srgb, var(--dsw-alias-state-success-primary, var(--px-tone-green)) 50%, var(--dsw-alias-label-primary, var(--px-ink))); }
 
 /* 时段与计费：倒计时降级为一行次要信息，与计费口径同处一张紧凑卡片，
    不再单独占一张大面板（用户反馈「内容不多却占大量空间」）。 */
@@ -2414,7 +2431,7 @@ body[data-ds-dark-theme] .px-modal-mask { background: rgba(0, 0, 0, 0.58); }
  */
 export const STYLES = [
   ['tokens', TOKENS],
-  ['dashboard', DASHBOARD],
+  ['dashboard', DASHBOARD + REVIEW_CSS],
   ['pricing', PRICING_CSS],
   ['accounts', ACCOUNTS_CSS],
   ['session', SESSION_CSS],

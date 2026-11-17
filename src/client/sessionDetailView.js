@@ -105,7 +105,7 @@ export function TimingBreakdownView(props) {
     // 左端：总时长锚点
     h('div', { className: 'px-timing-total' },
       h('b', null, formatDurationMs(total)),
-      h('span', null, '模型在干活'),
+      h('span', null, '步骤耗时估算'),
       // 平均每轮放在这里：它是「总时长 ÷ 轮次」，与总时长同源，放一起最自然。
       Number(timing.turns) > 0
         ? h('span', { className: 'px-timing-avg' }, `平均每轮 ${formatDurationMs(total / Number(timing.turns))}`)
@@ -129,7 +129,7 @@ export function TimingBreakdownView(props) {
       // 「思考」无法切分：如实说明，不给假数。
       h('p', { className: 'px-timing-note' },
         '「模型思考」与「模型回复」在同一条消息里到达，日志层面无法分离，',
-        '因此合并计入「模型回复」。')))
+        '因此合并计入「模型回复」。步骤计时已排除问答工具区间（近似），与逐轮累计的有效耗时口径不同。')))
 }
 
 /**
@@ -138,7 +138,7 @@ export function TimingBreakdownView(props) {
  * ## 布局（三轮迭代后的定稿）
  *
  *   1. 团队标签页（有成员时）
- *   2. 四枚 hero 指标：金额 / Token / 模型耗时 / 工具次数
+ *   2. 四枚 hero 指标：金额 / Token / 会话用时 / 工具次数
  *   3. 耗时构成横向堆叠条——回答「时间花在哪」
  *   4. 两栏明细：花费与时段 / 时间与模型
  *   5. 请求分布条
@@ -146,8 +146,8 @@ export function TimingBreakdownView(props) {
  * ## 时间口径（用户纠正的关键点）
  *
  * 「活跃时长 = 创建到最后使用」被用户否掉了：会话放三周再用，会被算成几百小时。
- * 现在 hero 里的「模型耗时」= 等待 + 回复 + 工具，即**模型真正在干活的那段时间**；
- * 「平均每轮」= 模型耗时 / 轮次。这才是「我花了多少时间等它」。
+ * 现在 hero 里的「有效处理耗时」按已完成轮次的原始毫秒，扣除问答等待区间（近似）；
+ * 不采用 Chat 最少显示一秒的钳制。平均值只除以有起止计时的已完成轮次。
  *
  * ## `models` 的兜底
  *
@@ -168,10 +168,11 @@ export function SessionDetail(props) {
   const totals = session.totals ?? {}
   const cost = session.cost ?? {}
   const timing = session.timing ?? {}
-  const activeMs = Number(timing.totalMs ?? 0)
-  const turns = Number(session.turns ?? 0)
-  const avgTurnMs = activeMs > 0 && turns > 0 ? activeMs / turns : undefined
-  const maxTurnMs = Number.isFinite(session.maxTurnMs) && session.maxTurnMs > 0 ? session.maxTurnMs : undefined
+  const activeMs = session.completedTurnMs
+  const turns = Number(session.completedTurns ?? 0)
+  const hasDuration = Number.isFinite(activeMs) && turns > 0
+  const avgTurnMs = hasDuration ? activeMs / turns : undefined
+  const maxTurnMs = Number.isFinite(session.maxCompletedTurnMs) && turns > 0 ? session.maxCompletedTurnMs : undefined
 
   const peek = totals.peak ?? {}
   const pello = totals.idle ?? {}
@@ -215,14 +216,14 @@ export function SessionDetail(props) {
         : '全部落在高峰时段' }),
     h(HeroCard, { tone: 'blue', label: '总 Token', value: formatTokens(Number(totals.local ?? 0)),
       foot: `${totalRequests} 次请求` }),
-    // 模型耗时而不是「活跃时长」——见函数说明里的口径纠正。
-    h(HeroCard, { tone: 'green', label: '模型耗时', value: activeMs > 0 ? formatDurationMs(activeMs) : '—',
-      foot: avgTurnMs === undefined ? '等待 + 回复 + 工具' : `平均每轮 ${formatDurationMs(avgTurnMs)}` }),
+    // 已完成轮次的有效处理耗时（已扣问答等待）；step 三段是另一套诊断指标。
+    h(HeroCard, { tone: 'green', label: '有效处理耗时', value: hasDuration ? formatDurationMs(activeMs) : '—',
+      foot: avgTurnMs === undefined ? '暂无已完成轮次计时' : `已排除等待用户 ${formatDurationMs(session.awaitingUserMs ?? 0)}（近似）` }),
     h(HeroCard, { tone: 'purple', label: '工具调用', value: Number.isFinite(session.toolCalls) ? `${session.toolCalls} 次` : '—',
       foot: maxTurnMs === undefined ? undefined : `最久一轮 ${formatDurationMs(maxTurnMs)}` })),
 
   // 耗时构成：横向堆叠条 + 图例（替代上一版的环形图——用户明确不喜欢）。
-  h(TimingBreakdownView, { timing: { ...timing, turns: Number(session.turns ?? 0) } }),
+  h(TimingBreakdownView, { timing }),
 
   h('div', { className: 'px-dcols' },
     h('div', { className: 'px-dcol' },

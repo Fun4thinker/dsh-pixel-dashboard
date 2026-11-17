@@ -7,7 +7,7 @@
  * 用法: node tools/preflight.mjs
  */
 import { strict as assert } from 'node:assert'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -120,8 +120,9 @@ const ratesRoute = routeOf('/dsh-pixel/rates')
 const credsRoute = routeOf('/dsh-pixel/plan-credentials')
 // 路由条数是**有意**钉死的：新增路由必须在这里显式加一行，并想清楚它是否需要
 // 同源闸门与写权限，而不是让新增悄悄溜过去（见 lib/host.js 的注册处）。
-// 11 = version / period / balance / plans / session / notify / focus / toggle / rates / plan-credentials / data
-assert.equal(routes.length, 11, `应注册恰好十一条路由，实际 ${routes.length}`)
+// 12 = 原有十一条 + 只读窗口复盘 review（不改变 /data 形状）
+const reviewRoute = routeOf('/dsh-pixel/review')
+assert.equal(routes.length, 12, `应注册恰好十二条路由，实际 ${routes.length}`)
 
 /**
  * 最小 req/res 替身。
@@ -250,6 +251,20 @@ assert.ok(payload.capabilities.includes('deltaRev'),
   const stale = await call(dataRoute, 'GET', '/dsh-pixel/data?rev=0')
   const staleBody = JSON.parse(stale.body)
   assert.ok(Array.isArray(staleBody.sessions), 'rev 对不上时应回整份数据（含 sessions）')
+}
+// 新复盘接口为独立只读精确路由，错误不能回一份假的零账目。
+{
+  const response = await call(reviewRoute, 'GET', '/dsh-pixel/review?days=7')
+  assert.equal(response.statusCode, 500, '无 persistence 时复盘应报数据不可用，不是假零')
+  const review = JSON.parse(response.body)
+  assert.match(review.error, /sessionPersistence/)
+  assert.equal(review.summary, undefined)
+  assertNoSecrets(response.body, '复盘响应')
+  for (const query of ['days=1', 'days=invalid', 'days=7.5']) {
+    const invalid = await call(reviewRoute, 'GET', `/dsh-pixel/review?${query}`)
+    assert.equal(invalid.statusCode, 400, `无效窗口 ${query} 应被拒绝`)
+  }
+  assert.equal((await call(reviewRoute, 'POST')).statusCode, 405)
 }
 assert.equal(payload.overview.sessions, 0, '无 persistence 时会话数应为 0')
 assert.ok(Array.isArray(payload.days), '响应应含 days 数组')
@@ -1796,6 +1811,232 @@ const rejectedProvider = (await rejectedService.read({ refresh: true })).provide
 assert.equal(rejectedProvider.ok, false)
 assert.equal(rejectedProvider.reason, 'rejected', '信封里的鉴权错误应归为 rejected（即使 HTTP 是 401）')
 assert.ok(rejectedProvider.hint.includes('AccessKey'), '必须提示要的是 AccessKey 而不是推理 Key')
+
+// ── Codex：与 dsh-codex-subscription 共用同一份登录态 ──────────────
+// 背景（本机实测）：会话里 Codex 用得好好的，输入框下面那一行额度却写「不可用」。
+// 两枚 token 属于同一个账号，只是 `~/.codex/auth.json` 那枚早已过期，而插件里那枚
+// 还新鲜——数字错不在取数，而在「读的是谁的那一份」。这一组断言把新口径钉住：
+// 优先级 = 显式环境变量 > 插件登录态 > CLI auth.json，且两者都在时**已过期的让位**。
+const {
+  parseCodexOAuthCredential, codexPluginCredential, jwtExpiryOf, PlansService: CodexPlansService,
+  CODEX_PLUGIN_VAULT_KEY, CODEX_USAGE_URL, CODEX_TOKEN_ENVS,
+} = plansModule
+
+/** 造一枚只带 `exp` 的假 JWT（本插件不验签，只读 exp）。 */
+const fakeJwt = (exp) => [
+  'eyJhbGciOiJSUzI1NiJ9',
+  Buffer.from(JSON.stringify({ exp })).toString('base64url'),
+  'sig',
+].join('.')
+
+const nowSec = Math.floor(Date.now() / 1000)
+// 1) JWT 过期时刻：秒 → 毫秒；不是 JWT 时返回 undefined（「不知道」不等于「已过期」）
+assert.equal(jwtExpiryOf(fakeJwt(nowSec + 3600)), (nowSec + 3600) * 1000, '应从 JWT 的 exp 读过期时刻')
+assert.equal(jwtExpiryOf('not-a-jwt'), undefined, '读不出过期时刻时必须返回 undefined')
+assert.equal(jwtExpiryOf('a.%%%not-base64%%%.c'), undefined, '坏 payload 不得抛错，应安静降级')
+
+// 2) 插件写下的那条 OAuth：JSON 字符串与对象都要认，字段名要逐字对齐
+const pluginCredential = {
+  type: 'oauth',
+  access: fakeJwt(nowSec + 3600),
+  refresh: 'rt.1.fake',
+  expires: (nowSec + 3600) * 1000,
+  accountId: 'acct-active',
+  email: 'user@example.com',
+}
+const parsedOauth = parseCodexOAuthCredential(JSON.stringify(pluginCredential))
+assert.equal(parsedOauth.accessToken, pluginCredential.access, '应能解析插件的 OAuth JSON')
+assert.equal(parsedOauth.accountId, 'acct-active', 'accountId 必须带出来（请求头要用）')
+assert.equal(parseCodexOAuthCredential(pluginCredential).accessToken, pluginCredential.access, '已解析对象同样要认')
+assert.equal(parseCodexOAuthCredential('{"type":"oauth"}'), undefined, '没有 access 就不是可用凭据')
+assert.equal(parseCodexOAuthCredential('{broken'), undefined, '坏 JSON 不得抛错')
+
+// 3) 多账号 vault：必须按 activeId 挑，绝不能拿第一个
+const vaultRecord = {
+  kind: 'grant',
+  payload: {
+    version: 1,
+    activeId: 'id-active',
+    accounts: [
+      { id: 'id-other', label: 'Account 2', credential: { ...pluginCredential, access: fakeJwt(nowSec + 60), accountId: 'acct-other' } },
+      { id: 'id-active', label: 'Account 1', credential: pluginCredential },
+    ],
+  },
+}
+const activeCredential = codexPluginCredential(vaultRecord)
+assert.equal(activeCredential.accountId, 'acct-active', 'vault 必须按 activeId 挑账号（挑第一个会拿别人的额度）')
+assert.equal(activeCredential.label, 'Account 1', '账号标签要带出来供界面说明')
+assert.equal(
+  codexPluginCredential({ ...vaultRecord, payload: { ...vaultRecord.payload, activeId: 'id-missing' } }),
+  undefined,
+  'activeId 对不上任何一条时不得猜一个：那是坏记录，宁可说不可用',
+)
+
+/** 造一个只提供 Codex 记录的凭据服务（顺带记录有没有人试图写）。 */
+const codexCredentialService = (record) => ({
+  readRecord: async (key) => (key === CODEX_PLUGIN_VAULT_KEY ? record : undefined),
+  resolve: async () => undefined,
+  set: async () => { throw new Error('本插件不得写凭据') },
+  unset: async () => { throw new Error('本插件不得写凭据') },
+})
+
+/** 假 fetch：记下每一次请求，只对 Codex 用量端点给真形状的响应。 */
+const recordingFetch = (sent) => async (url, init) => {
+  const href = String(url)
+  sent.push({ url: href, headers: init?.headers ?? {} })
+  if (href === CODEX_USAGE_URL) {
+    return new Response(JSON.stringify({
+      plan_type: 'plus',
+      rate_limit: {
+        allowed: true,
+        limit_reached: false,
+        primary_window: { used_percent: 12, limit_window_seconds: 18000, reset_after_seconds: 60, reset_at: nowSec + 600 },
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+}
+
+/** 直接读一次套餐并取出 Codex 那一家。 */
+const readCodex = async (service) => (await service.read({ refresh: true })).providers.find((item) => item.id === 'codex')
+
+// 4) 端到端：插件里登录过 → 拿的就是它那一份，且请求头带着同一条 accountId
+{
+  const sent = []
+  const service = new CodexPlansService({
+    credentials: () => codexCredentialService(vaultRecord),
+    fetchImpl: recordingFetch(sent),
+    prefs: async () => ({ plansEnabled: true }),
+    env: {},
+  })
+  const codex = await readCodex(service)
+  const request = sent.find((item) => item.url === CODEX_USAGE_URL)
+  assert.equal(codex.ok, true, '插件登录态可用时应能取到额度')
+  assert.equal(request.headers.authorization, `Bearer ${pluginCredential.access}`,
+    '发出去的必须是插件那一份 token——这正是「同一个凭据来源」')
+  assert.equal(request.headers['chatgpt-account-id'], 'acct-active', 'accountId 必须与所用 token 同源')
+  assert.equal(codex.keyRef, CODEX_PLUGIN_VAULT_KEY, '要能说清这一枚 token 来自插件的多账号记录')
+  assert.equal(codex.keySource, 'codex-subscription', '来源层要标成插件登录态，界面才解释得清')
+  assert.ok(!JSON.stringify(codex).includes(pluginCredential.access), '响应里绝不能出现 token 原值')
+}
+
+// 5) 旧单条引用（没有记录服务的旧版本 / 迁移中途）同样要能用
+{
+  const sent = []
+  const service = new CodexPlansService({
+    credentials: () => ({
+      resolve: async (ref) => (ref === 'OPENAI_CODEX_SUBSCRIPTION_OAUTH'
+        ? { value: JSON.stringify(pluginCredential), source: 'file' }
+        : undefined),
+    }),
+    fetchImpl: recordingFetch(sent),
+    prefs: async () => ({ plansEnabled: true }),
+    env: {},
+  })
+  const codex = await readCodex(service)
+  const request = sent.find((item) => item.url === CODEX_USAGE_URL)
+  assert.equal(codex.ok, true, '单条 OAuth 引用也应能取到额度')
+  assert.equal(request.headers.authorization, `Bearer ${pluginCredential.access}`, '单条引用同样要真的用上')
+  assert.equal(codex.keyRef, 'OPENAI_CODEX_SUBSCRIPTION_OAUTH', '来源要指向那条引用名')
+}
+
+// 6) 两份都在时：插件那枚新鲜 → 用插件；插件那枚过期 → 让位给还没过期的 CLI 文件。
+//    这一档是必须的：用过期那份只会换来 401，而界面会把它说成「凭据被拒」——
+//    等于指控一份其实没问题的登录态。
+{
+  const authDir = join(tmpdir(), `dsh-pixel-codex-${process.pid}`)
+  mkdirSync(authDir, { recursive: true })
+  const authFile = join(authDir, 'auth.json')
+  const fileToken = fakeJwt(nowSec + 7 * 3600)
+  writeFileSync(authFile, JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { access_token: fileToken, account_id: 'acct-file' },
+  }), 'utf8')
+
+  // 6a) 插件新鲜：插件赢（同一个账号、且它会自己刷新）
+  {
+    const sent = []
+    const service = new CodexPlansService({
+      credentials: () => codexCredentialService(vaultRecord),
+      fetchImpl: recordingFetch(sent),
+      prefs: async () => ({ plansEnabled: true }),
+      env: { CODEX_HOME: authDir },
+    })
+    const codex = await readCodex(service)
+    const request = sent.find((item) => item.url === CODEX_USAGE_URL)
+    assert.equal(request.headers.authorization, `Bearer ${pluginCredential.access}`,
+      '两份都新鲜时应优先用插件那一份（它与会话里用的是同一份）')
+    assert.equal(codex.ok, true)
+  }
+
+  // 6b) 插件那枚过期：改用 CLI 文件那枚，而不是拿着过期的去撞 401
+  {
+    const sent = []
+    const expiredRecord = {
+      ...vaultRecord,
+      payload: {
+        ...vaultRecord.payload,
+        accounts: [{
+          id: 'id-active',
+          label: 'Account 1',
+          credential: { ...pluginCredential, access: fakeJwt(nowSec - 60), expires: (nowSec - 60) * 1000 },
+        }],
+      },
+    }
+    const service = new CodexPlansService({
+      credentials: () => codexCredentialService(expiredRecord),
+      fetchImpl: recordingFetch(sent),
+      prefs: async () => ({ plansEnabled: true }),
+      env: { CODEX_HOME: authDir },
+    })
+    const codex = await readCodex(service)
+    const request = sent.find((item) => item.url === CODEX_USAGE_URL)
+    assert.equal(request.headers.authorization, `Bearer ${fileToken}`,
+      '插件那枚过期时应让位给没过期的那一枚，而不是拿过期的去换一个 401')
+    assert.equal(request.headers['chatgpt-account-id'], 'acct-file', 'accountId 必须跟着实际用的 token 走')
+    assert.equal(codex.keyRef, '(auth.json)', '来源要如实指向实际用的那一处')
+  }
+
+  // 6c) 显式环境变量最高优先级：用户写了什么就用什么，插件不越权改判
+  {
+    const sent = []
+    const explicitToken = fakeJwt(nowSec + 600)
+    const service = new CodexPlansService({
+      credentials: () => ({
+        ...codexCredentialService(vaultRecord),
+        resolve: async (ref) => {
+          if (ref === CODEX_TOKEN_ENVS[0]) return { value: explicitToken, source: 'env' }
+          if (ref === 'CODEX_ACCOUNT_ID') return { value: 'acct-env', source: 'env' }
+          return undefined
+        },
+      }),
+      fetchImpl: recordingFetch(sent),
+      prefs: async () => ({ plansEnabled: true }),
+      env: { CODEX_HOME: authDir },
+    })
+    await readCodex(service)
+    const request = sent.find((item) => item.url === CODEX_USAGE_URL)
+    assert.equal(request.headers.authorization, `Bearer ${explicitToken}`,
+      '显式配置的 token 优先级最高，插件不得用自己那份盖掉用户的选择')
+    assert.equal(request.headers['chatgpt-account-id'], 'acct-env', '显式配置的账号 id 同样优先')
+  }
+
+  rmSync(authDir, { recursive: true, force: true })
+}
+
+// 7) 只读：整条路径不得调用任何写操作（set / unset 都会抛错，跑不通就说明有人写了）
+{
+  const service = new CodexPlansService({
+    credentials: () => codexCredentialService(vaultRecord),
+    fetchImpl: recordingFetch([]),
+    prefs: async () => ({ plansEnabled: true }),
+    env: {},
+  })
+  await readCodex(service)
+  const codexProvider = await service.readCodexPluginCredential()
+  assert.equal(codexProvider.accessToken, pluginCredential.access, '读取插件登录态必须成功')
+}
+
 
 // 自动发现：读不到文件时必须安静地返回 undefined，而不是抛错
 assert.equal(readCommandCodeKey(join(tmpdir(), `dsh-pixel-nonexistent-${process.pid}.json`)), undefined, '文件不存在时应返回 undefined')

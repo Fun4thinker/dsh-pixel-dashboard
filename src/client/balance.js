@@ -26,6 +26,37 @@ const REQUEST_TIMEOUT_MS = 15_000
  */
 const CURRENCY_SYMBOLS = { CNY: '¥', USD: '$' }
 
+function amountOf(value) {
+  if (value === null || value === undefined || typeof value === 'boolean'
+    || typeof value === 'string' && value.trim() === '') return undefined
+  const amount = Number(value)
+  return Number.isFinite(amount) ? amount : undefined
+}
+
+/** One currency, one balance fact. Signed-in wallets are components; API totals already include grants. */
+export function balanceRows(payload) {
+  if (!payload || typeof payload !== 'object') return []
+  const wallets = payload.wallets
+  const bonuses = payload.bonusWallets
+  if (Array.isArray(wallets) || Array.isArray(bonuses)) {
+    const currencyOf = (row) => typeof row?.currency === 'string' && row.currency !== '' ? row.currency : 'UNKNOWN'
+    const currencies = [...new Set([...(Array.isArray(wallets) ? wallets : []), ...(Array.isArray(bonuses) ? bonuses : [])].map(currencyOf))]
+    const sum = (rows, currency) => {
+      if (!Array.isArray(rows)) return undefined
+      const amounts = rows.filter((row) => currencyOf(row) === currency).map((row) => amountOf(row?.total))
+      return amounts.some((amount) => amount === undefined) ? undefined : amounts.reduce((total, amount) => total + amount, 0)
+    }
+    return currencies.map((currency) => {
+      const toppedUp = sum(wallets, currency), granted = sum(bonuses, currency)
+      return { currency, toppedUp, granted, total: toppedUp === undefined || granted === undefined ? undefined : toppedUp + granted }
+    })
+  }
+  return (Array.isArray(payload.balances) ? payload.balances : []).map((row) => ({
+    currency: typeof row?.currency === 'string' && row.currency !== '' ? row.currency : 'UNKNOWN',
+    total: amountOf(row?.total), toppedUp: amountOf(row?.toppedUp), granted: amountOf(row?.granted),
+  }))
+}
+
 /**
  * 格式化一个可能缺失的金额。
  *
@@ -52,9 +83,7 @@ export function formatMoney(value, currency) {
  * @returns {boolean} 是否有金额。
  */
 export function hasBalance(payload) {
-  if (payload === null || typeof payload !== 'object') return false
-  if (!Array.isArray(payload.balances)) return false
-  return payload.balances.some((row) => Number.isFinite(Number(row?.total)))
+  return balanceRows(payload).some((row) => row.total !== undefined)
 }
 
 /**
@@ -68,7 +97,7 @@ export function hasBalance(payload) {
  */
 export function balanceSummary(payload) {
   if (!hasBalance(payload)) return undefined
-  const rows = payload.balances.filter((row) => Number.isFinite(Number(row?.total)))
+  const rows = balanceRows(payload).filter((row) => row.total !== undefined)
   if (rows.length === 0) return undefined
   const primary = rows.find((row) => row.currency === 'CNY') ?? rows[0]
   return formatMoney(primary.total, primary.currency)

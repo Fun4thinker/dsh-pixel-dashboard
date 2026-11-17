@@ -1725,7 +1725,14 @@ const dockUnavailable = renderToStaticMarkup(React.createElement(SessionCostView
 }))
 must(dockUnavailable.includes('不可用'), '绑定到的那一家取不到时必须显示「不可用」')
 must(dockUnavailable.includes('px-pill-warn'), '不可用那一枚应带告警样式')
-must(dockUnavailable.includes('ZHIPU_CODING_API_KEY'), '悬停里要给出具体原因，否则用户无从下手')
+must(dockUnavailable.includes('展开账户详情'), '不可用账户也应能打开原因卡片，而非只剩裸tooltip')
+{
+  const { accountDetailModel } = await import(pathToFileURL(join(root, 'lib', 'client', 'dockDetail.js')).href)
+  const reasonCard = renderToStaticMarkup(React.createElement(viewModule.CostDetailPanel, {
+    model: accountDetailModel({ account: { kind: 'unavailable', label: '智谱', source: 'route', reason: '没有找到 ZHIPU_CODING_API_KEY' } }),
+  }))
+  must(reasonCard.includes('ZHIPU_CODING_API_KEY'), '账户卡片必须可读地给出具体失败原因')
+}
 must(dockUnavailable.includes('本次会话'), '账户那一枚不可用时费用仍要显示')
 
 // 余额取不到时：不渲染余额那一枚，但费用照常显示（余额坏掉不该拖垮费用）
@@ -1967,6 +1974,7 @@ must(shellHtml.includes('px-loading'), 'Dashboard 容器首屏应渲染加载骨
 const entryRegistration = registrations.find((item) => item.slot === 'sidebar.panellist')
 const iconHtml = renderToStaticMarkup(React.createElement(entryRegistration.component, { size: 18, active: true }))
 must(iconHtml.includes('<svg'), '侧栏图标没有渲染出 svg')
+must(!iconHtml.includes('<button'), '侧栏图标槽不得再嵌套按钮；选中底色、边框和点击交给宿主行')
 
 // ── 侧栏按钮上的时段指示灯 ──────────────────────────────────────
 const {
@@ -2152,41 +2160,25 @@ must(periodTitle(undefined) === '用量看板', '拿不到相位时应退回原�
     'createPortal 的目标必须是 usePanelRow 找到的 row 元素')
   must(!/paddingRight\s*:\s*reserve/.test(entrySource),
     '不该再用「给标题预留宽度」那套：环现在是 flex 兄弟节点，不占标题的位置')
-  // 认 row 的判据：**跳过我们自己那个按钮**，取产品那一行。
-  //
-  // 这里曾经写反过：早先断言的是 `closest('button')`，理由是「产品的面板行本身
-  // 就是一个 <button>」。看起来是结构事实，实际是错的——**我们自己**也渲染了
-  // 一个 <button>，而且套在产品的 row 按钮里面。于是 closest('button') 命中的是
-  // 我们自己那颗按钮：宽度只有十几像素 → 档位判定成 none → 倒计时什么都不显示，
-  // 且完全不报错。现在的主判据是「第一个不是我们自己的 button 祖先」。
-  //
-  // 断言前必须**去掉注释**：这段代码的文档注释里就写着这些标识符，直接搜整个
-  // 文件的话，把真正的代码删掉、只留注释也能通过（实测如此）——那是假闸门。
+  // 图标槽不再拥有第二个按钮；寻找和计时标记都使用宿主自己的可点击行。
   const entryCode = entrySource
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/(^|\s)\/\/[^\n]*/g, '$1')
-  must(!/closest\(\s*'button'\s*\)/.test(entryCode),
-    "usePanelRow 不得用 closest('button') 认 row——我们自己就渲染了一个 <button> "
-    + '并套在产品的 row 按钮里，closest 会命中我们自己那个，量到的宽度只有图标宽')
-  must(/tagName/.test(entryCode) && /BUTTON/.test(entryCode),
-    "usePanelRow 必须按 tagName === 'BUTTON' 逐层找，才能把「我们自己那个」跳过去")
-  must(/ownRef/.test(entryCode),
-    'usePanelRow 必须用 ownRef 排除我们自己渲染的那个按钮')
-  // 光「提到 ownRef」不够：真正防住 bug 的是那一句**比较**。
-  // 实测过——只把 `candidate !== own` 里的排除去掉、变量声明照旧留着，
-  // 这条闸门就会放行，而界面上的倒计时确实又没了。
-  must(/candidate\s*!==\s*own\b/.test(entryCode),
-    'usePanelRow 认 row 时必须真的把「我们自己那个按钮」比较掉'
-    + '（candidate !== own）；只留着 ownRef 声明是不起作用的')
-  must(/parentElement/.test(entryCode),
-    'usePanelRow 应沿 parentElement 往上找 row')
-  must(!/width\s*>=\s*100/.test(entryCode),
-    '不该再用「宽度 ≥ 100px」当主判据认 row：首帧与收起动画里宽度可以是 0，会认错')
+  must(/parentElement|closest\s*\(/.test(entryCode), '倒计时仍应定位到宿主的祖先行')
+  must(/BUTTON/.test(entryCode), '行识别应落在宿主按钮，不能只靠图标宽度猜测')
+  must(/observer\.observe\(row\)/.test(entryCode), '观察宿主行宽，不能只观察固定大小图标')
+  must(!/document\.(querySelector|querySelectorAll)|classList/.test(entryCode), '不得全局猜测或修改宿主选中态')
+  for (const active of [false, true]) {
+    const entryHtml = renderToStaticMarkup(React.createElement(entryRegistration.component, { size: 18, active }))
+    must(entryHtml.includes('<svg'), '未选中和选中时都应保留图标')
+    must(!entryHtml.includes('<button') && !entryHtml.includes('aria-pressed'), '图标槽不能再创建第二个交互目标')
+    must(!/box-shadow:|background:|border:/.test(entryHtml), '图标不能额外绘制一层选中边框/底色/阴影')
+  }
 
   // 档位：宽 → 完整文案；中 → 只有时长；窄（侧栏收起）→ 什么都不显示。
   must(panelEntryLayout({ rowWidth: 240 }).placement === 'full',
     '宽侧栏应显示完整文案（如「空闲期剩2时15分」）')
-  must(panelEntryLayout({ rowWidth: 160 }).placement === 'short',
+  must(panelEntryLayout({ rowWidth: 180 }).placement === 'short',
     '中等宽度应只显示时长（时期由颜色表达，省下的字留给标题）')
   must(panelEntryLayout({ rowWidth: 36 }).placement === 'none',
     '侧栏收起成图标条时什么都不该显示')
@@ -2195,7 +2187,7 @@ must(periodTitle(undefined) === '用量看板', '拿不到相位时应退回原�
   // 档位必须随行宽收窄而**单调变保守**：出现「窄行反而更完整」就是门槛写反了
   const order = { full: 2, short: 1, none: 0 }
   let previous = Number.POSITIVE_INFINITY
-  for (const rowWidth of [400, 240, 210, 209, 160, 150, 149, 100, 56, 36]) {
+  for (const rowWidth of [400, 240, 239, 210, 180, 179, 160, 100, 56, 36]) {
     const rank = order[panelEntryLayout({ rowWidth }).placement]
     must(rank <= previous, `行宽 ${rowWidth} 的档位不应比更宽的行更激进`)
     previous = rank
@@ -2491,8 +2483,8 @@ must(css.includes('.px-period-inline'), '缺少倒计时文字的容器样式')
   must(!/position\s*:\s*absolute/.test(inlineBlock[1]),
     '倒计时不得绝对定位——它必须是 row 里的普通 flex 项')
   must(!/position\s*:\s*fixed/.test(inlineBlock[1]), '倒计时不得 fixed')
-  must(/pointer-events\s*:\s*none/.test(inlineBlock[1]),
-    '倒计时要 pointer-events: none，否则会抢走按钮的悬停/点击')
+  must(!/pointer-events\s*:\s*none/.test(inlineBlock[1]),
+    '倒计时普通span应能显示title提示；点击自然冒泡到宿主，不创建额外按钮')
   // 不折行：这一行本来就窄，折成两行会把侧栏那一行撑高
   must(/white-space\s*:\s*nowrap/.test(inlineBlock[1]),
     '倒计时必须 white-space: nowrap，否则窄栏里会折成两行把行高撑开')
@@ -2889,6 +2881,7 @@ const payload = buildPayload()
 
 // ── 多厂商费用：GLM 不分时只列一列，估算价要标注 ─────────────────
 const glmHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'accounts',
   data: buildPayload({ models: 'multi' }),
   now: Date.now(),
   refreshing: false,
@@ -3313,6 +3306,7 @@ must(mixedTight?.window?.window === 'weekly', '应跳过未知的那个，选中
 
 // 看板：带上套餐数据渲染，断言卡片与进度条都出现
 const plansHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'accounts',
   data: payload,
   now: payload.generatedAt,
   refreshing: false,
@@ -3341,12 +3335,13 @@ must(plansHtml.includes('AccessKey'), '套餐面板应说明火山要的是 Acce
 // 充值 / 管理入口：用户看到额度不够时的下一步动作
 must(plansHtml.includes('commandcode.ai/studio'), '套餐面板应给出 Command Code 管理入口')
 must(plansHtml.includes('console.volcengine.com'), '套餐面板应给出火山控制台入口')
-must(plansHtml.includes('platform.deepseek.com/usage'), '余额面板应给出 DeepSeek 官方用量/充值入口')
+// DeepSeek 钱包入口留在总览用户卡，下面单独校验；账户页不重复总览卡。
 
 // ── 卡片上的「未知百分比」：显示 — 与原因，绝不显示 0.0% ──────────
 // 这一块是用户报的那个 bug 的正面回归：Command Code 的月度窗口只有余额时，
 // 卡片必须说「不知道」，而不是画一条 0.0% 的空条。
 const unknownPercentHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'accounts',
   data: payload,
   now: payload.generatedAt,
   refreshing: false,
@@ -3387,6 +3382,7 @@ must(!unknownQuota.includes('px-acc-win-fill'), '未知百分比不该画进度�
 
 // 没配 Key 的两家：必须给出可读原因，且看板其余部分照常
 const plansEmptyHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'accounts',
   data: payload,
   now: payload.generatedAt,
   refreshing: false,
@@ -3453,6 +3449,7 @@ must(plansEmptyHtml.includes('配好凭据即可查看额度'), '全部未配时
 
 // 套餐关闭态：必须说明已关闭
 const plansOffHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'accounts',
   data: payload,
   now: payload.generatedAt,
   refreshing: false,
@@ -3502,7 +3499,7 @@ const dockNoQuota = renderToStaticMarkup(React.createElement(SessionCostView, {
 must(!dockNoQuota.includes('5 小时'), '没有可用额度时不应渲染额度那一枚')
 must(dockNoQuota.includes('本次会话'), '没有额度时费用仍要显示')
 
-const html = renderToStaticMarkup(React.createElement(View, {
+const dashboardProps = {
   data: payload,
   now: payload.generatedAt,
   refreshing: false,
@@ -3515,15 +3512,26 @@ const html = renderToStaticMarkup(React.createElement(View, {
   plans: planPayload,
   plansBusy: false,
   onTogglePlans: () => {},
-}))
+}
+const overviewHtml = renderToStaticMarkup(React.createElement(View, { ...dashboardProps, initialPage: 'overview' }))
+const accountPageHtml = renderToStaticMarkup(React.createElement(View, { ...dashboardProps, initialPage: 'accounts' }))
+const resourcePageHtml = renderToStaticMarkup(React.createElement(View, { ...dashboardProps, initialPage: 'resources' }))
+const habitPageHtml = renderToStaticMarkup(React.createElement(View, { ...dashboardProps, initialPage: 'habits' }))
+// Legacy content checks below cover both pages separately rendered, never one production long page.
+const html = overviewHtml + accountPageHtml
+must(!overviewHtml.includes('px-review-ledger-summary') && !overviewHtml.includes('px-model-group'), '总览不得继续叠加资源/模型长页')
+must(!accountPageHtml.includes('class="px-stats"') && !accountPageHtml.includes('px-trend-row'), '账户页不得重复总览')
+must(resourcePageHtml.includes('data-layout="resources"') && !resourcePageHtml.includes('px-trend-row'), '资源页独立且加载预留布局')
+must(habitPageHtml.includes('data-layout="habits"') && !habitPageHtml.includes('px-acc-cards'), '使用习惯独立分页')
+
 
 const required = [
   '用量看板', '累计 Token', '时段与计费', '高峰时段',
   // 「法定节假日」那一行已按用户要求删除（它把卡片撑高，口径已经写在
   // 「周一至周五（不含法定节假日）」这一行里）。**反向断言**见下面的结构闸门。
   '周一至周五', '活跃日历', '趋势', '模型分布', '费用明细',
-  // 会话清单整表已移入会话标签页；看板只留「消费 Top 会话」。
-  '消费 Top 会话',
+  // 分页入口留在每页，内容不再拼成长页。
+  '使用习惯', '资源去向',
   '官方定价页', '套餐余额',
   'px-seg-thumb', 'px-period-clock', 'px-stat-value', 'px-panel-dot',
   'px-barrow-fill', 'px-heat-4', 'px-slice', 'px-tone-fill-blue', 'px-rate-swatch',
@@ -3775,66 +3783,43 @@ must(
   }
   must(!css.includes('.px-notify-threshold'), '样式里不该还留着 .px-notify-threshold* 死样式')
 
-  // 2) 会话清单整表已移入会话标签页；看板只留「消费 Top 会话」**列表**
-  //    （v3.2 起由表格改成列表：表格的展开行里再嵌 hero 卡，形成「卡片套卡片」，
-  //    用户反馈「卡片层级奇怪」）。这里钉四件事：列表在、最多 8 条、
-  //    每条的整行是可聚焦、带 aria-expanded 的按钮、花费条只作相对比较。
-  const topCount = (html.match(/class="px-top-item/g) ?? []).length
-  must(html.includes('class="px-top"'), '看板应有「消费 Top 会话」列表')
-  must(topCount > 0 && topCount <= 8, `Top 会话应取前 8 名，实际 ${topCount} 条`)
-  // 整行是按钮：鼠标点哪都行，键盘用户 Tab 得到。
-  // 它**不跳转会话**，只原地展开该会话的费用明细（用户要求改的），
-  // 所以这里断言的是按钮 + `aria-expanded`，而不是「点了会 openSession」。
-  must(/<button[^>]*class="[^"]*px-top-main[^>]*aria-expanded="false"/.test(html),
-    'Top 会话的整行必须是带 aria-expanded 的按钮（键盘可达，且能表达展开状态）')
-  must(html.includes('px-top-share'), 'Top 会话每条都要有相对花费条，否则「Top」只能靠读数字比较')
-  must(!html.includes('px-top-session-table'),
-    'Top 会话不该再用表格：展开行里的嵌套卡片正是「层级奇怪」的来源')
-  // 完整清单不再铺在看板上：它的分身（SessionTable / SessionDetail）只在会话标签页里用。
-  must((html.match(/px-session-row/g) ?? []).length === 0,
-    '完整会话清单不该再渲染在看板上（它已移入会话标签页，看板只留 Top 8）')
-
-  // 2b) 时间投入：窗口内**按会话整体**相加；没有 step 计时的会话只计数、不参与求和。
-  //     这条同时钉住「平均每轮的分母」——把没计时的会话也除进去会让平均值偏低。
+  // 2) 全局复盘位于原有前三行之后；不再用全历史 Top / step 累加混充窗口数据。
+  must(resourcePageHtml.includes('px-review-skeleton'), '资源页应有稳定骨架边界');
+  must(overviewHtml.includes('用量看板分页'), '总览应有清晰分页入口');
+  must(!html.includes('消费 Top 会话'), '旧的全历史会话榜已被窗口资源账目替代');
+  must(!html.includes('窗口按会话整体计入'), '不得继续按整条会话历史计入窗口');
   {
-    const { timeInvestStats } = await import(
-      pathToFileURL(join(root, 'lib', 'client', 'dashboard.js')).href)
-    must(typeof timeInvestStats === 'function',
-      'dashboard.js 应导出 timeInvestStats（纯函数，闸门直接验口径）')
-    const stats = timeInvestStats([
-      {
-        id: 'a',
-        days: ['2026-11-10'],
-        timing: { ttftMs: 1000, genMs: 2000, toolsMs: 500, totalMs: 3500 },
-        turns: 2, toolCalls: 5, maxTurnMs: 2000,
-      },
-      {
-        id: 'b',
-        days: ['2026-11-11', '2026-11-12'],
-        timing: { ttftMs: 500, genMs: 500, toolsMs: 0, totalMs: 1000 },
-        turns: 1, toolCalls: 2, maxTurnMs: 1000,
-      },
-      // 窗口外：一天都不在窗口里，必须完全不计入。
-      {
-        id: 'c',
-        days: ['2026-10-01'],
-        timing: { ttftMs: 900, genMs: 900, toolsMs: 900, totalMs: 2700 },
-        turns: 9, toolCalls: 9, maxTurnMs: 900,
-      },
-      // 窗口内但没有 step 计时：计入会话数、不计入时长与轮次。
-      { id: 'd', days: ['2026-11-10'] },
-    ], ['2026-11-10', '2026-11-11'])
-    must(stats.sessions === 3, `窗口内应有 3 个会话（a/b/d），实际 ${stats.sessions}`)
-    must(stats.timed === 2, `只有 2 个会话有 step 计时，实际 ${stats.timed}`)
-    must(stats.totalMs === 4500, `窗口内总耗时应为 4500 ms，实际 ${stats.totalMs}`)
-    must(stats.ttftMs === 1500 && stats.genMs === 2500 && stats.toolsMs === 500,
-      `三段之和要分别对齐，实际 ${stats.ttftMs}/${stats.genMs}/${stats.toolsMs}`)
-    must(stats.turns === 3 && stats.toolCalls === 7, '轮次与工具调用只累加有计时的会话')
-    must(stats.maxTurnMs === 2000, `最久一轮应取最大值 2000，实际 ${stats.maxTurnMs}`)
-    must(stats.avgTurnMs === 1500, `平均每轮 = 4500 / 3，实际 ${stats.avgTurnMs}`)
-    must(html.includes('时间投入'), '看板应有「时间投入」卡片')
-    must(html.includes('>耗时<'), 'Top 会话应能按「耗时」排序（分段控件里有这一项）')
-    must(html.includes('px-time'), '时间投入卡应带 .px-time 结构类')
+    const { ReviewView, ResourceLedger, rankReviewRows, reviewValue } = await import(
+      pathToFileURL(join(root, 'lib', 'client', 'review.js')).href);
+    const at = Date.parse('2026-11-17T02:00:00Z');
+    const source = { kind: 'third-party', label: '测试插件', packageName: 'test-plugin', method: 'declaration', evidence: '声明匹配，非历史执行归属确证' };
+    const activity = { sessionId: 'review-session', sessionTitle: '复盘测试会话', workspace: 'project', at, durationMs: 0, status: 'completed', turn: 1, callId: 'call-1' };
+    const session = { id: 'review-session', title: '复盘测试会话', workspace: 'project', cwd: 'D:/project', cost: 2, tokens: 120, requests: 2, durationMs: 3000, completedTurns: 2, toolCalls: 1, maxTurnMs: 2000, models: [{ label: '测试模型', cost: 2, tokens: 120 }], days: [{ key: '2026-11-17', cost: 2, tokens: 120, durationMs: 3000 }] };
+    const fixture = {
+      schema: 2, scope: 'recent', generatedAt: at, timezone: 'Asia/Shanghai', range: { days: 7, start: at - 6*86400000, end: at },
+      summary: { cost: 2, durationMs: 3000, completedTurns: 2, thirdPartyCalls: 1 },
+      coverage: { timedSessions: 1, sessionCount: 1, unknownSourceCalls: 0 },
+      hours: Array.from({length: 24}, (_,hour) => ({ hour, turns: hour===10 ? 1 : 0, requests: hour===10 ? 2 : 0, cost: hour===10 ? 2 : 0, durationMs: hour===10 ? 3000 : 0 })),
+      weekHours: Array.from({length: 168}, (_,i) => ({ weekday: Math.floor(i/24), hour: i%24, turns: i===34 ? 1 : 0, requests: i===34 ? 2 : 0, cost: i===34 ? 2 : 0, durationMs: i===34 ? 3000 : 0 })),
+      sessions: [session],
+      workspaces: [{ id: 'd:/project', path: 'D:/project', label: 'project', cost: 2, tokens: 120, requests: 2, durationMs: 3000, completedTurns: 2, sessionCount: 1, sessionIds: ['review-session'] }],
+      tools: [{ id: 'third-tool', name: 'third_tool', source, calls: 1, timedCalls: 1, durationMs: 0, avgMs: 0, maxMs: 0, sessionCount: 1, activity: [activity], slowest: activity }],
+    };
+    const reviewHtml = renderToStaticMarkup(React.createElement(ReviewView, { data: fixture, rangeLabel: '7 日' }));
+    for (const label of ['使用习惯', '资源去向', '工作区', '会话', '工具调用', '对话轮次', '估算费用', '有效耗时', '10:00–11:00']) must(reviewHtml.includes(label), '复盘展示缺少 '+label);
+    must((reviewHtml.match(/class="px-review-hour"/g) ?? []).length === 24, '小时分布必须有24格');
+    must((reviewHtml.match(/class="px-review-cell level-/g) ?? []).length === 173, '星期小时图168格加5级图例');
+    must(/class="px-review-row"[^>]*aria-expanded="false"/.test(reviewHtml), '资源行必须能键盘展开');
+    const workspaceHtml = renderToStaticMarkup(React.createElement(ResourceLedger, { data: fixture, rangeLabel: '7 日', initialExpanded: 'd:/project' }));
+    must(workspaceHtml.includes('工作区内的会话账目') && workspaceHtml.includes('复盘测试会话'), '工作区展开应能追溯会话');
+    const sessionHtml = renderToStaticMarkup(React.createElement(ResourceLedger, { data: fixture, rangeLabel: '7 日', initialEntity: 'sessions', initialExpanded: 'review-session' }));
+    for (const label of ['模型费用构成', '逐日账目', '打开会话']) must(sessionHtml.includes(label), '会话账目缺少 '+label);
+    const toolHtml = renderToStaticMarkup(React.createElement(ResourceLedger, { data: fixture, rangeLabel: '7 日', initialEntity: 'tools', initialExpanded: 'third-tool' }));
+    for (const label of ['第三方·匹配', '来源未知', '发挥作用的时间与会话', '单次最慢', '复盘测试会话', '声明匹配，非历史执行归属确证', '0s']) must(toolHtml.includes(label), '工具账目缺少 '+label);
+    must(toolHtml.includes('不分摊模型费用'), '工具耗时不能伪装模型费用');
+    must(reviewValue(null, 'durationMs') === '—' && reviewValue(0, 'durationMs') === '0s', '缺测与零耗时不能混淆');
+    must(reviewValue(200, 'durationMs') === '200ms' && reviewValue(0.2, 'durationMs') === '<1ms', '工具亚秒计时不得被误显示为0s');
+    must(rankReviewRows([{id:'missing',durationMs:null},{id:'zero',durationMs:0}], 'durationMs')[0].id === 'zero', '缺测排序应在真实零之后');
   }
 
   // 3) 设置弹层默认关闭：整页静态渲染里**一个**弹层节点都不该有。
@@ -4127,7 +4112,7 @@ must(html.includes('platform.deepseek.com/usage'), '余额横条必须给出官�
       },
     }))
     // 用户点名的字段，逐个必须在。
-    for (const label of ['估算金额', '总 Token', '模型耗时', '工具调用',
+    for (const label of ['估算金额', '总 Token', '有效处理耗时', '工具调用',
       '峰时 Token', '闲时 Token', '缓存命中率', '峰时占比',
       '模型 × 提供商']) {
       must(detailHtml.includes(label), `详情面板缺少「${label}」——用户在需求里点名要它`)
@@ -4646,6 +4631,7 @@ must(html.includes('platform.deepseek.com/usage'), '余额横条必须给出官�
 
 // 余额关闭态：必须说明「已关闭」，而不是显示一个 0 或空白
 const closedHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'overview',
   data: payload,
   now: payload.generatedAt,
   refreshing: false,
@@ -4657,6 +4643,7 @@ must(closedHtml.includes('已关闭'), `关闭态应明说已关闭：${closedHt
 
 // 余额读取失败：必须明说失败原因，且看板其余部分照常渲染
 const failedBalanceHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'overview',
   data: payload,
   now: payload.generatedAt,
   refreshing: false,
@@ -4665,10 +4652,11 @@ const failedBalanceHtml = renderToStaticMarkup(React.createElement(View, {
   onToggleBalance: () => {},
 }))
 must(failedBalanceHtml.includes('DEEPSEEK_API_KEY'), '没配 Key 时应指明是哪个引用')
-must(failedBalanceHtml.includes('费用明细'), '余额不可用时看板其余部分仍应渲染')
+must(failedBalanceHtml.includes('消费趋势'), '余额不可用时总览其余部分仍应渲染')
 
 // 旧宿主（没有余额路由）：余额取数明确失败，界面要说清是版本问题，而不是装作一切正常
 const oldHostHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'overview',
   data: payload,
   now: payload.generatedAt,
   refreshing: false,
@@ -4678,7 +4666,7 @@ const oldHostHtml = renderToStaticMarkup(React.createElement(View, {
   onToggleBalance: () => {},
 }))
 must(oldHostHtml.includes('过旧'), `旧宿主应提示版本过旧：${oldHostHtml.slice(0, 300)}`)
-must(oldHostHtml.includes('费用明细'), '旧宿主上看板其余部分仍应渲染')
+must(oldHostHtml.includes('消费趋势'), '旧宿主上总览其余部分仍应渲染')
 
 // ── 热力图几何闸门：每格必须是正方形 ────────────────────────────
 // 历史事故：把 24 小时塞进同一格，格高算成 0.7px、格宽 9px，画出来全是条形。
@@ -4841,6 +4829,7 @@ console.log('日历映射：4 个首日下「下一行 = 后一天」均成立')
 // 空数据也必须能渲染（不能因为除零或空数组抛错）
 const empty = buildPayload({ empty: true })
 const emptyHtml = renderToStaticMarkup(React.createElement(View, {
+  initialPage: 'overview',
   data: empty,
   now: empty.generatedAt,
   refreshing: false,

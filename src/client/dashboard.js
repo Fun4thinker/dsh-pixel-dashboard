@@ -17,6 +17,7 @@ import React from 'react'
 // 都渲染不出来。默认导入在两种环境下都成立（CJS 互操作给的是 module.exports）。
 import ReactDOM from 'react-dom'
 import { AccountPanel } from './accountPanel.js'
+import { ReviewSection } from './review.js'
 import { PriceSettingsButton, PriceSettingsView } from './priceSettings.js'
 // 「消费 Top 会话」点开时要在原地取这条会话的明细，因此复用会话标签页那条取数口
 // （同一个 `/dsh-pixel/session`，同一套错误分类）。不复制一份 fetch：两份迟早漂移。
@@ -25,7 +26,7 @@ import { PriceSettingsButton, PriceSettingsView } from './priceSettings.js'
 // 「图二」那套彩色详情视图（hero 卡 / 耗时堆叠条 / 明细行）从本文件抽到
 // sessionDetailView.js：会话标签页的费用页也要用同一份实现，两处共用才不会漂移。
 // 这里保留 `export { SessionDetail }` 是为了不破坏既有 import（渲染闸门就按它取）。
-import { SessionDetail, TimingBreakdownView } from './sessionDetailView.js'
+import { SessionDetail } from './sessionDetailView.js'
 import {
   balanceAvailable,
   balanceStatus,
@@ -68,7 +69,6 @@ import {
   formatCny,
   formatCnyAxis,
   formatDateTime,
-  formatDurationMs,
   formatMinuteOfDay,
   formatSpan,
   formatTokens,
@@ -102,7 +102,14 @@ const { createElement: h, useCallback, useEffect, useMemo, useRef, useState } = 
 // 搬文件不该改变它们的 import 路径。
 export { SessionDetail }
 
-/** 趋势窗口选项。 */
+/** 按复盘任务分页，避免把所有长表堆进总览。 */
+const DASHBOARD_PAGES = [
+  { id: 'overview', label: '总览', hint: '费用趋势与活跃概况' },
+  { id: 'habits', label: '使用习惯', hint: '什么时候在推进对话' },
+  { id: 'resources', label: '资源去向', hint: '钱和时间花在哪' },
+  { id: 'accounts', label: '账户与模型', hint: '套餐额度与模型账目' },
+]
+
 const RANGES = [
   { id: '7', label: '7 日', days: 7 },
   { id: '30', label: '30 日', days: 30 },
@@ -162,18 +169,6 @@ const TREND_DIMENSIONS = [
 const TREND_SERIES_LIMIT = 5
 
 /**
- * 「消费 Top 会话」的排序维度。
- *
- * 三个维度回答三个不同问题，所以是**切换**而不是并列：谁最花钱 / 谁最耗时间 /
- * 谁最耗 token。默认「花费」——看板首先回答「钱花在哪」。
- */
-const TOP_SORTS = [
-  { id: 'cost', label: '花费' },
-  { id: 'duration', label: '耗时' },
-  { id: 'tokens', label: 'Token' },
-]
-
-/**
  * 消费趋势的两条序列：官方价 / 我的价。
  *
  * **并列而不是叠加**：两根柱子回答的是同一个问题的两个答案（「按官方价多少」
@@ -201,7 +196,6 @@ const PREF_DEFAULT = {
   trendDim: 'model',
   showMyRate: false,
   range: '30',
-  topSort: 'cost',
 }
 
 /**
@@ -967,15 +961,14 @@ export function View(props) {
   const [modelLimit, setModelLimit] = usePref('modelLimit', normalizeModelLimit)
   const normalizeShowMyRate = useCallback((raw) => prefBool(raw, PREF_DEFAULT.showMyRate), [])
   const [showMyRate, setShowMyRate] = usePref('showMyRate', normalizeShowMyRate)
-  /** 「消费 Top 会话」的排序维度：花费 / 耗时 / Token（默认花费）。 */
-  const normalizeTopSort = useCallback(
-    (raw) => prefEnum(raw, TOP_SORTS.map((item) => item.id), PREF_DEFAULT.topSort),
-    [],
-  )
-  const [topSort, setTopSort] = usePref('topSort', normalizeTopSort)
   /** 「展开全部」是一次性的查看动作，不进偏好：下次打开仍然先看精简视图。 */
   const [expandAll, setExpandAll] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // Stable callback keeps the dialog's focus effect from re-running on each clock tick.
+  const closeSettings = useCallback(() => { setSettingsOpen(false) }, [])
+  const normalizePage = useCallback((raw) => prefEnum(raw, DASHBOARD_PAGES.map((item) => item.id), 'overview'), [])
+  const [savedPage, setPage] = usePref('page', normalizePage)
+  const page = props.initialPage ?? savedPage
 
   const range = RANGES.find((item) => item.id === rangeId) ?? RANGES[1]
   const period = usePeriod(data, now)
@@ -999,7 +992,7 @@ export function View(props) {
   }, [data.days, data.pricing, data.overview?.today])
 
   const overview = data.overview
-  const activeInRange = points.filter((point) => Number(point.totals.requests) > 0).length
+  const activeInRange = points.filter((point) => Number(point.turns) > 0).length
   const split = splitTokens(rangeByModel)
   const peakShare = split.peak + split.idle > 0 ? split.peak / (split.peak + split.idle) : 0
 
@@ -1134,48 +1127,6 @@ export function View(props) {
     return { standard: priceByModel(subset, data.pricing).standard, count: Object.keys(subset).length }
   }, [modelFocus.rest, rangeByModel, data.pricing])
 
-  /**
-   * 消费 Top 会话：按当前排序维度取前 8。
-   *
-   * 三个维度都来自 `/data` 的会话行（`cost.standard` / `timing.totalMs` /
-   * `totals.local`），客户端不额外取数。耗时那一维**只对有 step 计时的会话有效**：
-   * 缺 `timing` 的会话排到最后并显示 `—`，而不是当成 0 秒排第一。
-   */
-  const topSessions = useMemo(() => {
-    const sessions = Array.isArray(data.sessions) ? data.sessions : []
-    const numeric = (value) => (value === undefined || value === null || !Number.isFinite(Number(value))
-      ? undefined
-      : Number(value))
-    const metricOf = (row) => (topSort === 'duration'
-      ? row.duration
-      : (topSort === 'tokens' ? row.tokens : row.cost))
-    return sessions
-      .map((session) => ({
-        session,
-        cost: numeric(session?.cost?.standard),
-        tokens: numeric(session?.totals?.local),
-        duration: numeric(session?.timing?.totalMs),
-      }))
-      .sort((a, b) => {
-        const left = metricOf(a)
-        const right = metricOf(b)
-        // 缺这个维度的排最后（`?? -1`），而不是当成 0 混进前几名。
-        return ((right ?? -1) - (left ?? -1))
-          || ((b.cost ?? 0) - (a.cost ?? 0))
-          || ((b.tokens ?? 0) - (a.tokens ?? 0))
-      })
-      .slice(0, 8)
-  }, [data.sessions, topSort])
-
-  /**
-   * 时间投入：窗口内有交集的所有会话，按会话整体相加（见 {@link timeInvestStats}）。
-   * 用 Set 传给纯函数，避免每行都线性查一次窗口键。
-   */
-  const timeInvest = useMemo(
-    () => timeInvestStats(data.sessions, new Set(points.map((point) => point.key))),
-    [data.sessions, points],
-  )
-
   // 切换监看的套餐：直接写共享存储，看板与输入框下方那一枚同时跟着变。
   const onSelectPlan = useCallback((planId) => { planViewStore().select(planId) }, [])
 
@@ -1233,6 +1184,14 @@ export function View(props) {
           onClick: () => { setSettingsOpen(true) },
         }, '设置'))),
 
+    h('nav', { className: 'px-dashboard-pages', 'aria-label': '用量看板分页' },
+      DASHBOARD_PAGES.map((item) => h('button', {
+        key: item.id, type: 'button', className: page === item.id ? 'selected' : '',
+        'aria-current': page === item.id ? 'page' : undefined,
+        onClick: () => { setPage(item.id) },
+      }, h('b', null, item.label), h('span', null, item.hint)))),
+
+    page === 'overview' ? h('div', { className: 'px-dashboard-page', 'data-page': 'overview' },
     h('div', { className: 'px-stats' },
       // 第一格：官方账号用户卡（头像 + **总余额** + 官网入口）。
       // 用户要求放在最左边第一位——它是「我是谁、还剩多少钱」，读的顺序上排在最前。
@@ -1258,7 +1217,7 @@ export function View(props) {
         label: `${range.label} Token`,
         value: rangeTotals.local,
         format: formatTokens,
-        foot: `输出 ${formatTokens(rangeTotals.output)} · ${activeInRange} 天有请求`,
+        foot: `输出 ${formatTokens(rangeTotals.output)} · ${activeInRange} 天有人机对话`,
       }),
       h(StatCard, {
         tone: 'pink',
@@ -1276,6 +1235,8 @@ export function View(props) {
         format: (value) => `${Math.round(value)} 天`,
         foot: `最长 ${overview.streaks.longest} 天 · 累计 ${overview.activeDays} 天`,
       })),
+    rangeTotals.requests === 0 ? h('p', { className: 'px-review-empty' },
+      '计费用量暂无数据：当前窗口还没有模型请求，活跃日历仍独立统计人机对话轮次。') : null,
 
     // ── 时段与计费 ＋ 活跃日历：**第二行**（用户指定）────────────
     // 时段与计费 + 活跃日历 并排一行：计费卡片的信息量就只有几行键值对，
@@ -1330,6 +1291,8 @@ export function View(props) {
       h(ActivityCalendar, {
         firstDay: data.heatmap.firstDay,
         days: data.heatmap.days,
+        turns: data.heatmap.turns,
+        maxTurns: data.heatmap.maxTurns,
         requests: data.heatmap.requests ?? [],
         sessions: data.heatmap.sessions ?? [],
         tokens: data.heatmap.tokens ?? [],
@@ -1403,6 +1366,18 @@ export function View(props) {
         ariaLabel: '逐日消费柱状图',
       }))),
 
+    ) : null,
+
+    // 按职责分页：不把习惯、资源、账户继续堆在总览之后。
+    page === 'habits' || page === 'resources' ? h(ReviewSection, {
+      page,
+      rangeDays: range.days,
+      rangeLabel: range.label,
+      revision: data.generatedAt,
+      timezone: data.timezone,
+    }) : null,
+
+    page === 'accounts' ? h('div', { className: 'px-dashboard-page', 'data-page': 'accounts' },
     // ── 套餐余额：第三方订阅额度（每家一张卡，环形条 + 进度条）────────
     h(AccountPanel, {
       balance,
@@ -1471,39 +1446,7 @@ export function View(props) {
             // 补价入口交给定价工作流（费用明细里每条一个按钮，点开浮层改单个模型）
             onRatesSaved,
           })))),
-
-    // ── 时间投入 ──────────────────────────────────────────────────
-    // 回答「时间去哪了」。它放在「消费 Top 会话」之前：先看总量、再看是谁花的，
-    // 与上一张卡（费用明细）形成「钱 / 时间」两个并行的口径，而不是塞进概览行
-    // ——那里已经有四张卡，再加一张会把数字挤成两行。
-    h(Panel, {
-      title: '时间投入',
-      tone: 'yellow',
-      delay: 400,
-      extra: timeInvest.timed === 0
-        ? `${range.label} · 暂无计时`
-        : `${range.label} · ${timeInvest.timed} 个会话有计时`,
-    },
-    h(TimeInvestCard, { stats: timeInvest }),
-    // 口径只写在卡片里一句：它是「机器干活的时间」，不是墙钟，也不是上班时长。
-    h('p', { className: 'px-time-note' },
-      '等待 + 回复 + 工具三段都来自每个会话的 step 计时；跨会话相加是「模型干活的总量」，不是墙钟时间。',
-      '窗口按会话整体计入（会话的最后活跃日落在窗口内即算），不按天切分。')),
-
-    // ── 消费 Top 会话 ──────────────────────────────────────────────
-    // 完整会话清单不再留在看板（它进会话标签页），这里只留「最靠前的几条」。
-    // 排序维度可切换（花费 / 耗时 / Token）：它们回答三个不同问题，因此是切换
-    // 而不是并列；默认「花费」——看板首先回答「钱花在哪」。
-    h(Panel, {
-      title: '消费 Top 会话',
-      tone: 'blue',
-      delay: 440,
-      extra: h('div', { className: 'px-top-sorts' },
-        h('span', { className: 'px-panel-extra' },
-          `共 ${Array.isArray(data.sessions) ? data.sessions.length : 0} 个会话`),
-        h(Segmented, { options: TOP_SORTS, value: topSort, onChange: setTopSort })),
-    },
-    h(TopSessions, { rows: topSessions, timezone: data.timezone, teams: data.teams, sort: topSort })),
+    ) : null,
 
     // 底部口径说明：只留**会改变读数理解**的两句（多厂商单价怎么来、金额是什么口径）。
     // 详细的计费口径属于 README，天天摆在读数下面只会让人先跨过它才能看到数字。
@@ -1522,7 +1465,7 @@ export function View(props) {
     // 放这里只是让「点开设置」这个动作的入口与出口在代码里也挨着。
     h(SettingsDialog, {
       open: settingsOpen,
-      onClose: () => { setSettingsOpen(false) },
+      onClose: closeSettings,
       data,
       onRatesSaved,
       minTokens,
@@ -1537,289 +1480,12 @@ export function View(props) {
   )
 }
 
-/**
- * 把「窗口内的会话」折成一组**时间投入**数字。
- *
- * ## 口径（与「费用」页那张时间卡同一个来源）
- *
- * 每个会话的 `timing` 来自宿主逐 step 的计时：等待模型（ttft）+ 模型回复（gen）+
- * 工具执行（tools），`totalMs` 就是这三段之和（见 lib/timing.js）。这里把它们
- * **按会话相加**。因此：
- *
- *   - 它是「模型干活的总量」，**不是墙钟时间**——两个会话并行跑时，墙钟只过了一小时，
- *     而这里是两小时。这正是「我在这上面耗了多少机器时间」这个问题的答案。
- *   - 窗口归属按**会话整体**计入：会话的 `days` 与窗口有交集就算进来，不按天切分。
- *     按天切分需要宿主在日志里按日累计耗时，那是另一件事（见 AGENT.md 第 12 节）。
- *
- * ## 为什么单独抽成纯函数
- *
- * `renderToStaticMarkup` 不执行 effect，整页静态渲染里只能看到「有没有这张卡」；
- * 真实的加总逻辑得能拿合成数据直接断言，所以这里做成纯函数并导出给闸门用。
- * @param {object[]} sessions - `/data` 的 `sessions[]`。
- * @param {Set<string>|string[]} dayKeys - 窗口内的日期键（`YYYY-MM-DD`）。
- * @returns {{sessions:number,timed:number,ttftMs:number,genMs:number,toolsMs:number,totalMs:number,turns:number,toolCalls:number,maxTurnMs:number,avgTurnMs:number|undefined}}
- *   窗口内会话数、**有 step 计时的**会话数，以及各段毫秒。
- */
-export function timeInvestStats(sessions, dayKeys) {
-  const keys = dayKeys instanceof Set ? dayKeys : new Set(Array.isArray(dayKeys) ? dayKeys : [])
-  const list = Array.isArray(sessions) ? sessions : []
-  const inWindow = list.filter((session) => (
-    Array.isArray(session?.days) && session.days.some((day) => keys.has(day))
-  ))
-  let ttftMs = 0
-  let genMs = 0
-  let toolsMs = 0
-  let totalMs = 0
-  let turns = 0
-  let toolCalls = 0
-  let maxTurnMs = 0
-  let timed = 0
-  for (const session of inWindow) {
-    const total = Number(session?.timing?.totalMs ?? 0)
-    // 没有 step 计时的会话（旧宿主 / 旧日志）只计入「窗口内会话数」，
-    // 不参与求和——把 0 当成「跑得很快」会让平均值偏低。
-    if (!Number.isFinite(total) || total <= 0) continue
-    timed += 1
-    ttftMs += Number(session?.timing?.ttftMs ?? 0)
-    genMs += Number(session?.timing?.genMs ?? 0)
-    toolsMs += Number(session?.timing?.toolsMs ?? 0)
-    totalMs += total
-    // 平均每轮只除以**有计时的那些轮次**，否则分母里混进没计时的会话会偏小。
-    turns += Number(session?.turns ?? 0)
-    toolCalls += Number(session?.toolCalls ?? 0)
-    const longest = Number(session?.maxTurnMs ?? 0)
-    if (Number.isFinite(longest) && longest > maxTurnMs) maxTurnMs = longest
-  }
-  return {
-    sessions: inWindow.length,
-    timed,
-    ttftMs,
-    genMs,
-    toolsMs,
-    totalMs,
-    turns,
-    toolCalls,
-    maxTurnMs,
-    avgTurnMs: turns > 0 ? totalMs / turns : undefined,
-  }
-}
-
-/**
- * 「时间投入」卡：三色耗时条 + 三个补充数字。
- *
- * 三色条直接复用会话页那一份 {@link TimingBreakdownView}（等待=黄 / 回复=蓝 /
- * 工具=绿），两处口径与配色因此不会漂移。它自己带「总时长 + 平均每轮」，
- * 右边补上「轮次 / 工具调用 / 最久一轮 / 有计时的会话」，正好覆盖用户想要的几项。
- * @param {object} props - stats（{@link timeInvestStats} 的结果）。
- * @returns {object} React 元素。
- */
-function TimeInvestCard(props) {
-  const { stats } = props
-  if (stats.timed === 0) {
-    return h('p', { className: 'px-muted' },
-      stats.sessions === 0
-        ? '这段窗口里还没有会话，跑一轮对话之后这里会显示时间都花在哪。'
-        : '这段窗口里的会话没有 step 计时（更早版本的日志，或来自其它设备的历史），因此看不出时间去向。')
-  }
-  const figure = (label, value) => h('div', { className: 'px-time-figure', key: label },
-    h('span', { className: 'px-time-figure-label' }, label),
-    h('b', { className: 'px-time-figure-value' }, value))
-  return h('div', { className: 'px-time' },
-    // 左：三色堆叠条 + 图例（含总时长与平均每轮）
-    h('div', { className: 'px-time-main' },
-      h(TimingBreakdownView, {
-        timing: {
-          ttftMs: stats.ttftMs,
-          genMs: stats.genMs,
-          toolsMs: stats.toolsMs,
-          turns: stats.turns,
-        },
-      })),
-    // 右：四个补充数字。竖排在最右，不与左栏的图例抢同一行。
-    h('div', { className: 'px-time-figures' },
-      figure('轮次', String(stats.turns)),
-      figure('工具调用', String(stats.toolCalls)),
-      figure('最久一轮', stats.maxTurnMs > 0 ? formatDurationMs(stats.maxTurnMs) : '—'),
-      figure('有计时的会话', `${stats.timed}/${stats.sessions}`)))
-}
-
-/**
- * 会话的显示名：与 DSH 侧栏同一条回落链。
- *
- * 持久标题 → 工作目录末段 → 会话 id 片段。旧宿主不返回 `title`，只有 `workspace`，
- * 那时至少显示目录名（用户认得出），而不是退回一串十六进制。
- * @param {object} session - `sessions[]` 里的一行。
- * @returns {string} 显示名。
- */
-function sessionTitleOf(session) {
-  const raw = typeof session?.title === 'string' ? session.title.trim() : ''
-  if (raw !== '') return raw
-  const workspace = typeof session?.workspace === 'string' ? session.workspace.trim() : ''
-  if (workspace !== '') return workspace
-  return `${String(session?.id ?? '').slice(8, 16)}…`
-}
-
-/**
- * 消费 Top 会话：只留「花得最多的几条」，点标题进入该会话。
- *
- * 完整会话清单**不再留在看板**（它进会话标签页）：看板要回答的是「花在哪」，
- * 而一百多行的清单只会把「还剩多少」推到很远的地方。
- *
- * 跳转走的是通知运行时那一条已经验证过的通道（`notifyStore().openSession`），
- * 不自己找 `uiWorkspace`：那条路径已经处理了「duplicate 服务不可用」「先 focus
- * 再切会话」等一堆坑，看板没必要再实现一遍。
- * @param {object} props - rows（已排好序的 `{session,cost,tokens}`）/ timezone / teams。
- * @returns {object} React 元素。
- */
-function TopSessions(props) {
-  const { rows, timezone, teams, sort = 'cost' } = props
-  /**
-   * 展开哪一条（**不跳转会话**）。
-   *
-   * 用户的要求改过一次：原来点标题是跳到那条会话，现在要「展开显示该会话的费用明细」。
-   * 判据也顺手变清楚了：这张表是**看板**的读数工具（谁最贵、贵在哪），
-   * 跳走会把人从"比较"拽进"单条"，反而丢上下文。
-   */
-  const [expanded, setExpanded] = useState('')
-
-  /**
-   * 展开/收起。**不再额外取数**：
-   *
-   * 早先这里为每条会话再拉一次 `/dsh-pixel/session`，用来画一张「逐模型金额」小表。
-   * 那张表与上面 `SessionDetail` 里的合计、逐日、请求分布**重复**（用户明确问
-   * 「底部为啥会有同样的数据重复显示」），于是整块去掉：`SessionDetail` 需要的
-   * 数据 `/data` 的会话行里全都有（totals / cost / timing / toolCalls / models）。
-   * 顺带的好处：展开是**瞬时**的，不再有「点开等半天」。
-   */
-  const toggle = (sessionId) => {
-    if (typeof sessionId !== 'string' || sessionId === '') return
-    setExpanded((prev) => (prev === sessionId ? '' : sessionId))
-  }
-
-  /**
-   * 这条会话所属团队的**其它成员**（不含它自己）。
-   *
-   * 数据取自 `/data` 的 `teams[].members`：团队归属只有宿主算得出来（要沿父链向上
-   * 走），客户端不该自己按 `teamId` 再拼一遍成员表。没有团队时返回空数组，
-   * `SessionDetail` 就不会画标签页。
-   *
-   * 成员行与 `/data` 的会话行**不是同一个形状**（它只有 totals/cost/name，没有
-   * timing/toolCalls/models）。这里补成 `SessionDetail` 认的形状：切到成员标签页时
-   * 缺字段显示 `—`，而不是把整块详情炸掉。
-   * @param {object} session - 当前会话行。
-   * @returns {object[]} 可直接交给 `SessionDetail` 的成员数组。
-   */
-  const membersOfSession = (session) => {
-    const teamId = typeof session?.teamId === 'string' ? session.teamId : ''
-    const list = Array.isArray(teams) ? teams : []
-    const team = teamId === '' ? undefined : list.find((row) => String(row?.id ?? '') === teamId)
-    const members = Array.isArray(team?.members) ? team.members : []
-    const selfId = String(session?.id ?? '')
-    return members
-      .filter((member) => String(member?.id ?? '') !== selfId)
-      .map((member) => ({
-        ...member,
-        // 标签页读的是 `memberName`（会话行上的字段名），团队名册里叫 `name`。
-        memberName: typeof member.memberName === 'string' && member.memberName !== ''
-          ? member.memberName
-          : String(member?.name ?? ''),
-        // 团队口径只有用量与金额，没有逐模型的键：给空数组而不是 undefined，
-        // SessionDetail 里那句 models.join 才不会在切标签页时抛错。
-        models: Array.isArray(member.models) ? member.models : [],
-        timing: member.timing ?? {},
-      }))
-  }
-
-  if (!Array.isArray(rows) || rows.length === 0) {
-    return h('p', { className: 'px-muted' }, '还没有会话记录。跑一轮对话之后这里会排出前几名。')
-  }
-
-  /**
-   * 当前排序维度对应的取值与显示格式。
-   *
-   * 三个维度共用同一张列表与同一根条：条只做**相对比较**，具体读数在它上面的
-   * 那个数字里。缺这个维度的会话显示 `—`、条为空——不能当成 0 画成「很短」。
-   */
-  const metricOf = (row) => {
-    if (sort === 'duration') return row.duration
-    if (sort === 'tokens') return row.tokens
-    return row.cost
-  }
-  const metricText = (value) => {
-    if (value === undefined) return '—'
-    if (sort === 'duration') return formatDurationMs(value)
-    if (sort === 'tokens') return formatTokens(value)
-    return formatCny(value)
-  }
-  /**
-   * 条的基准：**当前维度最大的那一条**。
-   *
-   * 按合计归一（而不是绝对值）会让第一名永远占满、其余按比例缩短，读者一眼就能
-   * 比出相对差距；用固定刻度则在数值普遍很小时全部缩成一条线。
-   */
-  const maxMetric = rows.reduce((max, row) => {
-    const value = metricOf(row)
-    return value !== undefined && Number.isFinite(value) && value > max ? value : max
-  }, 0)
-
-  /**
-   * 版式：**列表**，不是表格（见 theme.js 里 .px-top-* 的注释）。
-   *
-   * 早先是 <table>，展开行里再嵌一整套 hero 卡片：面板（白）→ 表头（奶油）
-   * → 行（白）→ 展开行（奶油）→ hero 卡（白），四层底色来回跳，用户原话是
-   * 「卡片层级奇怪」。现在一层分隔线 + 一块同底的展开区，里面不再浮起新卡片。
-   */
-  return h('div', { className: 'px-top' },
-    rows.map(({ session, cost, tokens, duration }, index) => {
-      const title = sessionTitleOf(session)
-      const id = String(session?.id ?? '')
-      const lastAt = Number(session?.lastAt ?? 0) || Number(session?.createdAt ?? 0)
-      const isOpen = expanded !== '' && expanded === id
-      const metric = metricOf({ cost, tokens, duration })
-      const share = metric === undefined || maxMetric <= 0 ? 0 : Math.max(0.03, metric / maxMetric)
-      // 第二行的三项事实：token / 最后活跃 / 耗时（缺哪个就少哪一段）。
-      // 当前维度已经显示在上面时，meta 里就不再重复它。
-      const meta = []
-      if (sort !== 'tokens' && tokens !== undefined) meta.push(formatTokens(tokens))
-      if (sort !== 'duration' && duration !== undefined) meta.push(formatDurationMs(duration))
-      if (lastAt > 0) meta.push(formatDateTime(lastAt, timezone))
-      return h('div', {
-        key: id !== '' ? id : title,
-        className: `px-top-item${isOpen ? ' open' : ''}`,
-      },
-      h('button', {
-        type: 'button',
-        className: 'px-top-main',
-        'aria-expanded': isOpen,
-        title: `${title}\n${id}`,
-        onClick: () => { toggle(id) },
-      },
-      // 名次：不算信息量，但它是「Top」这件事本身的可读形式。
-      h('span', { className: 'px-top-rank', 'aria-hidden': 'true' }, String(index + 1).padStart(2, '0')),
-      h('span', { className: 'px-top-copy' },
-        h('span', { className: 'px-top-title' }, title,
-          session?.live === true ? h('span', { className: 'px-top-live' }, '进行中') : null),
-        meta.length === 0 ? null : h('span', { className: 'px-top-meta' }, meta.join(' · '))),
-      h('span', { className: 'px-top-amount' },
-        h('b', null, metricText(metric)),
-        // 相对条：只做比较，不承载精确读数（精确值就在它上面）。
-        h('i', { className: 'px-top-share', 'aria-hidden': 'true' },
-          h('span', { style: { width: `${Math.round(share * 100)}%` } }))),
-      // 展开指示：小三角随状态旋转，说明「这里能点开」。
-      h('i', { className: `px-caret${isOpen ? ' open' : ''}`, 'aria-hidden': 'true' })),
-      isOpen
-        ? h('div', { className: 'px-top-detail' },
-          // 「图二」那一套：四枚彩色 hero + 三色耗时堆叠条 + 峰/闲明细 + 请求分布。
-          // 下面**不再**追加逐模型金额小表：那块与这里的合计/逐日/请求分布重复。
-          h(SessionDetail, {
-            key: 'rich',
-            lead: session,
-            members: membersOfSession(session),
-            timezone,
-          }))
-        : null)
-    }))
-}
+/** Keep the settings navigation local and explicit; the open branch previously referenced a missing constant. */
+const SETTINGS_TABS = [
+  { id: 'notify', label: '通知' },
+  { id: 'pricing', label: '单价' },
+  { id: 'display', label: '显示偏好' },
+]
 
 /**
  * 设置弹层。
@@ -1839,13 +1505,13 @@ function TopSessions(props) {
  * @param {object} props - open / onClose / data / onRatesSaved / 各偏好与 setter。
  * @returns {object|null} React 元素。
  */
-function SettingsDialog(props) {
+export function SettingsDialog(props) {
   const {
     open, onClose, data, onRatesSaved,
     minTokens, onMinTokens, modelLimit, onModelLimit,
     showMyRate, onShowMyRate, trendDim, onTrendDim,
   } = props
-  const [tab, setTab] = useState('notify')
+  const [tab, setTab] = useState(() => SETTINGS_TABS.some((item) => item.id === props.initialTab) ? props.initialTab : 'notify')
   const panelRef = useRef(null)
   // 阈值 / 条数用草稿：输入过程中不能每敲一个字符就改看板（「1」与「1000 万」
   // 是两个完全不同的筛选条件，中间态会让下面两张卡片连续闪烁）。
@@ -1860,18 +1526,27 @@ function SettingsDialog(props) {
 
   useEffect(() => {
     if (open !== true) return undefined
-    const onKey = (event) => {
-      if (event.key === 'Escape') {
-        event.stopPropagation()
-        onClose?.()
-      }
-    }
-    // capture 阶段收键：产品自己也监听 Esc（关输入框、退出面板），
-    // 不抢在它前面的话，「关设置」会先被别的东西吃掉。
-    document.addEventListener('keydown', onKey, true)
     const node = panelRef.current
+    const previous = document.activeElement
+    const onKey = (event) => {
+      if (event.key !== 'Escape') return
+      if (node === null) return
+      const active = document.activeElement
+      // A pricing popover or another product dialog owns its own keys; do not steal them.
+      const activeDialog = active?.closest?.('[role="dialog"]')
+      if (activeDialog && activeDialog !== node && !node.contains(activeDialog)) return
+      event.stopPropagation()
+      onClose?.()
+    }
+    // capture handles only this dialog, not a separate popover's own focus scope.
+    document.addEventListener('keydown', onKey, true)
     if (node !== null && typeof node.focus === 'function') node.focus()
-    return () => { document.removeEventListener('keydown', onKey, true) }
+    return () => {
+      document.removeEventListener('keydown', onKey, true)
+      const current = document.activeElement
+      if (previous?.isConnected && typeof previous.focus === 'function'
+        && (current === document.body || node?.contains(current))) previous.focus()
+    }
   }, [open, onClose])
 
   if (open !== true) return null
@@ -2243,7 +1918,12 @@ function ProviderQuota(props) {
       current ? h('span', { className: 'px-badge primary' }, '当前监看') : null,
       provider?.keyHint === undefined
         ? null
-        : h('span', { className: 'px-plan-key', title: `凭据来源：${provider.keySource ?? '未知'}` },
+        : h('span', {
+          className: 'px-plan-key',
+          // 宿主会带一句人话的来源说明（如「dsh-codex-subscription 插件里的登录态」）；
+          // 旧宿主没有这个字段时退回它给的 id，不为一个悬停提示去拦下整块渲染。
+          title: `凭据来源：${provider.keySourceLabel || provider.keySource || '未知'}`,
+        },
           `${provider.keyRef ?? ''} ${provider.keyHint}`)),
     status.level === 'ok' && status.text === ''
       ? null

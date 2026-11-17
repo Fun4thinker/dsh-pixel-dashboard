@@ -12,7 +12,7 @@
  *
  * | 行 | 内容 | 为什么 |
  * |---|---|---|
- * | 1 | 四枚 hero：估算金额 / 总 Token / 模型耗时 / 工具调用 | 「图二」的主打指标，带语义色左边条 |
+ * | 1 | 四枚 hero：估算金额 / 总 Token / 有效处理耗时 / 工具调用 | 「图二」的主打指标，带语义色左边条 |
  * | 2 | 耗时堆叠条 + 计价时段 + 用量构成 | 等待模型(黄)/模型回复(蓝)/工具执行(绿)；右边两张并排填满 |
  * | 3 | 逐模型明细（通栏） | 钱具体花在哪几款模型上 |
  * | 4 | 逐日花费 + 提供商 + 请求分布 | 三块并排，右侧不再有「第三行右边一大片空白」；提供商按「一家一行」列出（一条会话可能同时用多家） |
@@ -531,7 +531,7 @@ export function sessionCostModel(payload) {
   // ── 第一行的四枚 hero（照「图二」的口径）────────────────────────
   //
   // 数据全部来自 `/dsh-pixel/session` 的 `session` 行：`cost` / `totals.local` /
-  // `timing.totalMs` / `toolCalls` / `turns` / `maxTurnMs`。缺字段一律写 `—`
+  // `completedTurnMs` / `toolCalls` / `completedTurns` / `maxCompletedTurnMs`。缺字段一律写 `—`
   // （「不知道」不是「零」），这是用户在旧宿主上验证过的行为。
   //
   // 「估算金额」用**逐模型金额之和**（modelsTotal），与页面上其它合计同一个来源；
@@ -541,10 +541,10 @@ export function sessionCostModel(payload) {
     : undefined
   const totalTokens = maybeNumber(sessionTotals?.local)
   const timing = session.timing !== null && typeof session.timing === 'object' ? session.timing : {}
-  const turns = maybeNumber(session.turns)
-  const modelMs = maybeNumber(timing.totalMs)
+  const completedTurns = maybeNumber(session.completedTurns)
+  const modelMs = completedTurns !== undefined && completedTurns > 0 ? maybeNumber(session.completedTurnMs) : undefined
   const toolCalls = maybeNumber(session.toolCalls)
-  const maxTurnMs = maybeNumber(session.maxTurnMs)
+  const maxTurnMs = maybeNumber(session.maxCompletedTurnMs)
   const peakRequests = maybeNumber(sessionTotals?.peak?.requests)
   const idleRequests = maybeNumber(sessionTotals?.idle?.requests)
   const requestTotal = peakRequests === undefined && idleRequests === undefined
@@ -553,9 +553,9 @@ export function sessionCostModel(payload) {
   const peakRatio = requestTotal !== undefined && requestTotal > 0
     ? (peakRequests ?? 0) / requestTotal
     : undefined
-  // 平均每轮 = 模型耗时 ÷ 轮次（与看板详情同一口径：模型真正在干活的那段时间）。
-  const avgTurnMs = modelMs !== undefined && modelMs > 0 && turns !== undefined && turns > 0
-    ? modelMs / turns
+  // 有效处理使用已完成轮次的精确毫秒，扣除问答工具等待；不采用 Chat 的最少一秒展示钳制。
+  const avgTurnMs = modelMs !== undefined && completedTurns > 0
+    ? modelMs / completedTurns
     : undefined
 
   const heroes = [
@@ -573,14 +573,14 @@ export function sessionCostModel(payload) {
       tone: 'blue',
       label: '总 Token',
       value: totalTokens === undefined ? DASH : formatTokens(totalTokens),
-      foot: requestTotal === undefined ? undefined : `${requestTotal} 次请求`,
+      foot: `${session.turns ?? 0} 轮人机对话${requestTotal === undefined ? '' : ` · ${requestTotal} 次模型请求`}`,
     },
     {
       key: 'timing',
       tone: 'green',
-      label: '模型耗时',
-      value: modelMs === undefined || modelMs <= 0 ? DASH : formatDurationMs(modelMs),
-      foot: avgTurnMs === undefined ? '等待 + 回复 + 工具' : `平均每轮 ${formatDurationMs(avgTurnMs)}`,
+      label: '有效处理耗时',
+      value: modelMs === undefined ? DASH : formatDurationMs(modelMs),
+      foot: modelMs === undefined ? '暂无已完成轮次计时' : `已排除等待用户 ${formatDurationMs(session.awaitingUserMs ?? 0)}（近似）`,
     },
     {
       key: 'tools',
@@ -696,8 +696,9 @@ export function sessionCostModel(payload) {
     bucketRows,
     // 第一行的四枚 hero（估算金额 / 总 Token / 模型耗时 / 工具调用）
     heroes,
-    // 第二行左半：三色耗时堆叠条。`turns` 是「平均每轮」的除数，与看板详情同一口径。
-    timing: { ...timing, turns: turns ?? 0 },
+    durationNote: modelMs === undefined ? undefined : `完成执行 ${completedTurns} 轮 · 原始用时 ${formatDurationMs(session.completedWallMs ?? 0)} · 有效平均每轮 ${formatDurationMs(avgTurnMs)}。等待按问答工具调用区间近似排除，不是精确的用户阅读时间。`,
+    // 第二行左半：独立的步骤耗时诊断，不用它替代 Chat 的逐轮会话用时。
+    timing,
     // 第四行右半：峰/闲请求分布（与看板详情里那条 .px-peak-bar 同一种表达）
     requests: peakRatio === undefined
       ? undefined
@@ -1004,6 +1005,7 @@ export function SessionCostPanel(props) {
         value: hero.value,
         foot: hero.foot,
       }))),
+    model.durationNote ? h('p', { className: 'px-sv-hint px-sv-duration-note' }, model.durationNote) : null,
 
     // ── 第二行：耗时构成 + 计价时段 + 用量构成（并排）───────────────
     // 三块铺满整行：左边是三色堆叠条（等待模型=黄 / 模型回复=蓝 / 工具执行=绿），

@@ -42,12 +42,13 @@ $DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl
 
 ## 宿主暴露的路由
 
-插件在本地 webServer 上注册 11 条**精确匹配**路由，全部挂在 `/dsh-pixel` 前缀下：
+插件在本地 webServer 上注册 12 条**精确匹配**路由，全部挂在 `/dsh-pixel` 前缀下：
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
 | `/dsh-pixel/data` | GET | 看板全量数据（账本聚合 + 日历 + 价目）；`?refresh=1` 强制重扫 |
 | `/dsh-pixel/session` | GET | **单会话明细**（会话标签页用）；`?id=<会话 id>`，只读 |
+| `/dsh-pixel/review` | GET | 使用习惯与资源去向复盘；`?days=7|30|90&scope=recent|all`，默认近期未归档，只读，只返回数字、来源证据、调用时间与所属会话，不包含调用参数或结果正文 |
 | `/dsh-pixel/balance` | GET | DeepSeek 官方余额 |
 | `/dsh-pixel/plans` | GET | 六家订阅额度 |
 | `/dsh-pixel/period` | GET | 纯时钟（高峰 / 空闲与切换时刻），不读账本 |

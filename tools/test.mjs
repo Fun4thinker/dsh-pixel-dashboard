@@ -544,7 +544,7 @@ await check('热力图把请求落到正确的日/小时格', () => {
 
 await check('会话清单带上轮次与工作区名', () => {
   assert.equal(data.sessions.length, 2)
-  assert.equal(data.sessions.find((row) => row.id === 'a').turns, 2)
+  assert.equal(data.sessions.find((row) => row.id === 'a').turns, 0, '只有执行开始/模型消息，不能推断两轮人机对话')
   assert.equal(data.sessions.find((row) => row.id === 'a').workspace, 'blog')
 })
 
@@ -663,14 +663,15 @@ await check('会话缓存只留派生结果，不留原始事件（否则常驻�
   // 造一条带大块正文的事件：正文越大，新旧行为的常驻内存差越明显
   const bulky = 'x'.repeat(20_000)
   const heavyLog = [
-    { type: 'turn/start', seq: 0, time: T('2026-09-10T04:30:00Z') },
+    { type: 'turn/start', seq: 0, time: T('2026-09-10T04:30:00Z'), data: { turn: 1 } },
+    { type: 'user/message', seq: 1, time: T('2026-09-10T04:30:00Z'), data: { turn: 1, source: { kind: 'user' }, message: { content: [{ type: 'text', text: '请执行任务' }] } } },
     {
       type: 'tool/result',
-      seq: 1,
+      seq: 2,
       time: T('2026-09-10T04:30:00Z'),
       data: { output: bulky },
     },
-    message(2, T('2026-09-10T04:30:00Z'), 'deepseek-flash', { input: 10, output: 1 }),
+    message(3, T('2026-09-10T04:30:00Z'), 'deepseek-flash', { input: 10, output: 1 }),
   ]
   const catalog = new UsageCatalog({
     persistence: () => fakePersistence({ heavy: heavyLog }),

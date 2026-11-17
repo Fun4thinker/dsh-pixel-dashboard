@@ -36,6 +36,7 @@ const MODULES = [
   'planView.js',
   'account.js',
   'team.js',
+  'dockDetail.js',
   'notify.js',
   'period.js',
   'usage.js',
@@ -48,6 +49,7 @@ const MODULES = [
   'styles/pricing.js',
   'styles/accounts.js',
   'styles/session.js',
+  'styles/review.js',
   'theme.js',
   'Notifier.js',
   'SessionCost.js',
@@ -60,6 +62,8 @@ const MODULES = [
   // 会话标签页的费用页也用它 —— 两处共用一份视觉实现，避免各自漂移。
   // 必须排在 dashboard.js 之前：dashboard 会 require 它。
   'sessionDetailView.js',
+  'reviewStore.js',
+  'review.js',
   'dashboard.js',
   'entry.js',
 ]

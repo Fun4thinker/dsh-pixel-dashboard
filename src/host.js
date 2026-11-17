@@ -41,6 +41,7 @@ import { BalanceService } from './balance.js'
 import { PlansService } from './plans.js'
 import { Preferences, resolvePrefsPath } from './prefs.js'
 import { TimingBreakdown } from './timing.js'
+import { ReviewFacts, buildReview, reviewRange, completedExecutionTurns } from './review.js'
 import {
   NOTIFY_DEFAULTS,
   NotifyJournal,
@@ -237,7 +238,7 @@ const AGENT_FACT_LIMIT = 500
  * 旧缓存挡住——读出来的对象没有新字段，界面显示成空或 0，而且不报错。
  * 这个坑已经踩过一次（加 timing 时，用户看到「模型耗时 —」）。
  */
-const CACHE_SCHEMA = 2
+const CACHE_SCHEMA = 4
 
 /**
  * 磁盘快照（整份看板数据 + 逐会话明细）的格式版本。
@@ -358,6 +359,9 @@ async function readSession(persistence, id, timeZone) {
    * 口径见 timing.js 的说明。
    */
   const timing = new TimingBreakdown()
+  const review = new ReviewFacts()
+  let reviewError
+  let inheritedEventCount = 0
   /** 最新的 `session/title` 文本（last-wins）。 */
   let title = ''
   /**
@@ -387,8 +391,9 @@ async function readSession(persistence, id, timeZone) {
   let handle
   try {
     handle = await persistence.open(id, 'read')
-  } catch {
-    return { records, turns, title, days: [], members: [], label: '', firstAt, lastAt, steps, toolCalls, turnWallMs, timedTurns, maxTurnMs, timing: timing.toJSON() }
+    inheritedEventCount = Number(handle.inheritedEventCount ?? 0)
+  } catch (error) {
+    return { records, turns, title, days: [], members: [], label: '', firstAt, lastAt, steps, toolCalls, turnWallMs, timedTurns, maxTurnMs, timing: timing.toJSON(), review: { ...review.toJSON(), inheritedEventCount, error: error instanceof Error ? error.message : String(error) } }
   }
   /** 已读事件总数（含不产出记录的），用于 `MAX_EVENTS_PER_SESSION` 闸门。 */
   let read = 0
@@ -398,8 +403,10 @@ async function readSession(persistence, id, timeZone) {
       const page = await handle.read(offset, READ_CHUNK)
       const batch = page?.events ?? []
       if (batch.length === 0) break
-      for (const event of batch) {
-        if (event?.type === 'turn/start') turns += 1
+      for (const [index, event] of batch.entries()) {
+        // Seeded children inherit their parent's prefix; it is not work performed by this child.
+        const own = offset + index >= inheritedEventCount
+        if (own) review.observe(event)
         // ── 时间与步数：为「会话清单」的用量视角服务 ──────────────────
         //
         // 用户要的维度不只是钱和 token：**注意力与时间也是用量**。这里在既有的
@@ -413,10 +420,10 @@ async function readSession(persistence, id, timeZone) {
           if (firstAt === 0 || at < firstAt) firstAt = at
           if (at > lastAt) lastAt = at
         }
-        if (event?.type === 'step/start') steps += 1
-        if (event?.type === 'tool/call') toolCalls += 1
-        // 耗时分解：同一遍扫描里顺带算，不额外读盘。
-        timing.observe(event)
+        if (own && event?.type === 'step/start') steps += 1
+        if (own && event?.type === 'tool/call') toolCalls += 1
+        // Same scan; inherited machine steps are not this session's activity.
+        if (own) timing.observe(event)
 
         // ── 轮次耗时：用户要的「等待模型输出总时长 / 平均每轮 / 最久一轮」──
         //
@@ -427,10 +434,10 @@ async function readSession(persistence, id, timeZone) {
         // 注意：这是**墙钟时长**，包含工具执行与等待用户的时间，不等于「模型
         // 生成耗时」。后者需要 step 内 ttft/gen 细分，而 step 事件里没有那些
         // 时间戳——所以这里如实标成「轮次时长」，不冒充「模型耗时」。
-        if (event?.type === 'turn/start' && Number.isFinite(at) && at > 0) {
+        if (own && event?.type === 'turn/start' && Number.isFinite(at) && at > 0) {
           turnStartedAt = at
         }
-        if (event?.type === 'turn/end' && turnStartedAt > 0 && Number.isFinite(at) && at > turnStartedAt) {
+        if (own && event?.type === 'turn/end' && turnStartedAt > 0 && Number.isFinite(at) && at > turnStartedAt) {
           const ms = at - turnStartedAt
           turnWallMs += ms
           timedTurns += 1
@@ -473,10 +480,15 @@ async function readSession(persistence, id, timeZone) {
       }
       read += batch.length
       offset += batch.length
-      if (batch.length < READ_CHUNK || read >= MAX_EVENTS_PER_SESSION) break
+      if (read >= MAX_EVENTS_PER_SESSION && batch.length === READ_CHUNK) {
+        reviewError = `事件数达到读取上限 ${MAX_EVENTS_PER_SESSION}`
+        break
+      }
+      if (batch.length < READ_CHUNK) break
     }
-  } catch {
-    // 只读投影：读中断时用前缀数据，不阻塞页面。
+  } catch (error) {
+    reviewError = error instanceof Error ? error.message : String(error)
+    // 原看板继续使用前缀；复盘必须显式报告不完整读取，不能把缺失当零。
   } finally {
     try {
       await handle.close()
@@ -484,7 +496,9 @@ async function readSession(persistence, id, timeZone) {
       // 关闭失败不影响已读数据。
     }
   }
-  return { records, turns, title, days: [...days].sort(), members: [...members.values()], label, firstAt, lastAt, steps, toolCalls, turnWallMs, timedTurns, maxTurnMs, timing: timing.toJSON() }
+  const projection = review.toJSON()
+  turns = projection.humanTurns.length
+  return { records, turns, title, days: [...days].sort(), members: [...members.values()], label, firstAt, lastAt, steps, toolCalls, turnWallMs, timedTurns, maxTurnMs, timing: timing.toJSON(), review: { ...projection, inheritedEventCount, ...(reviewError === undefined ? {} : { error: reviewError }) } }
 }
 
 /**
@@ -808,8 +822,10 @@ export class UsageCatalog {
    * @param {() => object|undefined} [deps.llm] - LLM 注册表（模型 / 提供商显示名）。
    * @param {string} [deps.ledgerPath] - 账本路径；显式传入便于测试。
    * @param {string} [deps.machine] - 本机标识。
+   * @param {Map<string, object>|Function} [deps.toolSources] - 显式工具来源（优先于声明匹配；函数接收 name 与会话/调用 scope）。
    */
-  constructor({ persistence, sessions, timezone, llm, ledgerPath, machine, customRates }) {
+  constructor({ persistence, sessions, timezone, llm, ledgerPath, machine, customRates, toolSources, workspaceRegistry }) {
+    this.workspaceRegistry = workspaceRegistry ?? (() => undefined)
     this.persistence = persistence
     this.sessions = sessions
     this.timezone = timezone
@@ -926,6 +942,10 @@ export class UsageCatalog {
     this.sessionDetails = undefined
     /** 会话明细是否与当前快照配套（磁盘快照恢复时为 true；重建后仍为 true）。 */
     this.sessionDetailsReady = false
+    // Review facts deliberately are not restored from the legacy whole-dashboard snapshot.
+    this.reviewInput = undefined
+    this.reviewCache = new Map()
+    this.toolSources = toolSources
   }
 
   /**
@@ -1307,9 +1327,13 @@ export class UsageCatalog {
     })
     entries.sort((a, b) => Number(b.cost.standard) - Number(a.cost.standard))
 
-    const days = Object.entries(detail.byDay)
+    const humanDays = new Map(Object.entries(detail.turnsByDay ?? {}))
+    const detailDays = { ...detail.byDay }
+    for (const key of humanDays.keys()) detailDays[key] ??= {}
+    const days = Object.entries(detailDays)
       .map(([key, dayModels]) => ({
         key,
+        turns: humanDays.get(key) ?? 0,
         totals: roundUsage(sumUsageOf(dayModels)),
         // 当天的金额仍按**逐模型**算：拿日合计查一次价只会命中一个模型，
         // 其余落到兜底价（实测能差五倍）。
@@ -1377,6 +1401,39 @@ export class UsageCatalog {
     }
   }
 
+  /** Review uses the exact built snapshot's now; restored disk snapshots must first be rebuilt.
+   * No missing review facts may masquerade as a genuine zero. Errors propagate to the route.
+   * @param {7|30|90} [days] Site-calendar days including today.
+   */
+  async readReview(days = 30, scope = 'recent') {
+    if (![7, 30, 90].includes(days)) throw new RangeError('days 只支持 7、30 或 90')
+    if (!['recent', 'all'].includes(scope)) throw new RangeError('scope 只支持 recent 或 all')
+    await this.read()
+    if (this.reviewInput === undefined || this.reviewInput.timezone !== this.timezone()) {
+      await this.read({ refresh: true })
+    }
+    const input = this.reviewInput
+    if (input === undefined) throw new Error('复盘数据尚未构建')
+    if (input.ledgerError) throw new Error(`复盘账本读取失败：${input.ledgerError}`)
+    if (input.listError) throw new Error(`复盘会话清单读取失败：${input.listError}`)
+    const range = reviewRange(days, input.generatedAt, input.timezone)
+    // Registry-global getter is read-only and performs no persistence scan. Refresh it
+    // even while the financial snapshot is cached (archive/unarchive is not a log event).
+    let archivedIds
+    try {
+      const ids = this.workspaceRegistry()?.archivedSessionIds
+      if (Array.isArray(ids)) archivedIds = new Set(ids)
+    } catch { /* startup/unavailable registry is unknown, never implicitly unarchived */ }
+    const archiveKey = archivedIds ? JSON.stringify([...archivedIds].sort()) : 'unknown'
+    const key = `${input.generatedAt}:${input.timezone}:${days}:${scope}:${range.start}:${archiveKey}`
+    if (!this.reviewCache.has(key)) {
+      const sessions = input.sessions.map((session) => ({ ...session, archived: session._local && archivedIds ? archivedIds.has(session.id) : null }))
+      this.reviewCache.set(key, buildReview({ ...input, sessions, archiveSource: archivedIds ? 'workspaceRegistry' : 'unknown', days, scope, toolSources: this.toolSources }))
+      if (this.reviewCache.size > 12) this.reviewCache.delete(this.reviewCache.keys().next().value)
+    }
+    return this.reviewCache.get(key)
+  }
+
   /**
    * 扫描全部会话：抽账本记录、收集会话元信息，并把记录并入账本。
    *
@@ -1387,7 +1444,13 @@ export class UsageCatalog {
    */
   async collect(now) {
     const persistence = this.persistence()
+    if (persistence === undefined) this.reviewListError = 'sessionPersistence 服务不可用'
     const listed = persistence === undefined ? [] : await this.listSnapshotsCached(persistence)
+    let archivedIds
+    try {
+      const ids = this.workspaceRegistry()?.archivedSessionIds
+      if (Array.isArray(ids)) archivedIds = new Set(ids)
+    } catch { /* archive source not ready; report unknown rather than guessing */ }
     /**
      * 清单 + **实时补进来的新会话**。
      *
@@ -1451,7 +1514,8 @@ export class UsageCatalog {
       // 缓存里存的是**派生结果**（记录 / 轮次数 / 标题 / 归日 / 名册），
       // 不是原始事件——见 readSession 的说明：留事件本身会让常驻内存随历史线性增长。
       let derived
-      if (cached !== undefined && cached.fingerprint === fingerprint && !forced) {
+      if (cached !== undefined && cached.fingerprint === fingerprint && !forced
+        && Array.isArray(cached.review?.turns) && Array.isArray(cached.review?.tools) && cached.review.error === undefined) {
         derived = cached
       } else {
         derived = { fingerprint, ...(await readSession(persistence, id, timezone)) }
@@ -1467,6 +1531,7 @@ export class UsageCatalog {
 
       const cwd = typeof header.cwd === 'string' ? header.cwd : ''
       const placement = teamPlacementOf({ id, header }, byId)
+      const completed = completedExecutionTurns(derived.review ?? {}, now).filter((turn) => turn.durationMs !== null)
       sessions.push({
         id,
         // 成员名/职责默认空串而不是缺字段：客户端会读它们决定徽标文案，
@@ -1505,6 +1570,14 @@ export class UsageCatalog {
         timing: derived.timing,
         timedTurns: derived.timedTurns,
         maxTurnMs: derived.maxTurnMs,
+        // Completed execution time excludes unioned question-tool spans; exact ms, 0 valid.
+        completedTurnMs: completed.length ? completed.reduce((sum, turn) => sum + turn.durationMs, 0) : null,
+        completedWallMs: completed.length ? completed.reduce((sum, turn) => sum + turn.wallMs, 0) : null,
+        awaitingUserMs: completed.length ? completed.reduce((sum, turn) => sum + turn.awaitingUserMs, 0) : null,
+        completedTurns: completed.length,
+        maxCompletedTurnMs: completed.length ? Math.max(...completed.map((turn) => turn.durationMs)) : null,
+        archived: archivedIds ? archivedIds.has(id) : null,
+        activityAt: derived.review?.activityAt ?? null,
         // 已排好序（见 readSession）：这里是「与目录无关」的派生结果，直接复用。
         days: sessionDays,
         live: this.sessions?.()?.get?.(id) !== undefined,
@@ -1640,6 +1713,7 @@ export class UsageCatalog {
      * 需求去掉，这里就不再计算——留着没人读，只会让响应变大。
      */
     const calendar = {
+      turns: new Array(HEATMAP_DAYS).fill(0),
       requests: new Array(HEATMAP_DAYS).fill(0),
       sessions: new Array(HEATMAP_DAYS).fill(0),
       tokens: new Array(HEATMAP_DAYS).fill(0),
@@ -1757,6 +1831,13 @@ export class UsageCatalog {
         agentPreset: '',
         isSeeded: false,
         turns: 0,
+        completedTurnMs: null,
+        completedWallMs: null,
+        awaitingUserMs: null,
+        completedTurns: 0,
+        maxCompletedTurnMs: null,
+        archived: null,
+        activityAt: null,
         totals: roundUsage(acc.totals),
         cost: sessionCost(acc.byModel),
         models: Object.keys(acc.byModel).sort(),
@@ -1771,9 +1852,27 @@ export class UsageCatalog {
       })
     }
 
+    // Human conversation activity is independent of model requests and ledger seeds.
+    const humanDays = new Map()
+    for (const session of sessions) {
+      const detail = sessionDetails.get(session.id) ?? { byModel: {}, byDay: {} }
+      detail.turnsByDay = {}
+      sessionDetails.set(session.id, detail)
+      for (const human of this.cache.get(session.id)?.review?.humanTurns ?? []) {
+        if (!Number.isFinite(human.at) || human.at === null || human.at > now) continue
+        const facts = zonedFacts(human.at, timezone), key = facts.key
+        humanDays.set(key, (humanDays.get(key) ?? 0) + 1)
+        detail.turnsByDay[key] = (detail.turnsByDay[key] ?? 0) + 1
+        if (!days.has(key)) days.set(key, { key, totals: emptyUsage(), byModel: {}, sessions: new Set() })
+        const parts = facts.parts
+        const cell = Math.round((Date.UTC(parts.year, parts.month - 1, parts.day) - firstDayUtc) / 86_400_000)
+        if (cell >= 0 && cell < HEATMAP_DAYS) calendar.turns[cell] += 1
+      }
+    }
     const dayRows = [...days.values()]
       .map((day) => ({
         key: day.key,
+        turns: humanDays.get(day.key) ?? 0,
         totals: roundUsage(day.totals),
         byModel: roundByModel(day.byModel),
         sessions: day.sessions.size,
@@ -1939,6 +2038,36 @@ export class UsageCatalog {
     // 单会话明细挂在数据对象上供 `/dsh-pixel/session` 按 id 取一条；
     // 它**不参与 `/data` 的序列化**（下方响应体是逐字段挑出来拼的，不会带上它）。
     this.sessionDetails = sessionDetails
+    const modelNames = new Map(models.map((model) => [model.key, model.label]))
+    // Read-only, compact facts plus ledger numbers: never retain original session events.
+    const reviewFacts = new Map(sessions.map((session) => [session.id, this.cache.get(session.id)?.review ?? { turns: [], tools: [] }]))
+    this.reviewInput = {
+      generatedAt: now, timezone, records,
+      // Already resolved from official persistent headers/rosters above. Preserve only
+      // scalar topology, never events or bodies; review must not infer teams from labels.
+      sessions: sessions.map(({ id, title, cwd, archived, activityAt, firstAt, teamId, role, depth, detached, memberName, memberLabel }) => ({
+        id, title, cwd, archived, activityAt, _local: firstAt !== undefined,
+        teamId, role, depth, ...(detached === true ? { detached: true } : {}), memberName, memberLabel,
+      })),
+      facts: reviewFacts, ledgerError: ledger.error, listError: this.reviewListError,
+      modelOfRecord: (record) => {
+        const rollup = String(record.r ?? '') || rollupOf(record.n ?? record.m)
+        const provider = directory.nativeProvider.get(String(record.n ?? '')) ?? String(record.p ?? '')
+        const key = provider === '' ? rollup : `${rollup}@${provider}`
+        return { key, label: modelNames.get(key) ?? pricingOf(rollup).rates?.label ?? rollup }
+      },
+      costOfRecords: (selected) => {
+        const byModel = {}
+        for (const record of selected) {
+          const rollup = String(record.r ?? '') || rollupOf(record.n ?? record.m)
+          const provider = directory.nativeProvider.get(String(record.n ?? '')) ?? String(record.p ?? '')
+          const key = provider === '' ? rollup : `${rollup}@${provider}`
+          addUsage((byModel[key] ??= emptyUsage()), usageOfRecord(record), zonedFacts(Number(record.t), timezone).peak)
+        }
+        return sessionCost(byModel).standard
+      },
+    }
+    this.reviewCache.clear()
 
     return {
       generatedAt: now,
@@ -1986,14 +2115,15 @@ export class UsageCatalog {
       overview: {
         totals: sumDays(dayRows),
         sessions: sessions.length,
-        activeDays: dayRows.length,
+        turns: [...humanDays.values()].reduce((sum, count) => sum + count, 0),
+        activeDays: humanDays.size,
         firstDay: dayRows[0]?.key ?? null,
         lastDay: dayRows.at(-1)?.key ?? null,
         // 站点时区下的「今天」。客户端必须用它去 days 里定位当天，
         // **不能**拿 `days.at(-1)` 当今天：那是「最后一个有数据的日子」，
         // 今天还没跑过请求时它就是昨天，卡片上的「今日费用」会显示昨天的数字。
         today,
-        streaks: streaks(dayRows.map((row) => row.key), today),
+        streaks: streaks([...humanDays.keys()].sort(), today),
         modelsUsed: models.length,
       },
       windows: {
@@ -2016,6 +2146,8 @@ export class UsageCatalog {
         cells: heatmap,
         max: Math.max(1, ...heatmap),
         // 按天聚合：一天一个方块，供年历使用
+        turns: calendar.turns,
+        maxTurns: Math.max(1, ...calendar.turns),
         requests: calendar.requests,
         sessions: calendar.sessions.map((_, index) => daySessions[index].size),
         tokens: calendar.tokens,
@@ -2036,8 +2168,10 @@ export class UsageCatalog {
   async listSnapshots(persistence) {
     try {
       const all = await persistence.list()
+      this.reviewListError = Array.isArray(all) ? undefined : 'sessionPersistence.list 返回无效清单'
       return Array.isArray(all) ? all.filter((row) => row !== null && typeof row === 'object') : []
-    } catch {
+    } catch (error) {
+      this.reviewListError = error instanceof Error ? error.message : String(error)
       return []
     }
   }
@@ -2387,6 +2521,7 @@ export default {
     const catalog = new UsageCatalog({
       persistence: () => ctx.get('sessionPersistence'),
       sessions: () => ctx.get('sessions'),
+      workspaceRegistry: () => ctx.get('workspaceRegistry'),
       timezone: () => DEFAULT_TIMEZONE,
       // 自定义价目交给聚合器：它负责在每次聚合前复查文件
       customRates,
@@ -2621,6 +2756,34 @@ export default {
           return
         }
         sendJson(res, 200, payload, req.method === 'HEAD')
+      },
+    })
+
+    route({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/review`,
+      handler: async (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          req.resume?.()
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const value = url.searchParams.get('days')
+        if (value !== null && !['7', '30', '90'].includes(value)) {
+          sendJson(res, 400, { error: 'days 只支持 7、30 或 90' })
+          return
+        }
+        const scope = url.searchParams.get('scope') ?? 'recent'
+        if (!['recent', 'all'].includes(scope)) {
+          sendJson(res, 400, { error: 'scope 只支持 recent 或 all' })
+          return
+        }
+        try {
+          sendJson(res, 200, await catalog.readReview(value === null ? 30 : Number(value), scope), req.method === 'HEAD')
+        } catch (error) {
+          sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+        }
       },
     })
 

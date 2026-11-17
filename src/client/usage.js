@@ -289,6 +289,7 @@ export function recentDays(dayRows, days) {
     const totals = row?.totals ?? emptyUsage()
     out.push({
       key,
+      turns: typeof row?.turns === 'number' ? row.turns : null,
       byModel: row?.byModel ?? {},
       totals,
       cacheHit: Number(totals.cacheHit ?? 0),

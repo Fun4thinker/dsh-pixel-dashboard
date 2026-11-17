@@ -56,10 +56,11 @@
 import React from 'react'
 import { createPortal } from 'react-dom'
 import { resolveAccount } from './account.js'
-import { balanceDetail, fetchBalance } from './balance.js'
+import { fetchBalance } from './balance.js'
 import { costDetailModel } from './costDetail.js'
+import { accountDetailModel, timeDetailModel } from './dockDetail.js'
 import { formatCny, formatTokens } from './format.js'
-import { fetchPlans } from './plans.js'
+import { fetchPlans, providerById, windowProgress } from './plans.js'
 import { useSelectedPlan } from './planView.js'
 import { findTeamOf, teamSummaryOf } from './team.js'
 import { fetchDashboard } from './usage.js'
@@ -280,6 +281,19 @@ export function teamPillOf(summary) {
  * @param {object} input - open / anchorRef / panelRef。
  * @returns {{style:object|undefined, placed:boolean}} 内联样式与是否已定位。
  */
+export function detailPanelPlacement({ rect, panelHeight, viewportWidth, viewportHeight }) {
+  if (viewportWidth <= 0 || viewportHeight <= 0) return { position: 'fixed', left: `${PANEL_MARGIN}px`, top: `${PANEL_MARGIN}px`, width: `min(${PANEL_MAX_WIDTH}px, calc(100vw - ${PANEL_MARGIN * 2}px))` }
+  const width = Math.min(PANEL_MAX_WIDTH, Math.max(0, viewportWidth - PANEL_MARGIN * 2))
+  const centerX = rect.width > 0 ? rect.left + rect.width / 2 : viewportWidth / 2
+  const left = Math.min(Math.max(PANEL_MARGIN, centerX - width / 2), Math.max(PANEL_MARGIN, viewportWidth - PANEL_MARGIN - width))
+  const spaceAbove = rect.top - PANEL_GAP - PANEL_MARGIN
+  const spaceBelow = viewportHeight - rect.bottom - PANEL_GAP - PANEL_MARGIN
+  const base = { position: 'fixed', left: `${Math.round(left)}px`, width: `${Math.round(width)}px` }
+  if ((panelHeight <= 0 || panelHeight <= spaceAbove) && rect.top > 0) return { ...base, bottom: `${Math.round(viewportHeight - rect.top + PANEL_GAP)}px` }
+  if (spaceBelow > spaceAbove && panelHeight <= spaceBelow) return { ...base, top: `${Math.round(Math.max(PANEL_MARGIN, rect.bottom + PANEL_GAP))}px` }
+  return { ...base, top: `${PANEL_MARGIN}px` }
+}
+
 function useDetailPlacement(input) {
   const { open, anchorRef, panelRef } = input
   const [placement, setPlacement] = useState({ style: undefined, placed: false })
@@ -311,49 +325,7 @@ function useDetailPlacement(input) {
       const panelHeight = Number(panelRef?.current?.offsetHeight ?? 0)
       const viewportWidth = Number(window.innerWidth ?? 0) || 0
       const viewportHeight = Number(window.innerHeight ?? 0) || 0
-
-      // 视口宽为 0（jsdom / 尚未布局）时不做相对计算，给一个能断言的居中布局。
-      if (viewportWidth <= 0 || viewportHeight <= 0) {
-        setPlacement({
-          style: { position: 'fixed', left: `${PANEL_MARGIN}px`, top: `${PANEL_MARGIN}px`, width: `min(${PANEL_MAX_WIDTH}px, calc(100vw - ${PANEL_MARGIN * 2}px))` },
-          placed: true,
-        })
-        return
-      }
-
-      const width = Math.min(PANEL_MAX_WIDTH, Math.max(0, viewportWidth - PANEL_MARGIN * 2))
-      const centerX = rect.width > 0 ? rect.left + rect.width / 2 : viewportWidth / 2
-      const left = Math.min(
-        Math.max(PANEL_MARGIN, centerX - width / 2),
-        Math.max(PANEL_MARGIN, viewportWidth - PANEL_MARGIN - width),
-      )
-
-      // 上方空间够就用 bottom 贴住锚点顶部：用 bottom 而不是 top，是因为
-      // 面板高度会随后续刷新（金额位数、成员增减）变化，bottom 定位能让它在
-      // 高度变化时仍然**贴着**锚点，而 top 定位会让它从锚点往上长到一半卡住。
-      const spaceAbove = rect.top - PANEL_GAP - PANEL_MARGIN
-      const spaceBelow = viewportHeight - rect.bottom - PANEL_GAP - PANEL_MARGIN
-      const fitsAbove = panelHeight <= 0 || panelHeight <= spaceAbove
-      if (fitsAbove && rect.top > 0) {
-        setPlacement({
-          style: { position: 'fixed', left: `${Math.round(left)}px`, bottom: `${Math.round(viewportHeight - rect.top + PANEL_GAP)}px`, width: `${Math.round(width)}px` },
-          placed: true,
-        })
-        return
-      }
-      // 上面放不下、下面更宽裕：翻到下面（顶边贴住锚点底部）
-      if (spaceBelow > spaceAbove) {
-        setPlacement({
-          style: { position: 'fixed', left: `${Math.round(left)}px`, top: `${Math.round(Math.max(PANEL_MARGIN, rect.bottom + PANEL_GAP))}px`, width: `${Math.round(width)}px` },
-          placed: true,
-        })
-        return
-      }
-      // 两边都放不下：仍然向上，但贴到视口顶边，保证整块内容可达（可滚动）
-      setPlacement({
-        style: { position: 'fixed', left: `${Math.round(left)}px`, top: `${PANEL_MARGIN}px`, width: `${Math.round(width)}px` },
-        placed: true,
-      })
+      setPlacement({ style: detailPanelPlacement({ rect, panelHeight, viewportWidth, viewportHeight }), placed: true })
     }
 
     place()
@@ -366,7 +338,10 @@ function useDetailPlacement(input) {
     // 真正的滚动容器是会话区，它不在 body 的事件冒泡路径上。
     const onScroll = () => { place() }
     window.addEventListener('scroll', onScroll, true)
+    const observer = typeof ResizeObserver === 'function' && panel ? new ResizeObserver(place) : null
+    observer?.observe(panel)
     return () => {
+      observer?.disconnect()
       window.removeEventListener('scroll', onScroll, true)
       if (raf !== undefined && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(raf)
     }
@@ -404,7 +379,21 @@ function measureStyle() {
  * @returns {object|null} React 元素。
  */
 export function CostDetailPanel(props) {
-  const { model } = props
+  const [tab, setTab] = useState(props.initialTab === 'time' ? 'time' : 'cost')
+  const id = React.useId()
+  const costTabRef = useRef(null)
+  const timeTabRef = useRef(null)
+  const hasTabs = props.timeModel !== undefined
+  const selected = hasTabs && tab === 'time' ? 'time' : 'cost'
+  const model = selected === 'time' ? props.timeModel : props.model
+  const onTabKey = (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+    event.preventDefault()
+    event.stopPropagation()
+    const next = event.key === 'Home' ? 'cost' : event.key === 'End' ? 'time' : selected === 'cost' ? 'time' : 'cost'
+    setTab(next)
+    ;(next === 'time' ? timeTabRef : costTabRef).current?.focus?.()
+  }
   if (model === undefined || model === null || model.empty === true) return null
 
   return h(
@@ -412,8 +401,17 @@ export function CostDetailPanel(props) {
     {
       className: `px-detail px-detail-tone-${model.tone}`,
       role: 'dialog',
-      'aria-label': `${model.title}计价详情`,
+      'aria-label': model.ariaLabel || `${model.title}计价详情`,
+      tabIndex: -1,
     },
+    hasTabs ? h('div', { className: 'px-detail-tabs', role: 'tablist', 'aria-label': '会话资源维度' },
+      ['cost', 'time'].map((value) => h('button', {
+        key: value, type: 'button', role: 'tab', id: `${id}-${value}`,
+        ref: value === 'cost' ? costTabRef : timeTabRef,
+        'aria-selected': selected === value, 'aria-controls': `${id}-body`, tabIndex: selected === value ? 0 : -1,
+        onClick: () => { setTab(value) }, onKeyDown: onTabKey,
+      }, value === 'cost' ? '费用' : '时间'))) : null,
+    h('div', hasTabs ? { role: 'tabpanel', id: `${id}-body`, 'aria-labelledby': `${id}-${selected}`, className: 'px-detail-tab-body' } : null,
     h(
       'div',
       { className: 'px-detail-head' },
@@ -436,7 +434,7 @@ export function CostDetailPanel(props) {
         { className: 'px-detail-rows' },
         section.rows.map((row, rowIndex) => h(
           'div',
-          { key: `${row.label}-${rowIndex}`, className: 'px-detail-row' },
+          { key: `${row.label}-${rowIndex}`, className: `px-detail-row${row.wrap ? ' px-detail-row-wrap' : ''}` },
           h('span', { className: 'px-detail-row-label', title: row.hint }, row.label),
           h(
             'span',
@@ -458,7 +456,7 @@ export function CostDetailPanel(props) {
     )),
     model.notes.length === 0
       ? null
-      : h('div', { className: 'px-detail-notes' }, model.notes.map((note, index) => h('p', { key: index }, note))),
+      : h('div', { className: 'px-detail-notes' }, model.notes.map((note, index) => h('p', { key: index }, note)))),
   )
 }
 
@@ -467,12 +465,12 @@ export function CostDetailPanel(props) {
  * tertiary 文字、24px 圆角、悬停微微加深），因此并排时不显得是「外来的」。
  *
  * 可点的那一枚渲染成 `<button>`（带 `aria-expanded` / `aria-haspopup`），
- * 不可点的（token 数、余额）仍是 `<span>`——**别让用户去点一个点了没反应的东西**。
+ * 不可点的 token 数仍是 `<span>`；费用和账户有各自卡片入口，不创建空按钮。
  * @param {object} props - tone / label / value / title / warn / tag / onClick / expanded / refOf。
  * @returns {object} React 元素。
  */
 function Pill(props) {
-  const { tone, label, value, title, warn, tag, onClick, expanded, refOf } = props
+  const { tone, label, value, title, warn, tag, onClick, expanded, refOf, detailLabel = '计价详情' } = props
   const className = `px-pill${warn === true ? ' px-pill-warn' : ''}${onClick === undefined ? '' : ' px-pill-button'}`
   const children = [
     h('i', { key: 'dot', className: `px-pill-dot${tone === undefined ? '' : ` px-tone-bg-${tone}`}` }),
@@ -497,7 +495,7 @@ function Pill(props) {
       onClick,
       'aria-haspopup': 'dialog',
       'aria-expanded': expanded === true,
-      'aria-label': `${label ?? ''} ${value}，展开计价详情`.trim(),
+      'aria-label': `${label ?? ''} ${value}，展开${detailLabel}`.trim(),
       ref: refOf,
     },
     children,
@@ -508,8 +506,8 @@ function Pill(props) {
  * 徽标组：本次会话费用（+ 可选 token）、以及**按当前模型来源绑定**的那一份
  * 账户事实（官方余额或某家套餐的最紧窗口）。
  *
- * 纯展示**外加一个可展开的详情面板**：费用那一枚（或团队那一枚）是按钮，
- * 点开后在它的上方弹出 `CostDetailPanel`。
+ * 费用/团队与账户各是一个入口，共享最多一张可展开的详情卡片。
+ * 费用卡默认金额，另有已完成执行的时间视图；账户卡只呈现绑定账户事实。
  *
  * ## 两件事刻意分开
  *
@@ -521,119 +519,66 @@ function Pill(props) {
  * @returns {object|null} React 元素。
  */
 export function SessionCostPills(props) {
-  const { cost, tokens, failed, account, showTokens = true, unpriced, usage, team } = props
-  // 详情面板默认收起：真实首屏与静态渲染里都必须是「没有浮层」这一态。
+  const { cost, tokens, failed, account, showTokens = true, unpriced, usage, team, accountInfo, timezone, timeModel } = props
   const [open, setOpen] = useState(false)
-  const anchorRef = useRef(null)
+  const [panelKind, setPanelKind] = useState('cost')
+  const costAnchorRef = useRef(null)
+  const accountAnchorRef = useRef(null)
   const panelRef = useRef(null)
-  // 与 `open` 同步的一份 ref：`toggle` 想读到「当前是开还是关」而不把 open 放进
-  // 依赖里（那样每次开合都会重新创建回调，Pill 上的 onClick 也跟着变）。
   const openRef = useRef(false)
-
-  // 什么都没拿到、也不是失败：不渲染空壳。
-  // 必须返回 null 而不是空元素：容器没有 gap，空元素会污染产品的间距节奏。
-  // 团队口径也算「拿到了东西」：成员都还没跑过请求时合计是 ¥0，那是**已知的 0**，
-  // 不是「不知道」——但**空成员列表**不算（见 teamSummaryOf 的说明）。
-  if (cost === undefined && failed !== true && account === undefined && team === undefined
-    && (tokens === undefined || tokens === 0)) return null
-
-  // 「缺少计算公式」这件事必须说出来：那个模型不在价目表里，金额是**按 Flash
-  // 单价估的**，跟看板费用明细里标的「估算价」是同一件事。角标 + 面板脚注两处都写。
-  const unpricedList = Array.isArray(unpriced) ? unpriced.filter((name) => name !== '') : []
-
-  const model = costDetailModel({ cost, failed, team, account, usage, unpriced: unpricedList })
-  // 开合状态是本组件自己的。**不在 setOpen 的更新函数里做副作用**：
-  // React 在 StrictMode 下会把更新函数调用两次，副作用（回调外部、埋点之类）
-  // 因此会重复执行；这里先把 next 算出来再提交。
-  const toggle = useCallback(() => {
-    const next = openRef.current !== true
+  const kindRef = useRef('cost')
+  const anchorRef = panelKind === 'account' ? accountAnchorRef : costAnchorRef
+  const togglePanel = useCallback((kind) => {
+    const next = !(openRef.current && kindRef.current === kind)
+    kindRef.current = kind
     openRef.current = next
+    setPanelKind(kind)
     setOpen(next)
   }, [])
+  const toggle = useCallback(() => { togglePanel('cost') }, [togglePanel])
+  const toggleAccount = useCallback(() => { togglePanel('account') }, [togglePanel])
   const closing = useCallback(() => {
     openRef.current = false
     setOpen(false)
+    if (typeof document !== 'undefined' && panelRef.current?.contains(document.activeElement)) {
+      const anchor = kindRef.current === 'account' ? accountAnchorRef.current : costAnchorRef.current
+      anchor?.focus?.()
+    }
   }, [])
-
   usePanelDismiss({ open, setOpen: closing, anchorRef, panelRef })
   const placement = useDetailPlacement({ open, anchorRef, panelRef })
-  const panel = open === true && typeof createPortal === 'function' && typeof document !== 'undefined'
-    ? createPortal(
-      h(
-        'div',
-        {
-          ref: panelRef,
-          className: 'px-detail-anchor',
-          // 还没量到时用测量态（隐藏但占位）。绝不能不给 style：那样面板会以
-          // 静态流的方式插进 body 末尾，先在整个页面底部闪一下再跳上来。
-          style: placement.placed === true ? placement.style : measureStyle(),
-          'data-px-detail-placed': placement.placed === true ? 'true' : 'false',
-        },
-        h(CostDetailPanel, { model }),
-      ),
-      document.body,
-    )
+  useEffect(() => {
+    if (!open || !placement.placed) return
+    const node = panelRef.current?.querySelector?.('[aria-selected="true"]') ?? panelRef.current?.querySelector?.('[role="dialog"]')
+    node?.focus?.()
+  }, [open, panelKind, placement.placed])
+
+  if (cost === undefined && failed !== true && (!account || account.kind === 'none') && team === undefined
+    && (tokens === undefined || tokens === 0)) return null
+  const unpricedList = Array.isArray(unpriced) ? unpriced.filter((name) => name !== '') : []
+  const model = panelKind === 'account'
+    ? accountDetailModel({ account, provider: accountInfo, timezone })
+    : costDetailModel({ cost, failed, team, usage, unpriced: unpricedList })
+  const panel = open && typeof createPortal === 'function' && typeof document !== 'undefined' && document.body
+    ? createPortal(h('div', {
+      ref: panelRef, className: 'px-detail-anchor',
+      style: placement.placed ? placement.style : measureStyle(),
+      'data-px-detail-placed': placement.placed ? 'true' : 'false',
+    }, h(CostDetailPanel, { key: panelKind, model, timeModel: panelKind === 'cost' ? timeModel : undefined })), document.body)
     : null
-  // 没有 createPortal（服务端渲染 / 渲染闸门的替身环境）时**整块不渲染**：
-  // 面板是固定定位的浮层，塞回 dock 那一行会把横向行撑开、与官方胶囊抢宽度。
-
-  /**
-   * 团队模式：**这一枚取代**「本次会话」那一枚，而不是并排再加一枚。
-   *
-   * ## 为什么是取代而不是并列
-   *
-   * dock 那一行是横向 flex，宽度是与官方胶囊抢的。团队合计与本次会话金额
-   * 并排会多占一格，而两者的差（teammate 那部分）才是用户想看的——把它写进
-   * 详情面板的「成员」一节，既省下宽度，又直接回答了「谁花的」。
-   * 因此团队模式下，**本次会话的金额移到面板里**，不丢信息。
-   */
   const teamText = teamPillOf(team)
-  if (teamText !== undefined) {
-    return h(
-      React.Fragment,
-      null,
-      h(Pill, {
-        tone: 'purple',
-        label: '团队合计',
-        value: teamText.value,
-        tag: teamText.tag,
-        onClick: toggle,
-        expanded: open,
-        refOf: anchorRef,
-      }),
-      showTokens && team.tokens !== undefined && team.tokens > 0
-        ? h(Pill, { tone: 'blue', value: `${formatTokens(team.tokens)} tokens`, title: `团队合计 ${team.memberCount} 位成员` })
-        : null,
-      h(AccountPill, { account }),
-      panel,
-    )
-  }
-
-  return h(
-    React.Fragment,
-    null,
+  return h(React.Fragment, null,
     h(Pill, {
-      tone: failed === true ? 'red' : 'pink',
-      label: '本次会话',
-      value: cost === undefined
-        ? (failed === true ? '费用不可用' : '折算中…')
-        : formatCny(cost.standard),
-      warn: failed === true,
-      tag: unpricedList.length === 0 ? undefined : '估算',
-      // **刻意不给 `title`。** 这一枚是按钮，详情全部在面板里；再挂一段多行
-      // title 就等于同时保留两条信息通道，而悬停那条正是用户嫌丑的原生裸浮窗
-      // （而且是**打开的**面板之上再弹一个系统提示，两个东西会打架）。
-      // 无障碍的「可展开 + 名字」由 aria-expanded / aria-label 承担。
-      onClick: toggle,
-      expanded: open,
-      refOf: anchorRef,
+      tone: teamText ? 'purple' : failed ? 'red' : 'pink',
+      label: teamText ? '团队合计' : '本次会话',
+      value: teamText ? teamText.value : cost === undefined ? failed ? '费用不可用' : '折算中…' : formatCny(cost.standard),
+      warn: failed === true, tag: teamText ? teamText.tag : unpricedList.length ? '估算' : undefined,
+      onClick: toggle, expanded: open && panelKind === 'cost', refOf: costAnchorRef,
     }),
-    showTokens && tokens !== undefined && tokens > 0
-      ? h(Pill, { tone: 'blue', value: `${formatTokens(tokens)} tokens` })
-      : null,
-    h(AccountPill, { account }),
-    panel,
-  )
+    showTokens && (teamText ? team.tokens : tokens) > 0
+      ? h(Pill, { tone: 'blue', value: formatTokens(teamText ? team.tokens : tokens) + ' tokens' }) : null,
+    h(AccountPill, { account, onClick: toggleAccount, expanded: open && panelKind === 'account', refOf: accountAnchorRef }),
+    panel)
 }
 
 /**
@@ -686,52 +631,23 @@ function usePanelDismiss(input) {
 /**
  * 那一枚账户徽标：按来源不同渲染成余额或套餐窗口。
  *
- * 它**不可点击**：账户这一节已经在费用面板里了，再给它一个自己的浮层只会让人
- * 以为点哪个都能展开，而实际上只有费用那一枚有内容。详情写进 `title`。
+ * 账户有独立的可点击卡片入口：余额构成、额度窗口、重置时间与来源说明不再塞进原生 title。
+ * 与费用详情共用开合状态，任一时刻最多一张浮层；不把大卡片常驻在输入框下。
  * @param {object} props - account。
  * @returns {object|null} React 元素。
  */
 function AccountPill(props) {
-  const { account } = props
-  if (account === undefined || account === null) return null
-
-  if (account.kind === 'balance') {
-    // 悬停给出完整说明（各币种 / 赠送金 / 账号名），徽标上只留**一个总余额**。
-    const detail = balanceDetail(account.payload)
-    return h(Pill, {
-      tone: 'green',
-      label: '余额',
-      value: account.text,
-      title: (detail.length > 0 ? `${detail.join('\n')}\n` : '')
-        + '余额来自官方账户接口（当前登录的 DeepSeek 账号）；当前会话走官方 API，因此显示它。',
-    })
-  }
-
+  const { account, onClick, expanded, refOf } = props
+  if (!account || account.kind === 'none') return null
+  const action = { onClick, expanded, refOf, detailLabel: '账户详情' }
+  if (account.kind === 'balance') return h(Pill, { ...action, tone: 'green', label: '余额', value: account.text })
   if (account.kind === 'plan') {
-    const { plan } = account
-    const percent = plan.percent
-    return h(Pill, {
-      // 超过 75% 转警戒色，与看板里的阈值保持一致
-      tone: percent >= 75 || plan.window.exceeded === true ? 'red' : 'purple',
-      label: account.label,
-      value: `${percent.toFixed(0)}%`,
-      title: `${account.fullLabel ?? account.label} · ${plan.window.label}额度已用 ${percent.toFixed(1)}%`
-        + `｜来自厂商内部接口，仅供参照｜当前会话走的是这一家，因此显示它`
-        + (account.source === 'selected' ? '（你在看板上手动指定了监看这一家）' : ''),
-    })
+    const percent = Number(account.plan?.percent)
+    const known = account.plan?.percent !== undefined && Number.isFinite(percent)
+    return h(Pill, { ...action, tone: known && (percent >= 75 || account.plan?.window?.exceeded) ? 'red' : 'purple',
+      label: account.label, value: known ? percent.toFixed(0) + '%' : `余 ${windowProgress(account.plan?.window).remainingText}` })
   }
-
-  if (account.kind === 'unavailable') {
-    // 拿不到就说出来。静默不渲染会让人以为是插件坏了。
-    return h(Pill, {
-      tone: 'red',
-      label: account.label,
-      value: '不可用',
-      warn: true,
-      title: `${account.reason ?? '暂时取不到数据'}｜这一枚是按当前模型来源绑定的，切换模型或修好凭据后会自动恢复`,
-    })
-  }
-
+  if (account.kind === 'unavailable') return h(Pill, { ...action, tone: 'red', label: account.label, value: '不可用', warn: true })
   return null
 }
 
@@ -769,7 +685,7 @@ export function SessionCostView(props) {
 export function SessionCost(props) {
   const sessionId = props.sessionId
   const [state, setState] = useState({
-    cost: undefined, failed: false, balance: undefined, plans: undefined, unpriced: [], team: undefined,
+    sessionId: undefined, cost: undefined, failed: false, balance: undefined, plans: undefined, unpriced: [], team: undefined, timeModel: undefined, timezone: undefined,
   })
   const official = useOfficialStats()
   // 用户在看板上手动指定的「当前监看的套餐」（undefined = 自动）。
@@ -790,13 +706,15 @@ export function SessionCost(props) {
            * 找不到团队（单人会话 / 旧宿主没有 `teams[]`）时是 undefined，
            * 于是费用条完全退回改动前的单会话口径——见 team.js 的退化表。
            */
-          const team = teamSummaryOf(findTeamOf(data, sessionId), { formatCny, formatTokens })
+          const rawTeam = findTeamOf(data, sessionId)
+          const team = teamSummaryOf(rawTeam, { formatCny, formatTokens })
           // 会话在、但没带 cost：宿主是旧实现。标成失败，不要继续转圈。
           setState((prev) => ({
             ...prev,
-            cost: row?.cost,
+            sessionId, cost: row?.cost,
             failed: row !== undefined && row.cost === undefined,
-            team,
+            team, timezone: data.timezone,
+            timeModel: timeDetailModel({ row, team: rawTeam, sessions: data.sessions }),
             // 这个会话用到的模型里，哪些不在价目表里？金额仍是宿主按 Flash 兜底
             // 单价算的，界面上要标成「估算」——与看板费用明细的口径一致。
             unpriced: unpricedModelsOf(row, data.models),
@@ -805,7 +723,7 @@ export function SessionCost(props) {
         .catch(() => {
           // 取数失败（宿主没起来 / 请求出错）也要明说，不静默停在「折算中」
           if (!cancelled) {
-            setState((prev) => ({ ...prev, cost: undefined, failed: true, unpriced: [], team: undefined }))
+            setState((prev) => ({ ...prev, sessionId, cost: undefined, failed: true, unpriced: [], team: undefined, timeModel: undefined }))
           }
         })
       fetchBalance({ refresh })
@@ -855,14 +773,18 @@ export function SessionCost(props) {
 
   if (sessionId === undefined) return null
 
+  // Do not put the previous session's money or timing under a newly selected conversation.
+  const current = state.sessionId === sessionId ? state : {}
   const pills = h(SessionCostPills, {
-    cost: state.cost,
-    failed: state.failed,
-    account,
-    unpriced: state.unpriced,
+    key: sessionId,
+    cost: current.cost,
+    failed: current.failed,
+    account, accountInfo: providerById(state.plans, account?.planId), timezone: current.timezone,
+    timeModel: current.timeModel ?? timeDetailModel(),
+    unpriced: current.unpriced,
     // 团队口径：当前会话属于某个多成员团队时，这一枚换成「团队合计」，
     // 成员明细进详情面板（见 SessionCostPills 的说明）。
-    team: state.team,
+    team: current.team,
     // 面板里的「用量构成」一节要的是分桶数字，不是总数——投影给的就是这份，
     // 原样交下去，免得面板再去发一次请求。
     usage: totals,
