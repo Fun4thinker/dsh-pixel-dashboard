@@ -143,13 +143,18 @@ node tools/install-official.mjs --profile web      # 建 link: 软链指向本�
 | 智谱 GLM Coding Plan | 订阅额度 | 5 小时、每周 | `ZHIPU_CODING_API_KEY` |
 | Command Code | 订阅额度 | 5 小时、每周、每月 | `COMMAND_CODE_API_KEY`（可自动读 `~/.commandcode/auth.json`） |
 | 火山方舟 | 订阅额度 | 5 小时、每周、每月 | `VOLC_ACCESS_KEY_ID` + `VOLC_SECRET_ACCESS_KEY` |
-| Codex | 订阅额度 | 上游给的窗口长度 | `CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID`（可自动读 `~/.codex/auth.json`） |
+| Codex | 订阅额度 | 上游给的窗口长度 | `CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID`（**优先自动复用 `dsh-codex-subscription` 的登录态**，其次 `~/.codex/auth.json`） |
 | Cursor | 订阅额度 | 计费周期 | `CURSOR_ACCESS_TOKEN`（可自动读 Cursor 的 `auth.json`） |
 | Opencode | 订阅额度 | 每日 / 每月 | `OPENCODE_API_KEY` + `OPENCODE_WORKSPACE_ID`（可自动读 `~/.local/share/opencode/auth.json`） |
 
 **没有凭据就没有额度可看**，这一点没什么可绕的；界面会直接告诉你这一家缺哪个引用名、
 去哪拿、以及插件在这台机器上会去哪个路径找。**后六家都是未文档化的内部接口**，
 可能随时失效——一家失败只标那一家，其余照常工作。
+
+**在 DSH 里用 Codex 的话不用另配凭据**：装了 `dsh-codex-subscription` 并在其中登录过，
+本插件直接复用它的那一份登录态（与会话里正在用的是同一份，且它会自己刷新），
+不会因为 `~/.codex/auth.json` 过期就说「不可用」——那个文件只在你执行 `codex login`
+那一刻被写，之后不再更新。
 
 看板最左边那张账户卡是**官方账户**：登录后显示头像、昵称与**现金余额**，右上角「更多」
 直接打开官网**用量页**。**「累计消费」只在官方接口真的返回它时才显示**——官网那个数

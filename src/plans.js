@@ -493,7 +493,145 @@ export function readCodexAuth(path) {
   if (tokens === undefined || tokens === null || typeof tokens !== 'object') return undefined
   const accessToken = stringOrUndefined(tokens.access_token)
   if (accessToken === undefined) return undefined
-  return { accessToken, accountId: stringOrUndefined(tokens.account_id) }
+  return {
+    accessToken,
+    accountId: stringOrUndefined(tokens.account_id),
+    // exp 取自 JWT 本身：`last_refresh` 只说明**上次**刷新时间，回答不了
+    // 「这枚 token 现在还能用吗」，而这里恰恰要靠它比较两枚 token 谁更新。
+    expiresAt: jwtExpiryOf(accessToken),
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * 与 dsh-codex-subscription 共用同一份登录态
+ *
+ * ## 这条路解决的是什么
+ *
+ * 用户在 DSH 里用 Codex 时，**真正在用的**那一份登录态属于另一半插件
+ * （`dsh-codex-subscription`）：它把 OAuth 存进 DSH 凭据服务，并在每次请求前自己
+ * 刷新。而本插件原先只认 `CODEX_ACCESS_TOKEN` 与 `~/.codex/auth.json`——后者是
+ * **Codex CLI 自己的**文件，别的 App 登录之后就不会再更新（本插件不写别人的文件）。
+ *
+ * 于是本机出现过一种典型症状：会话里 Codex 用得好好的，输入框下面那一行额度却写着
+ * 「不可用」。实测两枚 token 属于**同一个账号**（同一个 `chatgpt_account_id`），
+ * 只是 auth.json 那枚已在两天前过期，而插件里那枚还新鲜——数字错不在取数逻辑，
+ * 而在「读的是谁的那一份」。
+ *
+ * ## 只读，而且必须只读
+ *
+ * 这里只 `readRecord` / `resolve`：不 `set`、不 `unset`、**不刷新**。刷新是那一半
+ * 插件的职责（它自己有串行化与 refresh token 轮换处理），在这里刷会与它竞争，
+ * 甚至把已轮换的 refresh token 写成废的。读到的那枚过期了就**如实说已过期**，
+ * 由用户去那一半重新登录——绝不自己动手。
+ * ══════════════════════════════════════════════════════════════════ */
+
+/**
+ * `dsh-codex-subscription` 的多账号记录键（DSH 凭据存储里的一条 grant 记录）。
+ *
+ * 与插件自己的 `credentialKey('codex-subscription', 'accounts')` 逐字相同；形状是
+ * `{ version, activeId, legacyAccountId?, accounts: [{ id, label, credential }] }`。
+ */
+export const CODEX_PLUGIN_VAULT_KEY = 'codex-subscription/accounts'
+
+/**
+ * `dsh-codex-subscription` 的单条 OAuth 引用名。
+ *
+ * 多账号是后来的形态，这条引用是**旧版本 / 迁移中途**仍在用的那一份（插件自己也
+ * 保留它做回滚源）。因此 vault 读不到时还要再试它一次。
+ */
+export const CODEX_PLUGIN_CREDENTIAL_REFS = Object.freeze(['OPENAI_CODEX_SUBSCRIPTION_OAUTH'])
+
+/**
+ * 从 JWT 里读 `exp`（毫秒）。**不验签**，只用来比较两份登录态谁更新。
+ *
+ * 读不出就返回 undefined——「不知道过期时间」与「已过期」是两件事，不能混。
+ * @param {string} token - JWT。
+ * @returns {number|undefined} 过期时刻（毫秒）；不是 JWT 或读不出时 undefined。
+ */
+export function jwtExpiryOf(token) {
+  if (typeof token !== 'string') return undefined
+  const parts = token.split('.')
+  if (parts.length < 2) return undefined
+  try {
+    const payload = Buffer.from(parts[1].replace(/-/gu, '+').replace(/_/gu, '/'), 'base64').toString('utf8')
+    const parsed = JSON.parse(payload)
+    const exp = parsed?.exp
+    if (typeof exp !== 'number' || !Number.isFinite(exp) || exp <= 0) return undefined
+    return exp * 1000
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 把一条 OAuth 凭据（JSON 字符串或已解析对象）压成统一形状。
+ *
+ * 只认插件真实写下的字段（`access` / `accountId` / `expires` / `email`），另外接受
+ * 下划线写法（`access_token` / `account_id`）因为 Codex CLI 的 auth.json 用那一套。
+ * **认不出就返回 undefined**，不猜。
+ * @param {unknown} value - 凭据值。
+ * @returns {{accessToken:string,accountId:string|undefined,expiresAt:number|undefined,email:string|undefined}|undefined}
+ */
+export function parseCodexOAuthCredential(value) {
+  let parsed = value
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value)
+    } catch {
+      return undefined
+    }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const accessToken = stringOrUndefined(parsed.access) ?? stringOrUndefined(parsed.access_token)
+  if (accessToken === undefined) return undefined
+  const accountId = stringOrUndefined(parsed.accountId) ?? stringOrUndefined(parsed.account_id)
+  const expires = typeof parsed.expires === 'number' && Number.isFinite(parsed.expires)
+    ? parsed.expires
+    : undefined
+  return {
+    accessToken,
+    accountId,
+    expiresAt: expires ?? jwtExpiryOf(accessToken),
+    email: stringOrUndefined(parsed.email),
+  }
+}
+
+/**
+ * 从 DSH 凭据记录 / 凭据值里挑出「插件当前正在用的那一个账号」。
+ *
+ * 多账号 vault 必须按 `activeId` 挑：vault 里可能躺着好几个账号，随手取第一个会拿
+ * 别人的额度去填这一行——数字有、也不报错，只是答错了账号。
+ * @param {unknown} value - `readRecord` 的返回值或一条凭据值。
+ * @returns {{accessToken:string,accountId:string|undefined,expiresAt:number|undefined,email:string|undefined,label:string|undefined}|undefined}
+ */
+export function codexPluginCredential(value) {
+  let parsed = value
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value)
+    } catch {
+      return undefined
+    }
+  }
+  if (parsed === null || typeof parsed !== 'object') return undefined
+  // grant 记录：真正的载荷在 payload 里
+  const payload = parsed.payload !== undefined && typeof parsed.payload === 'object' ? parsed.payload : parsed
+  const accounts = Array.isArray(payload.accounts) ? payload.accounts : undefined
+  if (accounts !== undefined) {
+    if (accounts.length === 0) return undefined
+    const activeId = stringOrUndefined(payload.activeId)
+    const active = activeId === undefined ? undefined : accounts.find((account) => account?.id === activeId)
+    // `activeId` 写着却对不上任何一条 = 记录本身坏了。此时**不猜**第一个：
+    // 拿别人的额度填这一行，数字有、也不报错，只是答错了账号。
+    if (activeId !== undefined && active === undefined) return undefined
+    const chosen = active ?? accounts[0]
+    const fields = parseCodexOAuthCredential(chosen?.credential)
+    if (fields === undefined) return undefined
+    return { ...fields, label: stringOrUndefined(chosen?.label) }
+  }
+  const fields = parseCodexOAuthCredential(payload)
+  if (fields === undefined) return undefined
+  return { ...fields, label: undefined }
 }
 
 /**
@@ -824,6 +962,12 @@ function credentialFilesOf(id, env = process.env) {
   } else if (id === 'codex') {
     add(codexAuthPath(env),
       'Codex CLI 的登录文件；插件只读它的 tokens.access_token / tokens.account_id，不写、不删')
+    // 另一半插件的登录态也在凭据文件里（记录键 `codex-subscription/accounts`）。
+    // 它必须列出来：这是「我在 dsh-codex-subscription 里登录过，为什么这里直接有数」
+    // 的答案，而 Codex CLI 的 auth.json 过期时数据仍然正常，也只有这一条能解释。
+    add(resolveCredentialFilePath(env),
+      'DSH 凭据文件；dsh-codex-subscription 把 Codex 登录态存在这里，本插件优先复用它'
+        + '（与本会话用的是同一份，且它会自己刷新；经 DSH 凭据服务只读，不写、不删）')
   } else if (id === 'cursor') {
     for (const path of cursorAuthPaths(env)) {
       add(path, 'Cursor CLI 的登录文件（accessToken）；插件只读，不写、不删。桌面端的 SQLite 存储不读')
@@ -849,6 +993,7 @@ export const CREDENTIAL_SOURCE_LABELS = Object.freeze({
   'project-env': '项目目录的 .env（插件改不了）',
   'user-env': '<DSH_HOME>/.env（插件改不了）',
   credentials: 'DSH 凭据服务',
+  'codex-subscription': 'dsh-codex-subscription 插件里的登录态（与本会话共用）',
   'file+cli': 'DSH 凭据文件 + CLI 文件',
 })
 
@@ -1720,6 +1865,45 @@ export class PlansService {
   }
 
   /**
+   * 从 DSH 凭据存储里取 `dsh-codex-subscription` 正在用的那一份 Codex 登录态。
+   *
+   * 两处都试，顺序是「多账号记录 → 旧单条引用」：多账号是现行形态（记录里按
+   * `activeId` 挑），单条引用是旧版本与迁移中途的回滚源，插件自己也在维护它。
+   * 两处都读不到才返回 undefined——那表示这台机器上那一半插件没登录过。
+   *
+   * **全程只读**：不刷新、不改写。刷新是那一半插件的职责（它有串行化与轮换处理），
+   * 在这里刷会与它竞争，还可能把已轮换的 refresh token 写成废的。
+   * @returns {Promise<{accessToken:string,accountId:string|undefined,expiresAt:number|undefined,email:string|undefined,label:string|undefined,ref:string,source:string}|undefined>} 登录态。
+   */
+  async readCodexPluginCredential() {
+    const credentials = this.credentials?.()
+    if (credentials === undefined) return undefined
+    if (typeof credentials.readRecord === 'function') {
+      try {
+        const record = await credentials.readRecord(CODEX_PLUGIN_VAULT_KEY)
+        const picked = codexPluginCredential(record)
+        if (picked !== undefined) {
+          return { ...picked, ref: CODEX_PLUGIN_VAULT_KEY, source: 'codex-subscription' }
+        }
+      } catch {
+        // 记录不存在、服务不支持记录、或形状对不上：退回下面那条单条引用。
+      }
+    }
+    for (const ref of CODEX_PLUGIN_CREDENTIAL_REFS) {
+      try {
+        const hit = await credentials.resolve(ref)
+        const picked = codexPluginCredential(hit?.value)
+        if (picked !== undefined) {
+          return { ...picked, ref, source: 'codex-subscription' }
+        }
+      } catch {
+        // 引用名非法或读失败：试下一个候选
+      }
+    }
+    return undefined
+  }
+
+  /**
    * 查询全部套餐额度（带 TTL 缓存与并发合并）。
    *
    * 两家各自独立取：一家失败不影响另一家（失败信息随该家一起返回）。
@@ -2245,9 +2429,10 @@ export class PlansService {
   /**
    * Codex（ChatGPT 套餐）额度。
    *
-   * 端点的核验与形状见 {@link CODEX_USAGE_URL}。这里是**只读另一个 App 的登录态**：
-   * token 优先取凭据（`CODEX_ACCESS_TOKEN`），取不到才读 `$CODEX_HOME/auth.json`
-   * 的 `tokens.access_token`——绝不写回、绝不 refresh（refresh 要写那个文件，越权）。
+   * 端点的核验与形状见 {@link CODEX_USAGE_URL}。登录态有**三处来源**，顺序见下方
+   * {@link PlansService#readCodexPluginCredential} 附近的注释；其中
+   * `dsh-codex-subscription` 那一条才是 DSH 里真正在用的那一份。
+   * 所有来源**都只读**：绝不写回、绝不 refresh（refresh 要写别人的凭据，越权）。
    *
    * `chatgpt-account-id` 也是必需的（`codex-rs/model-provider/src/runtime_auth.rs`
    * 的 `validate_runtime_selectors`：ChatGPT 身份的请求必须带它）。拿不到就不发请求，
@@ -2274,7 +2459,8 @@ export class PlansService {
         keyURL: CODEX_KEY_URL,
         keyURLName: 'Codex 登录与用量说明',
         acquire: [
-          '装过 Codex CLI 并 `codex login` 登录过的话**不用手动配**：插件会自动读本机的 auth.json。',
+          '装了 dsh-codex-subscription 并在其中登录过的话**不用手动配**：插件直接复用它的登录态——那正是会话里正在用的同一份，而且它会自己刷新。',
+          '装过 Codex CLI 并 `codex login` 登录过的话也**不用手动配**：插件会自动读本机的 auth.json。',
           '手动配置要的是**登录态 access token**（auth.json 里的 tokens.access_token），不是 sk- 开头的平台 API Key——后者打这个端点只会 401。',
           '同时需要 workspace / 账号 id（auth.json 的 tokens.account_id），它要放进 chatgpt-account-id 请求头。',
         ],
@@ -2288,33 +2474,77 @@ export class PlansService {
       }),
     }
 
-    const token = await this.resolveKey(CODEX_TOKEN_ENVS)
-    const fromFile = token === undefined ? readCodexAuth(authFile) : undefined
-    const accessToken = token?.value ?? fromFile?.accessToken
-    if (accessToken === undefined) {
+    // 三档来源，顺序即优先级：
+    //   1) 显式配置（`CODEX_ACCESS_TOKEN`）——用户写了什么就用什么，插件不越权改判；
+    //   2) dsh-codex-subscription 里那一条——**DSH 里真正在用**的登录态，且它会自己刷新；
+    //   3) `~/.codex/auth.json`——Codex CLI 自己的文件，登录过一次之后就不再更新。
+    // 2 与 3 之间再按「谁还没过期」调一次顺序：两份都在时，用过期的那份只会换来一个
+    // 401，而界面会把它说成「凭据被拒」——那是在指控一份其实没问题的登录态。
+    const now = Date.now()
+    const fresh = (item) => item.expiresAt === undefined || item.expiresAt > now
+    const candidates = []
+    const explicit = await this.resolveKey(CODEX_TOKEN_ENVS)
+    if (explicit !== undefined) {
+      candidates.push({
+        accessToken: explicit.value,
+        accountId: undefined,
+        expiresAt: jwtExpiryOf(explicit.value),
+        ref: explicit.ref,
+        source: explicit.source,
+      })
+    } else {
+      const plugin = await this.readCodexPluginCredential()
+      if (plugin !== undefined) candidates.push(plugin)
+      const fromFile = readCodexAuth(authFile)
+      if (fromFile !== undefined) {
+        candidates.push({
+          accessToken: fromFile.accessToken,
+          accountId: fromFile.accountId,
+          expiresAt: fromFile.expiresAt,
+          ref: '(auth.json)',
+          source: 'cli-file',
+        })
+      }
+    }
+    const chosen = candidates.find(fresh) ?? candidates[0]
+    const accessToken = chosen?.accessToken
+    if (chosen === undefined) {
       return {
         ...base,
         ok: false,
         reason: 'no-key',
         keyRef: CODEX_TOKEN_ENV,
         keyRefs: CODEX_TOKEN_ENVS,
-        hint: '需要 Codex CLI 的登录态（本机 auth.json 或 CODEX_ACCESS_TOKEN）。'
+        hint: '需要 Codex 的登录态：dsh-codex-subscription 里登录过、'
+          + 'Codex CLI 的 auth.json、或 CODEX_ACCESS_TOKEN 三者任一。'
           + '注意那不是 sk- 平台 Key。',
         windows: [],
       }
     }
     const configuredAccount = await this.resolveKey(CODEX_ACCOUNT_ENVS)
-    const accountId = configuredAccount?.value ?? fromFile?.accountId
+    const accountId = configuredAccount?.value ?? chosen.accountId
+    const keyFields = {
+      keyRef: chosen.ref,
+      keySource: chosen.source,
+      keyHint: maskSecret(accessToken),
+      // 来源层 id 对用户没有意义（`codex-subscription` / `cli-file`），带上人话版本，
+      // 界面优先用它。旧宿主没有这个字段时界面退回 id，不会因此空掉。
+      ...(credentialSourceLabel(chosen.source) === ''
+        ? {}
+        : { keySourceLabel: credentialSourceLabel(chosen.source) }),
+      ...(typeof chosen.label === 'string' && chosen.label !== '' ? { keyLabel: chosen.label } : {}),
+    }
     if (accountId === undefined) {
       return {
         ...base,
+        ...keyFields,
         ok: false,
         reason: 'no-key',
         keyRef: CODEX_ACCOUNT_ENVS[0],
         keyRefs: CODEX_ACCOUNT_ENVS,
-        keySource: token?.source ?? 'cli-file',
-        keyHint: maskSecret(accessToken),
-        hint: '拿到了 access token，但缺 workspace / 账号 id（auth.json 的 tokens.account_id 或 CODEX_ACCOUNT_ID）；'
+        hint: '拿到了 access token，但缺 workspace / 账号 id'
+          + '（auth.json 的 tokens.account_id、CODEX_ACCOUNT_ID，'
+          + '或 dsh-codex-subscription 里那条登录态自带的 accountId）；'
           + '这个请求头不带会被上游拒掉。',
         windows: [],
       }
@@ -2329,11 +2559,6 @@ export class PlansService {
         'user-agent': 'codex-cli',
       },
     })
-    const keyFields = {
-      keyRef: token?.ref ?? '(auth.json)',
-      keySource: token?.source ?? 'cli-file',
-      keyHint: maskSecret(accessToken),
-    }
     if (response.error !== undefined) {
       const rejected = response.status === 401 || response.status === 403
       return {
@@ -2342,8 +2567,14 @@ export class PlansService {
         ok: false,
         reason: rejected ? 'rejected' : 'request-failed',
         error: response.error,
+        // 「去哪重新登录」必须与**这一枚 token 的来处**一致：读的是另一半插件的
+        // 登录态却让用户去 `codex login`，等于把他指到一个与这条凭据无关的地方。
         ...(rejected
-          ? { hint: 'Codex 的登录态过期或被拒：在终端里重新 `codex login`（或更新 CODEX_ACCESS_TOKEN）。' }
+          ? {
+            hint: chosen.source === 'codex-subscription'
+              ? 'Codex 的登录态过期或被拒：在 dsh-codex-subscription 里重新登录（或更新 CODEX_ACCESS_TOKEN）。'
+              : 'Codex 的登录态过期或被拒：在终端里重新 `codex login`（或更新 CODEX_ACCESS_TOKEN）。',
+          }
           : {}),
         windows: [],
       }

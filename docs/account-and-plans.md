@@ -57,7 +57,7 @@
 | 智谱 GLM Coding Plan | 5 小时、每周 | 官方只给百分比 | `ZHIPU_CODING_API_KEY` | —（智谱没有官方 CLI 凭据文件） |
 | Command Code | 5 小时、每周、每月 | 5h/周给绝对值；月度只有剩余额 | `COMMAND_CODE_API_KEY` | `~/.commandcode/auth.json` 的 `apiKey` |
 | 火山方舟 Agent / Coding Plan | 5 小时、每周、每月 | Agent Plan 绝对值；Coding Plan 百分比 | `VOLC_ACCESS_KEY_ID` + `VOLC_SECRET_ACCESS_KEY` | —（两把都要配） |
-| Codex（ChatGPT 套餐） | 主 / 次两个滚动窗口（实测 1 小时与 5 小时都出现过） | 官方只给百分比 | `CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID` | `$CODEX_HOME/auth.json`（默认 `~/.codex/auth.json`） |
+| Codex（ChatGPT 套餐） | 主 / 次两个滚动窗口（实测 1 小时与 5 小时都出现过） | 官方只给百分比 | `CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID` | `dsh-codex-subscription` 的登录态（**优先**，见下）；`$CODEX_HOME/auth.json`（默认 `~/.codex/auth.json`） |
 | Cursor | 一个计费周期 | 官方只给百分比 | `CURSOR_ACCESS_TOKEN` | `~/.cursor/auth.json`、`%APPDATA%\Cursor\auth.json` |
 | Opencode | Go：rolling / 每周 / 每月；外加 Console 预算 | 套餐百分比 + 预算金额（美元） | `OPENCODE_API_KEY` + `OPENCODE_WORKSPACE_ID` | `$XDG_DATA_HOME/opencode/auth.json` |
 
@@ -128,6 +128,10 @@
   [`codex-rs/http-client/src/openai_headers.rs`](https://github.com/openai/codex/blob/main/codex-rs/http-client/src/openai_headers.rs)
 - 凭据文件：`$CODEX_HOME/auth.json`，取 `tokens.access_token` 与 `tokens.account_id`
   （见 [`codex-rs/login/src/auth/storage.rs`](https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/storage.rs)）
+- **登录态优先复用 `dsh-codex-subscription` 插件那一份**：你在这个插件里登录过 Codex 时，
+  本插件读的就是它存在 DSH 凭据里的同一条（记录键 `codex-subscription/accounts`，按
+  `activeId` 取当前账号），而不是 `~/.codex/auth.json`。理由很简单——**会话里真正在用的
+  就是那一份**，而且它会自己刷新；`auth.json` 只在 `codex login` 那一刻被写，之后不再更新
 - **窗口身份按 `limit_window_seconds` 判**，不按 primary/secondary 的位置猜：上游出现过
   3600 秒与 18000 秒两种主窗口。认不出的长度会照实显示长度本身（如「每小时」），
   不塞进某个已知窗口
@@ -220,7 +224,9 @@ DSH 会**自动重载**这个文件，改完不用重启——等下一次额度
   Secret Access Key **只在创建时显示一次**，记得当场下载凭证。
 - **Codex 要的是登录态 access token，不是 `sk-` 平台 Key；Cursor 同理。** 这两把都会过期，
   过期后 401：在各自 CLI 里重新登录即可（本插件**不做 token 刷新**——刷新要写回另一个 App
-  的凭据文件，越权了）。
+  的凭据文件，越权了）。**在 DSH 里用 Codex 的话，正确的重登入口是 `dsh-codex-subscription`
+  插件本身**：额度读的就是它的登录态，在那里重新登录之后这一行会自己恢复，不需要碰
+  `~/.codex/auth.json`。
 
 ---
 
