@@ -3806,7 +3806,7 @@ must(
       tools: [{ id: 'third-tool', name: 'third_tool', source, calls: 1, timedCalls: 1, durationMs: 0, avgMs: 0, maxMs: 0, sessionCount: 1, activity: [activity], slowest: activity }],
     };
     const reviewHtml = renderToStaticMarkup(React.createElement(ReviewView, { data: fixture, rangeLabel: '7 日' }));
-    for (const label of ['使用习惯', '资源去向', '工作区', '会话', '工具调用', '对话轮次', '估算费用', '有效耗时', '10:00–11:00']) must(reviewHtml.includes(label), '复盘展示缺少 '+label);
+    for (const label of ['使用习惯', '资源去向', '工作区', '会话', '工具调用', '对话轮次', 'Token 消耗', '有效耗时', '10:00–11:00']) must(reviewHtml.includes(label), '复盘展示缺少 '+label);
     must((reviewHtml.match(/class="px-review-hour"/g) ?? []).length === 24, '小时分布必须有24格');
     must((reviewHtml.match(/class="px-review-cell level-/g) ?? []).length === 173, '星期小时图168格加5级图例');
     must(/class="px-review-row"[^>]*aria-expanded="false"/.test(reviewHtml), '资源行必须能键盘展开');
@@ -4141,14 +4141,16 @@ must(html.includes('platform.deepseek.com/usage'), '余额横条必须给出官�
     // 耗时构成：环形图 + 图例（用户要求对齐 dsh-context 的耗时统计）。
     // 数据来自宿主侧新增的 TimingBreakdown：等待 / 回复 / 工具三段。
     must(detailHtml.includes('px-timing'), '详情应有耗时构成环形图')
-    must(detailHtml.includes('等待模型') && detailHtml.includes('模型回复') && detailHtml.includes('工具执行'),
-      '环形图图例应含三段：等待模型 / 模型回复 / 工具执行')
+    must(detailHtml.includes('模型调用（含生成）') && detailHtml.includes('其他处理') && detailHtml.includes('工具执行'),
+      '步骤构成应区分完整模型调用、其他调度和工具，不将完整响应时刻当首字')
+    must(!detailHtml.includes('模型回复'), '消息落盘后的收尾区间不得冒充模型输出生成')
     // 改用横向堆叠条（用户明确不喜欢环形图）：三段按比例铺开，宽度即占比。
     must(detailHtml.includes('px-timing-seg'), '耗时构成应是横向堆叠条，而不是环形图')
-    must(detailHtml.includes('px-timing-seg-yellow'), '堆叠条应含「等待模型」段')
+    must(detailHtml.includes('px-timing-seg-blue'), '堆叠条应含完整模型调用段')
+    must(detailHtml.includes('px-timing-seg-yellow'), '堆叠条应含响应后的其他处理段')
     must(detailHtml.includes('px-timing-legend'), '堆叠条下方应有图例（百分比 + 时长）')
     // 「思考」无法从事件里切分，界面必须如实说明，而不是编一个假数。
-    must(detailHtml.includes('无法分离'), '必须说明思考与回复在日志层面无法分离')
+    must(detailHtml.includes('步骤准备') && detailHtml.includes('其他处理不是输出生成'), '应说明调用范围及调度耗时，不能伪装为网络TTFT或模型内部生成')
   }
 
   // ── 团队成员必须挂在 lead 行下，不自己成为顶层条目 ──────────────────

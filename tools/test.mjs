@@ -960,22 +960,24 @@ await check('第三方网关的各种写法都认得出是同一个模型（用�
 //
 // 用户明确否掉了「活跃时长 = 创建到最后使用」：会话放三周再聊两句会被算成
 // 数百小时。有用的口径是「模型真正在干活」的那段，即：
-//   ttft  = step/start → 首条 assistant/message
-//   gen   = 首条 assistant/message → step/end，再扣掉工具执行的部分
+//   ttft  = step/start → 完整 assistant/message（旧字段，不是真正TTFT）
+//   gen   = 完整 assistant/message → step/end，扣工具后的其他处理（非输出生成）
 //   tools = tool/call → tool/result 的配对时长
-await check('耗时分解把等待、回复、工具三段算准', async () => {
+await check('步骤诊断兼容旧字段，区分完整响应、其他处理和工具', async () => {
   const { TimingBreakdown } = await import('../lib/timing.js')
   const timing = new TimingBreakdown()
-  // 一个 step：0s 开始 → 10s 首字（等待 10s）→ 20s 结束（回复窗口 10s，无工具）
+  // 一个 step：0s 开始 → 10s 完整响应 → 20s 结束（其他处理10s，无工具）
   timing.observe({ type: 'step/start', time: 0 })
   timing.observe({ type: 'assistant/message', time: 10_000 })
   timing.observe({ type: 'step/end', time: 20_000 })
   const one = timing.toJSON()
-  assert.equal(one.ttftMs, 10_000, '等待应为首字时刻减 step 起点')
-  assert.equal(one.genMs, 10_000, '回复应为 step 结束减首字')
+  assert.equal(one.ttftMs, 10_000, '旧ttft字段记录完整响应时刻减步骤起点')
+  assert.equal(one.genMs, 10_000, '旧gen字段记录消息后的非工具处理，不能当生成')
   assert.equal(one.toolsMs, 0, '没有工具调用时工具耗时为 0')
   assert.equal(one.totalMs, 20_000, '总耗时 = 三段之和')
   assert.equal(one.steps, 1, '应记到 1 个 step')
+  assert.equal(one.modelMs, one.ttftMs)
+  assert.equal(one.otherMs, one.genMs)
 
   // 第二个 step 里有一次工具调用：回复窗口要把工具那段扣掉
   const timing2 = new TimingBreakdown()

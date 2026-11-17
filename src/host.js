@@ -238,7 +238,7 @@ const AGENT_FACT_LIMIT = 500
  * 旧缓存挡住——读出来的对象没有新字段，界面显示成空或 0，而且不报错。
  * 这个坑已经踩过一次（加 timing 时，用户看到「模型耗时 —」）。
  */
-const CACHE_SCHEMA = 4
+const CACHE_SCHEMA = 5
 
 /**
  * 磁盘快照（整份看板数据 + 逐会话明细）的格式版本。
@@ -817,17 +817,19 @@ export class UsageCatalog {
   /**
    * @param {object} deps - 依赖取值函数，全部惰性读取可选服务。
    * @param {() => object|undefined} deps.persistence - sessionPersistence。
-   * @param {() => object|undefined} deps.sessions - sessions（判断会话是否在线）。
+   * @param {() => object|undefined} deps.sessions - sessions（仅判断是否已加载，不代表正在运行）。
+   * @param {() => object|undefined} [deps.agents] - readonly Agent registry status（idle/running）。
    * @param {() => string} deps.timezone - 站点时区。
    * @param {() => object|undefined} [deps.llm] - LLM 注册表（模型 / 提供商显示名）。
    * @param {string} [deps.ledgerPath] - 账本路径；显式传入便于测试。
    * @param {string} [deps.machine] - 本机标识。
    * @param {Map<string, object>|Function} [deps.toolSources] - 显式工具来源（优先于声明匹配；函数接收 name 与会话/调用 scope）。
    */
-  constructor({ persistence, sessions, timezone, llm, ledgerPath, machine, customRates, toolSources, workspaceRegistry }) {
+  constructor({ persistence, sessions, agents, timezone, llm, ledgerPath, machine, customRates, toolSources, workspaceRegistry }) {
     this.workspaceRegistry = workspaceRegistry ?? (() => undefined)
     this.persistence = persistence
     this.sessions = sessions
+    this.agents = agents ?? (() => undefined)
     this.timezone = timezone
     this.llm = llm ?? (() => undefined)
     /** @type {object|undefined} 用户补充的价目（见 lib/custom-rates.js）。 */
@@ -1236,6 +1238,19 @@ export class UsageCatalog {
     return this.snapshot
   }
 
+  /** Read-only current driver status; loaded Session presence is not execution. */
+  runtimeOf(id) {
+    try {
+      const agents = this.agents()
+      if (!agents || typeof agents.get !== 'function') return { running: null, runtimeStatus: 'unknown' }
+      const agent = agents.get(id)
+      if (!agent) return { running: false, runtimeStatus: 'inactive' }
+      if (agent.status === 'running') return { running: true, runtimeStatus: 'running' }
+      if (agent.status === 'idle') return { running: false, runtimeStatus: 'idle' }
+    } catch { /* An unavailable optional service cannot establish a runtime fact. */ }
+    return { running: null, runtimeStatus: 'unknown' }
+  }
+
   /**
    * 单会话明细：供会话标签页（`conversation.view` 的「费用」）使用。
    *
@@ -1301,6 +1316,8 @@ export class UsageCatalog {
       }
     }
     if (session === undefined) return undefined
+    // Runtime is a current registry fact, not part of the cached financial snapshot.
+    session = { ...session, ...this.runtimeOf(id) }
     const detail = this.sessionDetails?.get(id) ?? { byModel: {}, byDay: {} }
     // 模型显示名 / 提供商名：`data.models` 里已经算好，直接按复合键索引。
     const metas = new Map((data.models ?? []).map((model) => [model.key, model]))
@@ -1375,6 +1392,7 @@ export class UsageCatalog {
           name: member.name,
           role: member.role,
           live: member.live === true,
+          ...this.runtimeOf(member.id),
           totals: member.totals,
           cost: member.cost,
         })),
@@ -1564,8 +1582,8 @@ export class UsageCatalog {
         /**
          * 耗时分解（等待 / 回复 / 工具）。
          *
-         * 用户明确否掉了「活跃时长 = 创建到最后使用」：放三周再来聊两句的会话会被
-         * 算成几百小时。这里给的是**模型真正在干活**的那段时间。
+         * 按步骤与已持久化响应/流时间点诊断，不使用创建到最后使用的跨度。
+         * 模型调用包含准备、等待与生成，不代表模型内部计算或真实网络首字时间。
          */
         timing: derived.timing,
         timedTurns: derived.timedTurns,
@@ -1580,7 +1598,8 @@ export class UsageCatalog {
         activityAt: derived.review?.activityAt ?? null,
         // 已排好序（见 readSession）：这里是「与目录无关」的派生结果，直接复用。
         days: sessionDays,
-        live: this.sessions?.()?.get?.(id) !== undefined,
+        live: this.sessions?.()?.get?.(id) !== undefined, // loaded presence only (legacy field)
+        ...this.runtimeOf(id),
         // 团队归属：`lead` 是团队根，`teammate` 归到 `teamId` 名下。
         // 缺这两个字段的就是旧宿主（客户端据此退回单会话口径，见 capabilities 的 agentTeam）。
         teamId: placement.teamId,
@@ -1843,6 +1862,7 @@ export class UsageCatalog {
         models: Object.keys(acc.byModel).sort(),
         days: [...acc.days].sort(),
         live: false,
+        ...this.runtimeOf(sessionId),
         // 只在账本里出现的会话没有会话头，因此**没有任何团队线索**：
         // 它是自己的根（旧宿主 / 跨设备历史都是这个口径），而不是被猜进某个团队。
         teamId: sessionId,
@@ -2023,6 +2043,7 @@ export class UsageCatalog {
               : (member.memberLabel ?? member.title),
             depth: member.depth ?? 0,
             live: member.live === true,
+            running: member.running ?? null, runtimeStatus: member.runtimeStatus ?? 'unknown',
             ...(member.detached === true ? { detached: true } : {}),
             ...(member.memberPhase === undefined ? {} : { phase: member.memberPhase }),
             turns: member.turns,
@@ -2521,6 +2542,7 @@ export default {
     const catalog = new UsageCatalog({
       persistence: () => ctx.get('sessionPersistence'),
       sessions: () => ctx.get('sessions'),
+      agents: () => ctx.get('agents'),
       workspaceRegistry: () => ctx.get('workspaceRegistry'),
       timezone: () => DEFAULT_TIMEZONE,
       // 自定义价目交给聚合器：它负责在每次聚合前复查文件
@@ -3133,6 +3155,7 @@ export default {
     })
 
     // 会话提交/关闭后数据会变：标记失效（下一次读先给旧快照、后台再补）。
+    ctx.on('agent/status', () => { catalog.invalidate() })
     ctx.on('session/flush', () => {
       catalog.invalidate()
     })

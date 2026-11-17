@@ -466,6 +466,31 @@ await check('nested PTC ancestors exclude their own asks but keep independent si
 })
 
 console.log('review: UsageCatalog integration and exact route contract')
+await check('loaded presence is separate from runtime execution and detail status never waits for ledger rebuild', async () => {
+  let state = 'idle', exists = true
+  const { catalog } = await catalogOf([{ id: 'a', events: [assistant(1, now - 1000)] }], {
+    sessions: () => ({ get: () => ({}) }),
+    agents: () => ({ get: () => exists ? { status: state } : undefined }),
+  })
+  const data = await catalog.read()
+  assert.equal(data.sessions[0].live, true)
+  assert.equal(data.sessions[0].running, false)
+  assert.equal(data.sessions[0].runtimeStatus, 'idle')
+  state = 'running'
+  const active = await catalog.readSessionDetail('a')
+  assert.equal(active.session.running, true)
+  assert.equal(active.session.runtimeStatus, 'running')
+  state = 'idle'
+  assert.equal((await catalog.readSessionDetail('a')).session.runtimeStatus, 'idle')
+  exists = false
+  assert.equal((await catalog.readSessionDetail('a')).session.runtimeStatus, 'inactive')
+})
+await check('missing agent service leaves status unknown, never claims loaded means running', async () => {
+  const { catalog } = await catalogOf([{ id:'a', events:[assistant(1, now - 1000)] }], { sessions: () => ({ get: () => ({}) }) })
+  const data = await catalog.read()
+  assert.equal(data.sessions[0].running, null)
+  assert.equal(data.sessions[0].runtimeStatus, 'unknown')
+})
 await check('review requests and money equal current 7-day ledger/day aggregation including markups', async () => {
   const start = reviewRange(7, now, timezone).start
   const fixtures = [{ id: 'a', cwd: '/repo', events: [assistant(0, start - 1), assistant(1, start, 2000, 'marked'), assistant(2, T('2026-11-16T10:00:00+08:00'), 6000, 'marked'), assistant(3, now, 3000, 'marked')] }]
@@ -562,9 +587,9 @@ await check('read failure is visible in review, while existing dashboard stays f
     await assert.rejects(catalog.readReview(7, 'all'), /exploded/)
   }
 })
-await check('schema v4 invalidates previous v3 per-session derived semantics', async () => {
+await check('schema v5 invalidates previous v4 timing and runtime semantics', async () => {
   const { catalog, directory, persistence } = await catalogOf([{ id: 'a', cwd: '/repo', events: [assistant(0, now)] }])
-  await writeFile(join(directory, 'session-cache.json'), JSON.stringify({ version: 1, sessions: { a: { fingerprint: `v3:1:1:@${timezone}`, records: [], turns: 999, days: [], members: [], review: { turns: [], tools: [], executions: [], humanTurns: [] } } } }))
+  await writeFile(join(directory, 'session-cache.json'), JSON.stringify({ version: 1, sessions: { a: { fingerprint: `v4:1:1:@${timezone}`, records: [], turns: 999, days: [], members: [], review: { turns: [], tools: [], executions: [], humanTurns: [] } } } }))
   catalog.adoptSnapshot(await catalog.build(now))
   assert.ok(persistence.reads > 0)
   assert.equal((await catalog.readReview(7, 'all')).summary.requests, 1)

@@ -69,13 +69,13 @@
   "scripts": {
     "build": "node tools/build.mjs",
     "verify": "node tools/verify.mjs",
-    "test": "node tools/test.mjs && node tools/test-review.mjs && node tools/test-review-cache.mjs && node tools/test-dock-detail.mjs && node tools/test-patch-layer.mjs",
+    "test": "node tools/test.mjs && node tools/test-stream-timing.mjs && node tools/test-review.mjs && node tools/test-review-cache.mjs && node tools/test-dock-detail.mjs && node tools/test-patch-layer.mjs",
     "preflight": "node tools/preflight.mjs",
-    "render-check": "node tools/test-settings.mjs --built && node tools/test-dock-ui.mjs --built && node tools/test-resource-ui.mjs --built && node tools/render-check.mjs",
+    "render-check": "node tools/test-review-loading.mjs --built && node tools/test-metric-semantics.mjs --built && node tools/test-settings.mjs --built && node tools/test-dock-ui.mjs --built && node tools/test-resource-ui.mjs --built && node tools/render-check.mjs",
     "install:official": "node tools/install-official.mjs",
     "doctor": "node tools/doctor.mjs",
     "pack": "npm pack",
-    "prepublishOnly": "node tools/build.mjs && node tools/test.mjs && node tools/test-review.mjs && node tools/test-review-cache.mjs && node tools/test-dock-detail.mjs && node tools/preflight.mjs",
+    "prepublishOnly": "node tools/build.mjs && node tools/test.mjs && node tools/test-stream-timing.mjs && node tools/test-review.mjs && node tools/test-review-cache.mjs && node tools/test-dock-detail.mjs && node tools/preflight.mjs",
     "sync:desktop": "node tools/sync-desktop.mjs"
   }
 }

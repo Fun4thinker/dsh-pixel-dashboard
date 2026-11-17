@@ -76,9 +76,59 @@ export function questionWaitProjection(calls, turnEnds, now) {
 }
 export const toolResultId = (data) => String(data?.message?.source?.callId ?? data?.message?.toolCallId ?? data?.callId ?? data?.id ?? '')
 
-/** Old step diagnostics, now excluding human waits from every machine component.
- * Scalar completed step/call ranges permit clipping and union, without retaining bodies.
- * Ordinary parallel tool costs remain per-call, but generation subtracts their union.
+/** Read only clocks and emptiness flags from durable stream records; never retain text/arguments.
+ * Official dt values reconstruct cumulatively. Clock rollback is representable by DSH,
+ * but cannot establish a trustworthy elapsed duration, so it stays unavailable here.
+ */
+function streamClock(stream, start, end) {
+  if (!Array.isArray(stream)) return null
+  let first = null, last = null, previous = start
+  const safeTime = (value) => Number.isSafeInteger(value) && value >= start && value <= end
+  const accept = (time, output) => {
+    if (!safeTime(time) || time < previous) return false
+    previous = time
+    if (output) { if (first === null) first = time; last = time }
+    return true
+  }
+  for (const record of stream) {
+    if (!record || typeof record !== 'object') return null
+    if (record.type === 'chunk') {
+      const chunk = record.chunk
+      if (!chunk || typeof chunk !== 'object') return null
+      if (['text-delta', 'reasoning-delta'].includes(chunk.type) && typeof chunk.text !== 'string') return null
+      if (chunk.type === 'tool-call-delta' && (typeof chunk.argumentsDelta !== 'string'
+        || chunk.name !== undefined && typeof chunk.name !== 'string')) return null
+      const output = ['text-delta', 'reasoning-delta'].includes(chunk.type)
+        ? typeof chunk.text === 'string' && chunk.text !== ''
+        : chunk.type === 'tool-call-delta' && (typeof chunk.argumentsDelta === 'string' && chunk.argumentsDelta !== '' || typeof chunk.name === 'string')
+      if (!accept(record.time, output)) return null
+      continue
+    }
+    const packed = ['text-chunks', 'reasoning-chunks', 'tool-call-chunks'].includes(record.type)
+    if (!packed) return null
+    if (record.type === 'tool-call-chunks' && record.name !== undefined && typeof record.name !== 'string') return null
+    const members = record.type === 'tool-call-chunks' ? record.args : record.texts
+    if (!Array.isArray(members) || !Array.isArray(record.dt) || members.length === 0
+      || record.dt.length !== members.length - 1 || !safeTime(record.time0)) return null
+    let time = record.time0
+    for (let index = 0; index < members.length; index += 1) {
+      if (typeof members[index] !== 'string') return null
+      if (index > 0) {
+        const delta = record.dt[index - 1]
+        if (!Number.isSafeInteger(delta) || delta < 0 || !Number.isSafeInteger(time + delta)) return null
+        time += delta
+      }
+      if (!accept(time, members[index] !== '' || record.type === 'tool-call-chunks' && record.name !== undefined)) return null
+    }
+  }
+  return { first, last }
+}
+
+/** Step diagnostics exclude human waits from every machine component.
+ * Legacy ttftMs is step start→complete assistant message (includes generation), not TTFT.
+ * Legacy genMs is the remaining non-tool step processing, not streamed generation.
+ * modelMs/otherMs expose those same values honestly; completed ranges retain no bodies.
+ * Ordinary parallel tool costs remain per-call; other processing subtracts their union.
  */
 export class TimingBreakdown {
   constructor() {
@@ -95,10 +145,16 @@ export class TimingBreakdown {
     this.lastAt = Math.max(this.lastAt, at)
     const data = event.data ?? {}
     switch (event.type) {
-      case 'step/start': this.current = { start: at, first: null, turn: data.turn, calls: [] }; break
+      case 'step/start': this.current = { start: at, first: null, turn: data.turn, step: data.step, calls: [], responses: [] }; break
       case 'assistant/message':
-        if (this.current && this.current.first === null) this.current.first = at
+      case 'assistant/attempt': {
+        const step = this.current
+        if (!step || at < step.start || data.turn !== undefined && step.turn !== undefined && data.turn !== step.turn
+          || data.step !== undefined && step.step !== undefined && data.step !== step.step) break
+        if (event.type === 'assistant/message' && step.first === null) step.first = at
+        step.responses.push({ at, complete: event.type === 'assistant/message', clock: streamClock(data.stream, step.start, at) })
         break
+      }
       case 'tool/call':
       case 'tool/ptc-dispatch-start': {
         const nested = event.type === 'tool/ptc-dispatch-start'
@@ -121,6 +177,8 @@ export class TimingBreakdown {
         break
       }
       case 'step/end':
+        if (this.current && (data.turn !== undefined && this.current.turn !== undefined && data.turn !== this.current.turn
+          || data.step !== undefined && this.current.step !== undefined && data.step !== this.current.step)) break
         if (this.current) this.steps.push({ ...this.current, end: at })
         this.current = null
         break
@@ -131,9 +189,30 @@ export class TimingBreakdown {
     const calls = [...this.calls.values()]
     const { waits, forCall, endOf } = questionWaitProjection(calls, this.turnEnds, now)
     let ttftMs = 0, genMs = 0, toolsMs = 0, wallMs = 0, awaitingUserMs = 0
+    let firstOutputWaitMs = 0, streamedMs = 0, responseSteps = 0, streamedSteps = 0, firstOutputSteps = 0
     for (const step of this.steps) {
       const end = Math.min(now, step.end)
       if (end < step.start) continue
+      const responses = step.responses.filter((response) => response.at <= end)
+      if (step.end <= now && responses.some((response) => response.complete)) {
+        responseSteps += 1
+        let uncertainEarlier = false
+        for (const response of responses) {
+          if (response.clock === null) { uncertainEarlier = true; continue }
+          if (response.clock.first === null) continue
+          if (!uncertainEarlier) {
+            firstOutputWaitMs += response.clock.first - step.start - overlapMs(waits, step.start, response.clock.first)
+            firstOutputSteps += 1
+          }
+          break
+        }
+        const intervals = unionRanges(responses.filter((response) => response.clock && response.clock.first !== null && response.clock.last > response.clock.first)
+          .map((response) => [response.clock.first, response.clock.last]))
+        if (intervals.length) {
+          streamedSteps += 1
+          streamedMs += overlapMs(subtractRanges(intervals, waits), step.start, end)
+        }
+      }
       wallMs += end - step.start
       awaitingUserMs += overlapMs(waits, step.start, end)
       if (step.first !== null) {
@@ -148,6 +227,6 @@ export class TimingBreakdown {
         if (stop >= start) toolsMs += stop - start - overlapMs(forCall(call), start, stop)
       }
     }
-    return { ttftMs: Math.round(ttftMs), genMs: Math.round(genMs), toolsMs: Math.round(toolsMs), steps: this.steps.length, totalMs: Math.round(ttftMs + genMs + toolsMs), wallMs, awaitingUserMs }
+    return { ttftMs: Math.round(ttftMs), genMs: Math.round(genMs), modelMs: Math.round(ttftMs), otherMs: Math.round(genMs), firstOutputWaitMs: firstOutputSteps ? Math.round(firstOutputWaitMs) : null, streamedMs: streamedSteps ? Math.round(streamedMs) : null, responseSteps, streamedSteps, firstOutputSteps, toolsMs: Math.round(toolsMs), steps: this.steps.length, totalMs: Math.round(ttftMs + genMs + toolsMs), wallMs, awaitingUserMs }
   }
 }

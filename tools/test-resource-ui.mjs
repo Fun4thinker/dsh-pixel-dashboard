@@ -52,11 +52,38 @@ check('workspace session ledger uses full available width and aligned metric col
  assert.ok(/\.px-review-child\s*\{[^}]*width:\s*100%/.test(REVIEW_CSS),'native button must not shrink to its content width')
  assert.ok(html.includes('data-label="Token"') && html.includes('data-label="最近使用"'),'mobile rows retain metric labels')
 })
+check('workspace column headings are native sort buttons with clear current and next direction', () => {
+ const html=render(WorkspaceAccount,{row:workspace,data})
+ const head=html.slice(html.indexOf('px-review-child-head'),html.indexOf('px-review-child-item'))
+ assert.ok(head.includes('<button')&&head.includes('最近使用，当前降序，点击切换为升序'))
+ assert.ok(head.includes('费用，点击按费用降序排列')&&head.includes('模型请求，点击按模型请求降序排列'))
+ assert.ok(head.includes('↓')&&!html.includes('px-review-choices'),'workspace sorting belongs to column headings, not duplicate chips')
+ const ascending=render(WorkspaceAccount,{row:workspace,data,initialDirection:'asc'})
+ orderOf(ascending,['OLD_SESSION','NEW_SESSION','MISSING_SESSION'])
+ assert.ok(ascending.includes('最近使用，当前升序，点击切换为降序')&&ascending.includes('↑'))
+})
+check('narrow session layouts keep sortable headings available instead of hiding the only sort controls', () => {
+ assert.ok(REVIEW_CSS.includes('.px-review-sort-heading'))
+ assert.ok(!/\.px-review-child-head\s*\{\s*display:\s*none/.test(REVIEW_CSS),'mobile must not hide clickable column headings')
+ assert.ok(REVIEW_CSS.includes('@container px-review-workspace'))
+ const html=render(WorkspaceAccount,{row:workspace,data})
+ assert.ok(html.includes('data-label="模型请求"')&&html.includes('模型请求，点击按模型请求降序排列'))
+})
 check('top-level sessions default to recent activity and expose the same manual sorting choices', () => {
  const html = render(ResourceLedger,{data,rangeLabel:'7 日',initialEntity:'sessions'})
  orderOf(html,['NEW_SESSION','OLD_SESSION','MISSING_SESSION'])
- for (const label of ['最近使用','费用','有效耗时','Token','模型请求']) assert.ok(html.includes(label))
+ for (const label of ['最近使用','费用','有效时长','Token','模型请求']) assert.ok(html.includes(label))
  assert.ok(!html.includes('占当前列表'), 'timestamps are not resource shares')
+})
+check('top-level session sorting uses heading buttons with direction, while workspace and tools keep their controls', () => {
+ const props={data,rangeLabel:'7 日',initialEntity:'sessions'}
+ const html=render(ResourceLedger,props)
+ assert.ok(html.includes('会话列头排序') && html.includes('最近使用，当前降序，点击切换为升序'))
+ assert.ok(!html.includes('aria-label="资源排行排序"'),'session cards must not duplicate old sorting chips')
+ const ascending=render(ResourceLedger,{...props,initialDirection:'asc'})
+ orderOf(ascending,['OLD_SESSION','NEW_SESSION','MISSING_SESSION'])
+ assert.ok(ascending.includes('最近使用，当前升序，点击切换为降序'))
+ for(const initialEntity of ['workspaces','tools']) assert.ok(render(ResourceLedger,{...props,initialEntity}).includes('aria-label="资源排行排序"'))
 })
 check('numeric sorting keeps missing values last, legitimate zero and deterministic ties', () => {
  const rows = [{id:'zero',activityAt:0,cost:0},{id:'blank',activityAt:'',cost:900},{id:'missing',activityAt:null},{id:'nan',activityAt:NaN},{id:'older',activityAt:9},{id:'newer',activityAt:100},{id:'tie-b',activityAt:100},{id:'tie-a',activityAt:100}]
@@ -65,6 +92,12 @@ check('numeric sorting keeps missing values last, legitimate zero and determinis
  assert.ok(sorted.indexOf('blank') > sorted.indexOf('zero'))
  assert.deepEqual(rankReviewRows([...rows].reverse(),'activityAt').map((row)=>row.id),sorted)
  assert.equal(rankReviewRows([{id:'missing',cost:null},{id:'credit',cost:-5}],'cost')[0].id,'credit')
+})
+check('ascending and descending sorts both leave unknown values last and keep stable ties', () => {
+ const rows=[{id:'high',tokens:9,cost:1},{id:'zero',tokens:0,cost:2},{id:'low',tokens:-2,cost:1},{id:'missing',tokens:null,cost:100},{id:'blank',tokens:'',cost:90},{id:'tie-b',tokens:9,cost:1},{id:'tie-a',tokens:9,cost:1}]
+ assert.deepEqual(rankReviewRows(rows,'tokens','asc').map((row)=>row.id),['low','zero','high','tie-a','tie-b','missing','blank'])
+ assert.deepEqual(rankReviewRows(rows,'tokens','desc').map((row)=>row.id),['high','tie-a','tie-b','zero','low','missing','blank'])
+ assert.deepEqual(rankReviewRows([...rows].reverse(),'tokens','asc').map((row)=>row.id),rankReviewRows(rows,'tokens','asc').map((row)=>row.id))
 })
 check('expanded session displays real Lead/member resource rows without replacing its own receipt', () => {
  const row={...sessions[1],teamId:'team-a'}
@@ -95,6 +128,19 @@ check('sorted pagination never leaves an expanded session detached from its page
  assert.equal((second.match(/class="px-review-row"/g)??[]).length,8)
  assert.ok(second.includes('2 / 3')&&second.indexOf('TITLE_04')<second.indexOf('本会话估算')&&second.indexOf('本会话估算')<second.indexOf('TITLE_03'))
  assert.ok(!second.includes('TITLE_16'))
+})
+check('resources keep three useful heroes and omit standing waiting-user numbers from session and team details', () => {
+ const waiting=34260000
+ const row={...sessions[1],teamId:'team',awaitingUserMs:waiting,wallMs:waiting+5000}
+ const team={id:'team',members:[{...row,name:'Lead',role:'lead'}],cost:1,tokens:200,requests:2,durationMs:5000,wallMs:waiting+5000,awaitingUserMs:waiting,timedMemberCount:1,leadKnown:true,leadInScope:true}
+ const fixture={...data,sessions:[row],teams:[team],summary:{cost:1,sessionCount:1,turns:1,requests:2,durationMs:5000,awaitingUserMs:waiting,wallMs:waiting+5000}}
+ const ledger=render(ResourceLedger,{data:fixture,rangeLabel:'7 日',initialEntity:'sessions'})
+ assert.equal((ledger.match(/class="px-hero px-hero-/g)??[]).length,3)
+ assert.ok(!ledger.includes('等待用户（估算）'))
+ const details=render(SessionAccount,{row,data:fixture})
+ assert.ok(!details.includes('已排除等待用户')&&!details.includes('已扣等待')&&!details.includes('9h31m'))
+ assert.ok(details.includes('有效处理已排除问答区间（近似）'))
+ assert.ok(details.includes('计时覆盖 1/1'))
 })
 check('partial team view discloses hidden Lead/archive members and leaves all-unknown timing unknown', () => {
  const member={...sessions[1],role:'teammate',name:'ONLY_VISIBLE_MEMBER',durationMs:null,wallMs:null,awaitingUserMs:null}

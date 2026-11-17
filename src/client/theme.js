@@ -2133,6 +2133,10 @@ const DASHBOARD = `
   font-size: 10.5px; line-height: 1.5;
   color: var(--px-muted);
 }
+.px-timing-stream { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--px-line); }
+.px-timing-stream summary { cursor: pointer; font-size: 11px; color: var(--px-ink-2); }
+.px-timing-stream summary:focus-visible { outline: 2px solid var(--px-tone-blue); outline-offset: 3px; border-radius: 3px; }
+.px-timing-stream .px-drow { margin-top: 7px; }
 /* 空态：没有 step 计时时给一句解释，而不是留一块空白。 */
 .px-timing-empty {
   display: block;
@@ -2280,9 +2284,7 @@ body[data-ds-dark-theme] .px-modal-mask { background: rgba(0, 0, 0, 0.58); }
   background: transparent;
   border: 0;
 }
-/* 组件自带的那句「思考与回复无法分离」在这里省掉：面板底部有一句统一口径，
-   两段说明叠在一起会把这张卡撑成读文档。 */
-.px-time .px-timing-note { display: none; }
+/* 模型调用与流时序的边界说明保留；不能把缺测或调用等待误读为生成。 */
 .px-time-figures {
   display: grid;
   grid-template-columns: repeat(2, minmax(76px, auto));

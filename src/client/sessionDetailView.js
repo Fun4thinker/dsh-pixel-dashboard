@@ -76,60 +76,48 @@ export function DetailRow(props) {
  *
  * ## 配色
  *
- * 等待（暖黄）→ 回复（蓝）→ 工具（青绿），沿用项目既有马卡龙 token。
+ * 模型调用（蓝）/ 工具（青绿）/ 其他调度（暖黄）；可用的流时序在折叠明细中单独呈现覆盖率。
  * @param {object} props - timing。
  * @returns {object} React 元素。
  */
 export function TimingBreakdownView(props) {
   const { timing } = props
-  const ttft = Number(timing?.ttftMs ?? 0)
-  const gen = Number(timing?.genMs ?? 0)
-  const tools = Number(timing?.toolsMs ?? 0)
-  const total = ttft + gen + tools
-
-  if (!Number.isFinite(total) || total <= 0) {
-    return h('div', { className: 'px-timing px-timing-empty' },
-      h('span', { className: 'px-timing-empty-title' }, '耗时构成'),
-      h('span', { className: 'px-muted' },
-        '这份日志里没有 step 计时（可能是更早版本写入的日志，或该会话没有完整跑过一轮）。'))
-  }
-
+  const ms = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
+  // Legacy names described final-message boundaries, not actual first-token/generation timing.
+  const model = ms(timing?.modelMs ?? timing?.ttftMs)
+  const other = ms(timing?.otherMs ?? timing?.genMs)
+  const tools = ms(timing?.toolsMs)
+  const total = model + other + tools
+  if (total <= 0) return h('div', { className: 'px-timing px-timing-empty' },
+    h('span', { className: 'px-timing-empty-title' }, '耗时构成'),
+    h('span', { className: 'px-muted' }, Number(timing?.steps) > 0
+      ? '这些步骤没有可展示的有效处理时长，问答等待已排除。' : '这份日志没有完整的步骤计时。'))
   const segments = [
-    { key: 'wait', value: ttft, tone: 'yellow', label: '等待模型' },
-    { key: 'reply', value: gen, tone: 'blue', label: '模型回复' },
+    { key: 'model', value: model, tone: 'blue', label: '模型调用（含生成）' },
     { key: 'tools', value: tools, tone: 'green', label: '工具执行' },
+    { key: 'other', value: other, tone: 'yellow', label: '其他处理' },
   ].filter((segment) => segment.value > 0)
-  const percent = (value) => Math.round((value / total) * 100)
-
+  const percent = (value) => value / total * 100 < 1 ? '<1%' : Math.round(value / total * 100) + '%'
+  const formatKnown = (value) => value === undefined || value === null || !Number.isFinite(value) ? '—' : formatDurationMs(value)
+  const responseSteps = Number(timing?.responseSteps ?? 0)
+  const streamSteps = Number(timing?.streamedSteps ?? 0)
   return h('div', { className: 'px-timing' },
-    // 左端：总时长锚点
-    h('div', { className: 'px-timing-total' },
-      h('b', null, formatDurationMs(total)),
-      h('span', null, '步骤耗时估算'),
-      // 平均每轮放在这里：它是「总时长 ÷ 轮次」，与总时长同源，放一起最自然。
-      Number(timing.turns) > 0
-        ? h('span', { className: 'px-timing-avg' }, `平均每轮 ${formatDurationMs(total / Number(timing.turns))}`)
-        : null),
-    // 中间：堆叠条
+    h('div', { className: 'px-timing-total' }, h('b', null, formatDurationMs(total)), h('span', null, '步骤耗时估算')),
     h('div', { className: 'px-timing-main' },
-      h('div', { className: 'px-timing-bar' },
-        segments.map((segment) => h('span', {
-          key: segment.key,
-          className: `px-timing-seg px-timing-seg-${segment.tone}`,
-          style: { width: `${(segment.value / total) * 100}%` },
-          title: `${segment.label} ${formatDurationMs(segment.value)}（${percent(segment.value)}%）`,
-        }))),
-      // 图例：色点 + 名称 + 百分比 + 时长
-      h('div', { className: 'px-timing-legend' },
-        segments.map((segment) => h('span', { key: segment.key, className: 'px-timing-item' },
-          h('span', { className: `px-tdot px-tdot-${segment.tone}` }),
-          h('span', { className: 'px-timing-item-name' }, segment.label),
-          h('span', { className: 'px-timing-item-pct' }, `${percent(segment.value)}%`),
-          h('span', { className: 'px-timing-item-ms' }, formatDurationMs(segment.value))))),
-      // 「思考」无法切分：如实说明，不给假数。
-      h('p', { className: 'px-timing-note' },
-        '「模型思考」与「模型回复」在同一条消息里到达，日志层面无法分离，',
-        '因此合并计入「模型回复」。步骤计时已排除问答工具区间（近似），与逐轮累计的有效耗时口径不同。')))
+      h('div', { className: 'px-timing-bar' }, segments.map((segment) => h('span', {
+        key: segment.key, className: 'px-timing-seg px-timing-seg-' + segment.tone,
+        style: { width: (segment.value / total * 100) + '%' },
+        title: segment.label + ' ' + formatDurationMs(segment.value) + '（' + percent(segment.value) + '）',
+      }))),
+      h('div', { className: 'px-timing-legend' }, segments.map((segment) => h('span', { key: segment.key, className: 'px-timing-item' },
+        h('span', { className: 'px-tdot px-tdot-' + segment.tone }), h('span', { className: 'px-timing-item-name' }, segment.label),
+        h('span', { className: 'px-timing-item-pct' }, percent(segment.value)), h('span', { className: 'px-timing-item-ms' }, formatDurationMs(segment.value))))),
+      h('p', { className: 'px-timing-note' }, '模型调用包括步骤准备、请求等待和生成；其他处理不是输出生成。工具可并行累计，本图不是在线时长。'),
+      responseSteps > 0 ? h('details', { className: 'px-timing-stream' },
+        h('summary', null, '流式时序明细 · ' + streamSteps + '/' + responseSteps + ' 步有接收区间'),
+        h(DetailRow, { tone: 'blue', label: '首输出前（含准备/重试）', value: formatKnown(timing.firstOutputWaitMs) }),
+        h(DetailRow, { tone: 'green', label: '接收输出区间', value: formatKnown(timing.streamedMs) }),
+        h('p', { className: 'px-timing-note' }, Number(timing.firstOutputSteps ?? 0) + '/' + responseSteps + ' 步有首输出时刻；' + streamSteps + '/' + responseSteps + ' 步有接收区间。仅据本机流记录，缺测不补零；不是精确网络首字等待或模型内部计算时长。')) : null))
 }
 
 /**
@@ -218,7 +206,7 @@ export function SessionDetail(props) {
       foot: `${totalRequests} 次请求` }),
     // 已完成轮次的有效处理耗时（已扣问答等待）；step 三段是另一套诊断指标。
     h(HeroCard, { tone: 'green', label: '有效处理耗时', value: hasDuration ? formatDurationMs(activeMs) : '—',
-      foot: avgTurnMs === undefined ? '暂无已完成轮次计时' : `已排除等待用户 ${formatDurationMs(session.awaitingUserMs ?? 0)}（近似）` }),
+      foot: avgTurnMs === undefined ? '暂无已完成轮次计时' : '已排除问答等待（近似）' }),
     h(HeroCard, { tone: 'purple', label: '工具调用', value: Number.isFinite(session.toolCalls) ? `${session.toolCalls} 次` : '—',
       foot: maxTurnMs === undefined ? undefined : `最久一轮 ${formatDurationMs(maxTurnMs)}` })),
 
