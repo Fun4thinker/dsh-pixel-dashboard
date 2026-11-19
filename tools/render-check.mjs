@@ -1709,11 +1709,11 @@ const dockWithPlan = renderToStaticMarkup(React.createElement(SessionCostView, {
     label: '智谱',
     fullLabel: '智谱 GLM Coding Plan',
     source: 'route',
-    plan: { provider: '智谱 GLM Coding Plan', planId: 'zhipu', window: { window: 'fiveHour', label: '5 小时' }, percent: 61.8 },
+    plan: { provider: '智谱 GLM Coding Plan', planId: 'zhipu', window: { window: 'fiveHour', label: '5 小时', usedPercent: 61.8 }, percent: 61.8 },
   },
 }))
 must(dockWithPlan.includes('智谱'), `绑定套餐时应显示那一家，实际：${dockWithPlan}`)
-must(dockWithPlan.includes('62%'), '应显示那一家最紧窗口的百分比')
+must(dockWithPlan.includes('智谱剩余 38.2%'), '应显示那一家最紧窗口的剩余百分比')
 must(!dockWithPlan.includes('余额'), '绑定套餐时不得同时显示余额——两笔账来自不同账户，并排会误导')
 must(dockWithPlan.includes('本次会话'), '绑定套餐时费用仍要显示')
 
@@ -3469,13 +3469,13 @@ const dockWithQuota = renderToStaticMarkup(React.createElement(SessionCostView, 
     label: '智谱',
     fullLabel: '智谱 GLM Coding Plan',
     source: 'route',
-    plan: { provider: '智谱 GLM Coding Plan', planId: 'zhipu', window: { window: 'fiveHour', label: '5 小时' }, percent: 61.8 },
+    plan: { provider: '智谱 GLM Coding Plan', planId: 'zhipu', window: { window: 'fiveHour', label: '5 小时', usedPercent: 61.8 }, percent: 61.8 },
   },
 }))
 must(dockWithQuota.includes('px-pill'), '有套餐数据时费用条应渲染额度那一枚')
-must(dockWithQuota.includes('62%'), `费用条应显示最紧窗口的整数百分比：${dockWithQuota}`)
-// 超过 75% 才转警戒色；这里最紧是 61.8%，不该是警戒态
-must(!dockWithQuota.includes('px-pill-warn'), '未超阈值时不应是警戒态')
+must(dockWithQuota.includes('智谱剩余 38.2%'), `费用条应显示最紧窗口的剩余百分比：${dockWithQuota}`)
+// 剩余 25% 或更少才变红；这里剩余 38.2%，不该是警戒态
+must(!dockWithQuota.includes('px-tone-bg-red'), '没有低额度时不应使用警戒色')
 const dockTight = renderToStaticMarkup(React.createElement(SessionCostView, {
   cost: { standard: 0.5, peak: 0.2, idle: 0.3 },
   tokens: 1000,
@@ -3484,12 +3484,12 @@ const dockTight = renderToStaticMarkup(React.createElement(SessionCostView, {
     planId: 'zhipu',
     label: '智谱',
     source: 'route',
-    plan: { provider: '智谱', planId: 'zhipu', window: { window: 'fiveHour', label: '5 小时' }, percent: 96 },
+    plan: { provider: '智谱', planId: 'zhipu', window: { window: 'fiveHour', label: '5 小时', usedPercent: 96 }, percent: 96 },
   },
 }))
-// 96% 时那一枚用红色点（px-tone-bg-red），不是整块警告底色——
+// 剩余 4% 时用红色点（px-tone-bg-red），不是整块警告底色——
 // 警告底色只留给「费用拿不到」这种真正的故障
-must(dockTight.includes('px-tone-bg-red'), '超过 75% 时额度那一枚应转红色点')
+must(dockTight.includes('智谱剩余 4%') && dockTight.includes('px-tone-bg-red'), '低额度应显示剩余比例和警戒色')
 // 没有任何可用账户事实时：不渲染那一枚，费用照常
 const dockNoQuota = renderToStaticMarkup(React.createElement(SessionCostView, {
   cost: { standard: 0.5, peak: 0.2, idle: 0.3 },

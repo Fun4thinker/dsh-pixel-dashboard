@@ -15,16 +15,43 @@ check('account card separates wallet and bonus per currency without adding dolla
   ['CNY 余额构成','¥115.00','¥100.00','¥15.00'], ['USD 余额构成','$8.00','$3.00','$5.00']
  ])
 })
-check('quota card keeps remaining-only percentage unknown and shows reset and true overage', () => {
+check('quota card shows remaining percentage and amount, preserves reset and flags overage', () => {
+ const hourly = {label:'5 小时',used:28.25,total:100,unit:'$'}
  const monthly = {label:'每月',remaining:65.55,unit:'$',resetAt:Date.parse('2026-11-18T00:00:00Z'),note:'官方只报余额'}
  const weekly = {label:'每周',usedPercent:140,remaining:-4,unit:'$'}
- const model = accountDetailModel({ account:{kind:'plan',label:'CC',fullLabel:'Command Code',source:'route',plan:{window:monthly,percent:0}}, provider:{windows:[monthly,weekly],secretMarker:'NEVER-SERIALIZE'},now:Date.parse('2026-11-17T00:00:00Z'),timezone:'Asia/Shanghai' })
- assert.equal(model.sections.length,2)
- assert.equal(model.sections[0].rows.find((row) => row.label==='已用比例').value,'—')
- assert.equal(model.sections[0].rows.find((row) => row.label==='剩余额度').value,'$65.55')
- assert.ok(model.sections[0].rows.some((row) => row.value.includes('重置')))
- assert.equal(model.sections[1].rows.find((row) => row.label==='已用比例').value,'140.0%')
- assert.ok(!JSON.stringify(model).includes('NEVER-SERIALIZE'))
+ const model = accountDetailModel({ account:{kind:'plan',label:'CC',fullLabel:'Command Code',source:'route',plan:{window:hourly}}, provider:{windows:[hourly,monthly,weekly],secretMarker:'NEVER-SERIALIZE'},now:Date.parse('2026-11-17T00:00:00Z'),timezone:'Asia/Shanghai' })
+ assert.equal(model.headline,'剩余 71.75%')
+ assert.deepEqual(model.sections[0].rows,[
+   {label:'剩余比例',value:'71.75%',share:0.7175,tone:'purple'},
+   {label:'剩余额度',value:'$71.75'},
+   {label:'总额度',value:'$100'},
+ ])
+ assert.deepEqual(model.sections[1].rows.map((row) => row.label),['剩余额度','重置时间'])
+ assert.equal(model.sections[1].rows[0].value,'$65.55')
+ assert.ok(model.sections[1].rows[1].value.includes('重置'))
+ assert.deepEqual(model.sections[2].rows[0],{label:'剩余比例',value:'0%',share:0,tone:'red'})
+ assert.ok(model.sections[2].rows.some((row) => row.value==='已超限'))
+ assert.ok(!/已用|NEVER-SERIALIZE/.test(JSON.stringify(model)))
+})
+check('quota card distinguishes exhausted quota from exceeding the limit', () => {
+ const cardFor = (window) => accountDetailModel({account:{kind:'plan',label:'CC',plan:{window}}})
+ const full = cardFor({usedPercent:0})
+ assert.equal(full.headline,'剩余 100%')
+ assert.equal(full.sections[0].rows[0].share,1)
+ const exhausted = cardFor({usedPercent:100})
+ assert.equal(exhausted.headline,'剩余 0%')
+ assert.ok(!exhausted.sections[0].rows.some((row) => row.value==='已超限'))
+ const emptyBalance = cardFor({remaining:0,unit:'$'})
+ assert.equal(emptyBalance.headline,'剩余 $0')
+ assert.equal(emptyBalance.tone,'red')
+ const blocked = cardFor({usedPercent:28,exceeded:true})
+ assert.equal(blocked.headline,'已超限')
+ assert.equal(blocked.sections[0].rows[0].share,undefined)
+ for (const window of [{usedPercent:120},{remaining:-4,unit:'$'},{remaining:0,exceeded:true}]) {
+  const over = cardFor(window)
+  assert.equal(over.headline,'已超限')
+  assert.equal(over.tone,'red')
+ }
 })
 check('time view uses effective completed timing, not the hour spent waiting for a human', () => {
  const model = timeDetailModel({row:{completedTurns:1,completedTurnMs:2000,completedWallMs:3602000,awaitingUserMs:3600000,maxCompletedTurnMs:2000,turns:1}})
@@ -107,8 +134,7 @@ check('remaining-only quota is reachable through real route binding without inve
   assert.equal(account.plan.percent,undefined)
   const model = accountDetailModel({account})
   assert.equal(model.headline,'剩余 $65.55')
-  assert.equal(model.sections[0].rows.find((row)=>row.label==='已用比例').value,'—')
-  assert.equal(model.sections[0].rows.find((row)=>row.label==='已用比例').share,undefined)
+  assert.deepEqual(model.sections[0].rows,[{label:'剩余额度',value:'$65.55'}])
   assert.equal(resolveAccount({plans:{providers:[plans.providers[0]]}}).kind,'plan')
 })
 check('account metadata wraps long identities and signed-in source is not mislabeled as a custom API endpoint', () => {

@@ -1,7 +1,7 @@
 /** Read-only models for the composer account card and completed-execution time view. */
 import { balanceRows, formatMoney } from './balance.js'
 import { formatDurationMs, formatDateTime } from './format.js'
-import { formatQuota, formatResetLine, windowProgress } from './plans.js'
+import { formatResetLine, windowProgress } from './plans.js'
 import { memberNameOf } from './team.js'
 
 function timingOf(row) {
@@ -59,6 +59,29 @@ function numberOf(value) {
   const n = Number(value)
   return Number.isFinite(n) ? n : undefined
 }
+
+/** Shared remaining-quota display for the composer badge and account details. */
+export function planBalanceModel(window) {
+  const progress = windowProgress(window)
+  const remainingPercent = progress.percentKnown ? 100 - progress.barPercent : undefined
+  const percentText = remainingPercent === undefined ? undefined : `${Number(remainingPercent.toFixed(2))}%`
+  const remainingAmount = numberOf(window?.remaining)
+  const over = progress.over || window?.exceeded === true || (remainingAmount ?? 0) < 0
+  const low = remainingPercent === undefined ? remainingAmount === 0 : remainingPercent <= 25
+  // A provider may flag a hard limit even while its last percentage still shows a balance.
+  const share = remainingPercent === undefined || (over && remainingPercent > 0) ? undefined : remainingPercent / 100
+  const value = over ? '已超限' : percentText ?? progress.remainingText
+  return {
+    ...progress,
+    over,
+    percentText,
+    share,
+    value,
+    headline: over ? value : `剩余 ${value}`,
+    tone: over || low ? 'red' : 'purple',
+  }
+}
+
 export function accountDetailModel({ account, provider, now = Date.now(), timezone } = {}) {
   const result = { title: '账户余额', ariaLabel: '账户详情', headline: account?.text ?? '—', tone: 'green', sections: [], notes: [], empty: !account || account.kind === 'none' }
   if (account?.source === 'fallback') result.notes.push('模型来源暂未识别，当前账户来自自动回落；不代表已确认此会话使用它。')
@@ -85,18 +108,19 @@ export function accountDetailModel({ account, provider, now = Date.now(), timezo
   }
   if (account?.kind === 'plan') {
     result.title = `${account.fullLabel || account.label} 额度`
-    result.tone = 'purple'
+    const selected = planBalanceModel(account.plan?.window)
+    result.tone = selected.tone
     result.badge = '内部接口'
-    const selected = windowProgress(account.plan?.window)
-    result.headline = selected.percentKnown ? `${selected.percent.toFixed(1)}% 已用` : `剩余 ${selected.remainingText}`
+    result.headline = selected.headline
     const windows = Array.isArray(provider?.windows) ? provider.windows : account.plan?.window ? [account.plan.window] : []
     for (const window of windows) {
-      const progress = windowProgress(window)
-      const rows = [
-        { label: '已用比例', value: progress.percentKnown ? `${progress.percent.toFixed(1)}%` : '—', share: progress.percentKnown ? progress.barPercent / 100 : undefined, tone: progress.over ? 'red' : 'purple' },
-        { label: '剩余额度', value: progress.remainingText },
-      ]
-      if (numberOf(window.used) !== undefined) rows.push({ label: '已用额度', value: formatQuota(window.used, window.unit) })
+      const progress = planBalanceModel(window)
+      const rows = []
+      if (progress.percentText !== undefined) {
+        rows.push({ label: '剩余比例', value: progress.percentText, share: progress.share, tone: progress.tone })
+      }
+      if (progress.remainingText !== '—' || rows.length === 0) rows.push({ label: '剩余额度', value: progress.remainingText })
+      if (progress.over) rows.push({ label: '额度状态', value: '已超限' })
       if (numberOf(window.total) !== undefined) rows.push({ label: '总额度', value: progress.totalText })
       const reset = formatResetLine(window.resetAt, now, timezone)
       if (reset) rows.push({ label: '重置时间', value: reset, wrap: true })

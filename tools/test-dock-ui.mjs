@@ -14,13 +14,33 @@ const React=(await import(react)).default
 const {renderToStaticMarkup}=await import(pathToFileURL(join(base,'react-dom@18.3.1_react@18.3.1/node_modules/react-dom/server.js')).href)
 const source=process.argv.includes('--built')?'lib/client':'src/client'
 const {SessionCostView,CostDetailPanel,detailPanelPlacement}=await import(pathToFileURL(resolve(source,'SessionCost.js')).href)
+const {accountDetailModel,timeDetailModel}=await import(pathToFileURL(resolve(source,'dockDetail.js')).href)
 let passed=0
 function check(name,fn){try{fn();passed++;console.log(`  ✓ ${name}`)}catch(error){process.exitCode=1;console.error(`  ✗ ${name}: ${error.message}`)}}
 check('account beside the fee estimate is a real independent card trigger, not a bare native tooltip',()=>{
  const html=renderToStaticMarkup(React.createElement(SessionCostView,{cost:{standard:1,peak:1,idle:0},showTokens:false,account:{kind:'balance',label:'余额',text:'¥115.00',payload:{balances:[{currency:'CNY',total:115}]}}}))
  assert.ok(/<button[^>]*aria-label="余额 ¥115.00，展开账户详情"/.test(html))
+ assert.match(html,/<span class="px-pill-label">余额<\/span><b class="px-pill-value">¥115\.00<\/b>/)
  assert.equal((html.match(/aria-expanded="false"/g)??[]).length,2)
  assert.ok(!html.includes('px-detail-anchor'),'closed cards must not occupy the dock layout')
+})
+check('composer quota badge keeps the remaining descriptor with the provider and the value numeric',()=>{
+ const render=(window)=>renderToStaticMarkup(React.createElement(SessionCostView,{cost:{standard:1,peak:1,idle:0},showTokens:false,account:{kind:'plan',label:'CC',plan:{window}}}))
+ const percent=render({usedPercent:28})
+ assert.match(percent,/<button[^>]*aria-label="CC剩余 72%，展开账户详情"/)
+ assert.match(percent,/<span class="px-pill-label">CC剩余<\/span><b class="px-pill-value">72%<\/b>/)
+ assert.match(render({remaining:65.55,unit:'$'}),/<span class="px-pill-label">CC剩余<\/span><b class="px-pill-value">\$65\.55<\/b>/)
+ const over=render({usedPercent:140})
+ assert.match(over,/<span class="px-pill-label">CC<\/span><b class="px-pill-value">已超限<\/b>/)
+ assert.match(over,/class="px-pill-dot px-tone-bg-red"/)
+})
+check('quota popover fills the meter by the remaining percentage, not the used percentage',()=>{
+ const window={label:'5 小时',used:28,total:100,unit:'$'}
+ const model=accountDetailModel({account:{kind:'plan',label:'CC',plan:{window}}})
+ const html=renderToStaticMarkup(React.createElement(CostDetailPanel,{model}))
+ assert.match(html,/class="px-detail-headline">剩余 72%</)
+ assert.match(html,/class="px-detail-meter-fill[^"\n]*" style="width:72%"/)
+ assert.ok(html.includes('剩余比例') && html.includes('剩余额度') && !html.includes('已用'))
 })
 check('fee card defaults to cost while its secondary time tab renders completed timing',()=>{
  const model={title:'本次会话',tone:'pink',headline:'¥9.00',sections:[{label:'分时计价',rows:[]}],notes:[],empty:false}
@@ -43,7 +63,6 @@ const liveBase=process.argv.find((value)=>value.startsWith('--live-base='))?.sli
 if(liveBase){
  const load=async(path)=>{const response=await fetch(liveBase+path,{signal:AbortSignal.timeout(60_000)});if(!response.ok)throw new Error(`Live card fixture HTTP ${response.status}`);return response.json()}
  const [data,balance,plans]=await Promise.all(['/dsh-pixel/data','/dsh-pixel/balance','/dsh-pixel/plans'].map(load))
- const {accountDetailModel,timeDetailModel}=await import(pathToFileURL(resolve(source,'dockDetail.js')).href)
  const {resolveAccount}=await import(pathToFileURL(resolve(source,'account.js')).href)
  const {providerById}=await import(pathToFileURL(resolve(source,'plans.js')).href)
  check('cards render real current service data without missing-number text or exceptions',()=>{

@@ -58,9 +58,9 @@ import { createPortal } from 'react-dom'
 import { resolveAccount } from './account.js'
 import { fetchBalance } from './balance.js'
 import { costDetailModel } from './costDetail.js'
-import { accountDetailModel, timeDetailModel } from './dockDetail.js'
+import { accountDetailModel, planBalanceModel, timeDetailModel } from './dockDetail.js'
 import { formatCny, formatTokens } from './format.js'
-import { fetchPlans, providerById, windowProgress } from './plans.js'
+import { fetchPlans, providerById } from './plans.js'
 import { useSelectedPlan } from './planView.js'
 import { findTeamOf, teamSummaryOf } from './team.js'
 import { fetchDashboard } from './usage.js'
@@ -642,10 +642,9 @@ function AccountPill(props) {
   const action = { onClick, expanded, refOf, detailLabel: '账户详情' }
   if (account.kind === 'balance') return h(Pill, { ...action, tone: 'green', label: '余额', value: account.text })
   if (account.kind === 'plan') {
-    const percent = Number(account.plan?.percent)
-    const known = account.plan?.percent !== undefined && Number.isFinite(percent)
-    return h(Pill, { ...action, tone: known && (percent >= 75 || account.plan?.window?.exceeded) ? 'red' : 'purple',
-      label: account.label, value: known ? percent.toFixed(0) + '%' : `余 ${windowProgress(account.plan?.window).remainingText}` })
+    const balance = planBalanceModel(account.plan?.window)
+    const label = balance.over ? account.label : `${account.label}剩余`
+    return h(Pill, { ...action, tone: balance.tone, label, value: balance.value })
   }
   if (account.kind === 'unavailable') return h(Pill, { ...action, tone: 'red', label: account.label, value: '不可用', warn: true })
   return null
