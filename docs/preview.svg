@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="300" viewBox="0 0 640 300">
+  <!--
+    插件详情页的功能图（640x300）。**没有文字元素**：规范禁止字体、样式表、
+    脚本、内嵌图片与 foreignObject，所以它是一张纯图形示意，语义交给
+    meta.description 去说。
+
+    为什么用透明度而不是白底卡片：详情页可能是浅色也可能是深色主题，一张
+    白底图放到深色里会变成一块刺眼的方块。所有面板都用「蓝 + 低透明度」铺，
+    叠在什么底色上都成立，浅色下是淡蓝、深色下是微光。
+
+    金色只出现在两处，且都代表"费用"：趋势里的那根消费折线、环形图里代表
+    费用占比的那一段。蓝色代表用量。这样两种颜色都有话说，不是为了好看。
+  -->
+  <g fill="#3d7fb8" fill-opacity="0.08" stroke="#3d7fb8" stroke-opacity="0.22" stroke-width="1.5">
+    <rect x="32" y="32" width="132" height="64" rx="10"/>
+    <rect x="180" y="32" width="132" height="64" rx="10"/>
+    <rect x="328" y="32" width="132" height="64" rx="10"/>
+    <rect x="476" y="32" width="132" height="64" rx="10"/>
+    <rect x="32" y="112" width="576" height="156" rx="12"/>
+  </g>
+
+  <g fill="#3d7fb8">
+    <g fill-opacity="0.34">
+      <rect x="48" y="48" width="44" height="6" rx="3"/>
+      <rect x="196" y="48" width="44" height="6" rx="3"/>
+      <rect x="344" y="48" width="44" height="6" rx="3"/>
+      <rect x="492" y="48" width="44" height="6" rx="3"/>
+    </g>
+    <g fill-opacity="0.82">
+      <rect x="48" y="64" width="76" height="16" rx="4"/>
+      <rect x="196" y="64" width="60" height="16" rx="4"/>
+      <rect x="344" y="64" width="88" height="16" rx="4"/>
+      <rect x="492" y="64" width="52" height="16" rx="4"/>
+    </g>
+  </g>
+
+  <!-- 柱：用量。自左向右逐渐变高，但柱与柱的间距与高度都不规则，
+       避免读成"信号强度"那种等距递增。 -->
+  <g fill="#3d7fb8" fill-opacity="0.72">
+    <rect x="56" y="202" width="26" height="34" rx="4"/>
+    <rect x="100" y="188" width="26" height="48" rx="4"/>
+    <rect x="144" y="194" width="26" height="42" rx="4"/>
+    <rect x="188" y="170" width="26" height="66" rx="4"/>
+    <rect x="232" y="178" width="26" height="58" rx="4"/>
+    <rect x="276" y="152" width="26" height="84" rx="4"/>
+    <rect x="320" y="140" width="26" height="96" rx="4"/>
+  </g>
+
+  <!-- 消费折线：金色，只有当"费用"这一件事用 -->
+  <polyline points="69,190 113,172 157,180 201,150 245,158 289,126 333,112"
+            fill="none" stroke="#a97a1f" stroke-width="3"
+            stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#a97a1f">
+    <circle cx="69" cy="190" r="3.4"/>
+    <circle cx="113" cy="172" r="3.4"/>
+    <circle cx="157" cy="180" r="3.4"/>
+    <circle cx="201" cy="150" r="3.4"/>
+    <circle cx="245" cy="158" r="3.4"/>
+    <circle cx="289" cy="126" r="3.4"/>
+    <circle cx="333" cy="112" r="3.4"/>
+  </g>
+
+  <!-- 环形图：模型 / 费用构成。蓝两段是用量，金一段是费用占比 -->
+  <g fill="none" stroke-width="18" transform="rotate(-90 500 190)">
+    <circle cx="500" cy="190" r="38" stroke="#3d7fb8" stroke-opacity="0.78"
+            stroke-dasharray="102 136.76"/>
+    <circle cx="500" cy="190" r="38" stroke="#3d7fb8" stroke-opacity="0.34"
+            stroke-dasharray="68 170.76" stroke-dashoffset="-106"/>
+    <circle cx="500" cy="190" r="38" stroke="#a97a1f"
+            stroke-dasharray="56 182.76" stroke-dashoffset="-178"/>
+  </g>
+</svg>

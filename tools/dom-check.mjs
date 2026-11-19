@@ -389,11 +389,23 @@ const results = []
     '倒计时不该留在图标槽里')
   must(button.contains(captionInRow), '倒计时必须是产品 row 的后代')
 
-  // 我们自己渲染的按钮必须**不是**产品那一行：这正是认 row 时要跳过的那个
-  const ourButton = glyph.querySelector('button')
-  must(ourButton !== null, '面板入口应仍然渲染自己的按钮（可点区域）')
-  must(ourButton !== button, '我们自己那个按钮不能就是产品那一行')
-  must(button.contains(ourButton), '我们自己的按钮套在产品 row 按钮里面（这是要跳过的原因）')
+  // 图标槽现在**不再**渲染自己的按钮：可点区域、aria-current 与选中底色全部
+  // 交给宿主那一行（见 src/client/entry.js 里 PanelEntry 的注释）。
+  //
+  // 这里钉的是**当前契约**，而不是已经删掉的旧形态。旧断言要求「我们自己也有
+  // 一个 button」，而 span 方案下那个 button 永远不会出现——于是这条闸门常年
+  // 红着，红久了就没人看，闸门本身失去了信号。所以改成：
+  //   1) 图标槽里必须有我们的根节点；
+  //   2) 图标槽里**不许**再有 button（旧 bug 的结构，必须保持消失）；
+  //   3) 我们的节点仍然嵌在产品 row 按钮里（认 row 时要跳过的那个祖先）。
+  const ourSlot = glyph.querySelector('.px-panel-entry')
+  must(ourSlot !== null, '面板入口应在图标槽里渲染自己的根节点 .px-panel-entry')
+  must(glyph.querySelector('button') === null,
+    '图标槽里不应再次出现我们自己渲染的 button：可点区域必须交给宿主行，'
+    + '否则「我们自己的按钮套在产品按钮里」那个 bug 会以另一种形态回来')
+  must(ourSlot !== button, '我们的根节点不能就是产品那一行本身')
+  must(ourSlot.closest('button') === button,
+    '我们的图标槽必须嵌在产品 row 按钮里面（这正是认 row 时要跳过的那个祖先）')
 
   // 150 行宽的档位必须是 full：这正是否则「什么都不显示」的那条路径
   // 断言「完整文案」这个**形状**，而不是某个精确分钟数：
@@ -581,7 +593,16 @@ const results = []
   }))
   const tip = host.querySelector('.px-heat-tip')
   must(tip !== null, '日历应渲染提示行')
-  must(tip.textContent.includes('悬停看当天用量与消费估计'), '未悬停时应提示可以悬停')
+  // 空闲时是**图例**，不是「悬停看…」那句提示：v3 视觉重做把这块的语义从
+  // 「用量」改成了「人机对话轮次」，文案随之重写。这里钉住现在的契约——
+  // 图例必须同时说清三件事（每格是什么 / 颜色深浅是什么 / 模型请求只是工作量），
+  // 而不是钉住已经删掉的旧句子。
+  must(tip.textContent.includes('每格 = 一天'),
+    `未悬停时应显示图例（每格 = 一天…），实际：${tip.textContent}`)
+  must(tip.textContent.includes('人机对话轮次'),
+    `图例应说明颜色深浅对应的是人机对话轮次，实际：${tip.textContent}`)
+  must(tip.textContent.includes('模型请求仅表示工作量'),
+    `图例应把「模型请求」与「工作量」区分开，实际：${tip.textContent}`)
 
   // 取**第 PICK 个日格**：图例里也有 .px-heat 的 rect，所以不能拿「第一个匹配」
   // 当日期格——那是第 0 天（全 0），断言会在 0 上假通过。
@@ -608,7 +629,10 @@ const results = []
   // 消费估计必须出现，且是金额形态
   must(shown.includes('消费估计'), `悬停应显示消费估计，实际：${shown}`)
   must(shown.includes('¥6.17'), `悬停应显示 ¥6.17 这个金额，实际：${shown}`)
-  must(shown.includes('次请求') && shown.includes('个会话'), '悬停仍应保留请求数与会话数')
+  // 用「次模型请求」而不是「次请求」：代码里有刻意区分——请求次数只是工作量，
+  // 不等于对话轮次（图例最后一句就在说这件事）。断言跟着这个区分走。
+  must(shown.includes('次模型请求') && shown.includes('个会话'),
+    `悬停仍应保留模型请求数与会话数，实际：${shown}`)
   results.push('活跃日历悬停：token 缩略成 6.17亿（K/M 英文 + 亿档）+ 消费估计 ¥6.17')
 }
 
