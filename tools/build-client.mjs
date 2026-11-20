@@ -50,6 +50,7 @@ const MODULES = [
   'styles/accounts.js',
   'styles/session.js',
   'styles/review.js',
+  'styles/subscription-value.js',
   'theme.js',
   'Notifier.js',
   'SessionCost.js',
@@ -64,6 +65,9 @@ const MODULES = [
   'sessionDetailView.js',
   'reviewStore.js',
   'review.js',
+  'subscriptionValueLocale.js',
+  'purchasingPower.js',
+  'subscriptionValue.js',
   'dashboard.js',
   'entry.js',
 ]

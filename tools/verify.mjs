@@ -16,6 +16,9 @@ const here = dirname(fileURLToPath(import.meta.url))
 const STEPS = [
   ['构建可发布包（tools/build.mjs）', 'build.mjs'],
   ['时段 / 价目 / 账本逻辑（tools/test.mjs）', 'test.mjs'],
+  ['套餐价值计算', 'test-subscription-value.mjs', '--built'],
+  ['套餐购买力、分摊与历史均值', 'test-purchasing-power.mjs', '--built'],
+  ['套餐价值存储、路由与工具', 'test-subscription-value-host.mjs', '--built'],
   ['补丁层清理与校验（tools/test-patch-layer.mjs）', 'test-patch-layer.mjs'],
   // 卸载脚本只删代码、不删数据。这一关必须在：账本与开关就住在插件目录里，
   // 而「清理旧目录」与「删掉全部用量历史」只差一个 rmSync——没有任何别的闸门看得见。
@@ -33,10 +36,10 @@ const STEPS = [
 ]
 
 let failed = 0
-for (const [label, script] of STEPS) {
+for (const [label, script, ...args] of STEPS) {
   process.stdout.write(`\n▶ ${label}\n`)
   try {
-    execFileSync(process.execPath, [join(here, script)], { stdio: 'inherit' })
+    execFileSync(process.execPath, [join(here, script), ...args], { stdio: 'inherit' })
   } catch {
     failed += 1
     console.error(`✗ 失败：${label}`)

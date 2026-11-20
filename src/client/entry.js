@@ -17,6 +17,7 @@
 import React from 'react'
 import { createPortal } from 'react-dom'
 import { Dashboard } from './dashboard.js'
+import { SUBSCRIPTION_VALUE_MESSAGES } from './subscriptionValueLocale.js'
 import { installNotifier, notifyStore } from './Notifier.js'
 import { PeriodDot, panelEntryLayout, periodTitle, usePeriodPhase } from './period.js'
 import { COST_ENTRY_ID, COST_ENTRY_ORDER, SessionCost } from './SessionCost.js'
@@ -180,9 +181,14 @@ export function apply(ctx) {
   const slots = ctx.get('slots')
   if (slots === undefined) return
 
+  const localeService = ctx.get('locale')
+  if (typeof localeService?.register === 'function') {
+    ctx.effect(() => localeService.register(PACKAGE_ID, SUBSCRIPTION_VALUE_MESSAGES), 'pixel-dashboard: 套餐价值文案')
+  }
+  const valueText = localeService?.bind?.(PACKAGE_ID)
   slots.inject('main', () => slots.register(
     { name: 'main', key: PANEL_ID },
-    () => h(Dashboard),
+    () => h(Dashboard, { localeService, valueText }),
   ))
 
   slots.inject('sidebar.panellist', () => slots.register(

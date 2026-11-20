@@ -829,6 +829,8 @@ const results = []
     + '把官方数据挤成省略号。宽度必须由内容决定（inline-flex）。')
   must(/display\s*:\s*inline-flex/.test(groupBlock[1]),
     '.px-pill-group 必须是 inline-flex（按内容取宽），不能是块级占满整行')
+  must(/flex-wrap\s*:\s*nowrap/.test(groupBlock[1]),
+    '侧栏挤窄时费用和额度要留在同一行，不能在组内换行')
   // 旧那个全宽行的规则必须已经清干净：留着会让人以为还有一条渲染路径
   must(!/\.px-cost-row\s*[,{]/.test(css),
     '样式里残留了已删除的 .px-cost-row 规则（它就是「抢宽度」那个缺陷的来源）')
@@ -1136,6 +1138,94 @@ const results = []
   globalThis.fetch = realFetch
   results.push('费用详情面板：点击展开 + 点外面/Esc 收起，且不 portal 进 dock（不抢官方宽度）')
   results.push('费用详情面板：金额、分档、缓存命中率、占比条都真的画出来了')
+}
+
+{
+  // Exercise the real React panel with an isolated Host-wire fixture, not a visual preview.
+  const { SubscriptionValuePanel } = await import('../lib/client/subscriptionValue.js')
+  const realFetch = globalThis.fetch
+  const box = document.createElement('div')
+  document.body.appendChild(box)
+  let config
+  const end = Date.UTC(2026, 11, 1)
+  const day = 86_400_000
+  const usage = { requests: 2, tokens: 10, pricedTokens: 10, unpricedTokens: 0, unverifiedRequests: 0 }
+  const current = { start: end - 30 * day, end, current: true, complete: false, apiValue: 170, ...usage }
+  const prior = { start: current.start - 30 * day, end: current.start, current: false, complete: true, apiValue: 410, ...usage }
+  globalThis.fetch = async (_url, init) => {
+    if (init?.method === 'POST') {
+      const action = JSON.parse(init.body)
+      config = action.config
+      return Response.json(action.action === 'remove' ? { ok: true, removed: true } : { ok: true, config })
+    }
+    return Response.json({ schema: 1, timezone: 'Asia/Shanghai', usdToCny: 7.3, dataThrough: end - 1000, generatedAt: end - 500,
+      quotaTracking: 'ready', plans: config ? [
+        { config, billing: [current, prior], quota: [18000000, 604800000].map((durationMs) => ({
+          id: String(durationMs), durationMs, windows: [
+            { ...current, start: end - durationMs, apiValue: durationMs === 18000000 ? 2 : 127,
+              observedAt: end - 3600, usedPercent: 41 },
+            { ...prior, start: end - durationMs * 2, end: end - durationMs, apiValue: null },
+          ],
+        })) },
+        { config: { ...config, route: 'other-paid-route', fee: 50, quotaVendor: 'none' }, billing: [current, { ...prior, apiValue: 115 }] },
+      ] : [],
+    })
+  }
+  const click = async (label) => {
+    const button = [...box.querySelectorAll('button')].find((node) => node.textContent === label)
+    must(button !== undefined, `套餐价值缺按钮：${label}`)
+    await React.act(async () => { button.click() })
+    await settle()
+  }
+  const change = async (field, value) => {
+    const prototype = field.tagName === 'SELECT' ? window.HTMLSelectElement.prototype : window.HTMLInputElement.prototype
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(prototype, 'value').set.call(field, value)
+      field.dispatchEvent(new window.Event(field.tagName === 'SELECT' ? 'change' : 'input', { bubbles: true }))
+    })
+  }
+  try {
+    await renderInto(box, React.createElement(SubscriptionValuePanel, { locale: 'zh', models: [{ provider: 'openai-codex', providerLabel: 'Codex' }],
+      onRefreshQuota: async () => { throw new Error('fixture: quota unavailable') },
+    }))
+    await click('添加套餐')
+    must(box.querySelector('option[value="route:openai-codex"]').textContent.includes('Codex'), '本机套餐路由应看得到名称和 id')
+    await click('保存配置')
+    must(document.activeElement.getAttribute('aria-invalid') === 'true', '无效配置应聚焦到有问题的字段')
+    const fill = (name, value) => change(box.querySelector('form').elements.namedItem(name), value)
+    await fill('route', 'route:openai-codex')
+    await fill('fee', '100')
+    await fill('anchorDate', '2020-01-01')
+    await fill('quotaVendor', 'codex')
+    await click('保存配置')
+    must(config?.fee === 100 && config.route === 'openai-codex', '表单须保存选中的精确路由及数值月费')
+    const meter = () => box.querySelector('.px-value-receipt')?.textContent
+    must(meter().includes('41%') && meter().includes('$127.00') && meter().includes('5.44×'), '默认周窗同时显示额度、等效金额和整窗购买力')
+    must(box.textContent.includes('套餐 $1 ≈ API $5.44') && box.textContent.includes('API $1 = 1×'), '主读数旁要显示单元购买力与 API 基准')
+    must(box.querySelectorAll('.px-value-receipt [data-tone]').length === 3 && !box.querySelector('.px-value-details, form'), '默认只保留三格彩色摘要，不占历史或表单的空间')
+    const guide = document.getElementById(box.querySelector('.px-value-root').getAttribute('aria-describedby'))
+    must(guide?.textContent.includes('API 等效金额 ÷ 同周期套餐成本') && guide.textContent.includes('百分比不参与计算'), '不展开对比也可读到购买力公式及额度口径')
+    await click('对比')
+    const details = box.querySelector('.px-value-details')
+    must(details.textContent.includes('各套餐月均购买力') && details.textContent.includes('4.1×') && details.textContent.includes('2.3×'), '均值用已结束月账期，且展示其他套餐')
+    must(details.textContent.includes('—') && details.textContent.includes('0/1 个已结束周期纳入'), '无可用价格的历史窗不能当零计入平均')
+    await change(box.querySelector('select[aria-label="周期"]'), '18000000')
+    await settle()
+    must(meter().includes('$2.00') && meter().includes('2.88×'), '5 小时窗必须使用自己的金额和成本')
+    await click('刷新 Codex 额度')
+    must(box.textContent.includes('刷新失败，保留上次观测'), '额度失败不得报成刷新成功')
+    await click('设置')
+    must(!box.querySelector('.px-value-details'), '打开设置应收起对比')
+    await click('编辑套餐')
+    await click('移除配置…')
+    await click('确认移除配置')
+    must(!config && box.textContent.includes('还没有配置套餐'), '移除后应返回空状态')
+    results.push('套餐购买力：默认三格摘要、41% / $127 / 5.44×、周期切换、历史均值、保存/移除与额度刷新反馈')
+  } finally {
+    await unmountAll()
+    box.remove()
+    globalThis.fetch = realFetch
+  }
 }
 
 console.log('真实 DOM 闸门（jsdom）通过：')

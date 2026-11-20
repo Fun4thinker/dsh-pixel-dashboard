@@ -2488,23 +2488,21 @@ must(css.includes('.px-period-inline'), '缺少倒计时文字的容器样式')
   // 不折行：这一行本来就窄，折成两行会把侧栏那一行撑高
   must(/white-space\s*:\s*nowrap/.test(inlineBlock[1]),
     '倒计时必须 white-space: nowrap，否则窄栏里会折成两行把行高撑开')
+  // 保留 6d01765 之前的倒计时字形；继承宿主行的字体会随 DSH 字体设置改变观感。
+  must(/font-family\s*:\s*var\(--px-num-font\)\s*;/.test(inlineBlock[1]),
+    '倒计时应使用原有看板数字字体，不继承宿主按钮字体')
+  must(/font-weight\s*:\s*600\s*;/.test(inlineBlock[1]) && /letter-spacing\s*:\s*0\.2px\s*;/.test(inlineBlock[1]),
+    '倒计时应保留旧版 600 字重与 0.2px 字距')
   // 等宽数字：倒计时每秒变，不等宽会左右抖动
   must(/tabular-nums/.test(inlineBlock[1]),
     '倒计时必须 tabular-nums，否则每秒变化时数字宽度跳动')
 }
-// 两个时期必须各有一色，而且**是不同的两种色**：
-// 只写一个的话另一档会渲染成继承色，与普通文字混在一起、看不出是哪一段。
-must(css.includes('.px-period-tone-red'), '缺少高峰（红）的样式')
-must(css.includes('.px-period-tone-green'), '缺少空闲（绿）的样式')
+// 高峰和空闲分别直接使用旧版看板的红、绿令牌，不混入宿主正文色。
 {
   const red = /\.px-period-tone-red\s*\{[^}]*color\s*:\s*([^;]+);/.exec(css)
   const green = /\.px-period-tone-green\s*\{[^}]*color\s*:\s*([^;]+);/.exec(css)
-  must(red !== null && green !== null, '高峰/空闲两色都要真的设置 color')
-  must(red[1].trim() !== green[1].trim(),
-    `高峰与空闲必须是不同的颜色，实际都是 ${red[1].trim()}——两色相同的话颜色就不区分时期了`)
-  // 走 --px-* 令牌：深浅两套各自定义，深色下会自动换成更亮的那一支
-  must(/var\(--px-tone-/.test(red[1]) && /var\(--px-tone-/.test(green[1]),
-    '两色都应走 --px-* 令牌（深浅两套各自定义，否则深色下会糊在暗底上）')
+  must(red?.[1].trim() === 'var(--px-tone-red)', '高峰倒计时应直接使用看板红')
+  must(green?.[1].trim() === 'var(--px-tone-green)', '空闲倒计时应直接使用看板绿')
 }
 // 环已经删掉了：这些类不该再出现在样式里（留着会让人以为还有一条渲染路径，
 // 而那段 CSS 已经没有任何元素会用）
@@ -2547,13 +2545,25 @@ for (const token of ['--px-ink', '--px-surface', '--px-surface-2', '--px-detail-
   must(light !== undefined && dark !== undefined, `${token} 缺少明或暗取值`)
   must(light !== dark, `${token} 的明暗取值相同，切到深色不会变色`)
 }
-// 插件 CSS 不得直接读产品 --dsw-* 令牌当文字色：产品把它以**内联样式**写在 body 上，
-// 内联优先级高于 <style>，插件既覆盖不了也控制不了它的明暗。
-must(
-  !/color:\s*var\(--dsw-/.test(css),
-  '文字色不得直接依赖 --dsw-* 令牌（产品以内联样式写在 body 上，插件无法按主题覆盖）；'
-  + '请改用插件自己的 --px-* 令牌',
-)
+// 套餐购买力沿用现有看板的粉、蓝、紫和深浅色令牌；只在自己的范围内回落到宿主主题，
+// 不覆盖宿主令牌，也不让样式影响看板之外的产品元素。
+const { SUBSCRIPTION_VALUE_CSS } = await import('../lib/client/styles/subscription-value.js')
+const { SUBSCRIPTION_VALUE_MESSAGES } = await import('../lib/client/subscriptionValueLocale.js')
+const { zh: valueZh, en: valueEn } = SUBSCRIPTION_VALUE_MESSAGES
+must(Object.keys(valueZh).sort().join(',') === Object.keys(valueEn).sort().join(','), '套餐价值中英文词典缺少对应文案')
+const substitutions = (line) => [...line.matchAll(/\{\w+\}/g)].map(([part]) => part).sort().join(',')
+for (const [key, line] of Object.entries(valueZh)) {
+  must(substitutions(line) === substitutions(valueEn[key]), `套餐价值文案占位符不一致：${key}`)
+}
+must(css.includes(SUBSCRIPTION_VALUE_CSS), '账户页缺少套餐价值样式')
+must(!/color:\s*var\(--dsw-/.test(css.replace(SUBSCRIPTION_VALUE_CSS, '')), '旧看板的文字色仍应使用自己的令牌')
+must(!/--dsw-[\w-]+\s*:/.test(SUBSCRIPTION_VALUE_CSS), '套餐购买力不得覆盖宿主令牌')
+for (const tone of ['blue', 'pink', 'purple']) {
+  must(SUBSCRIPTION_VALUE_CSS.includes(`var(--px-tone-${tone},`), `摘要卡应复用看板的 ${tone} 色`)
+}
+for (const [, selector] of SUBSCRIPTION_VALUE_CSS.matchAll(/(?:^|\})\s*([^{}]+)\{/g)) {
+  must(selector.split(',').every((part) => part.trim().startsWith('.px-value-')), `套餐价值样式未限定作用域：${selector}`)
+}
 
 // ── 「谁在铺次级底色」白名单 ────────────────────────────────────
 //
@@ -3517,6 +3527,9 @@ const overviewHtml = renderToStaticMarkup(React.createElement(View, { ...dashboa
 const accountPageHtml = renderToStaticMarkup(React.createElement(View, { ...dashboardProps, initialPage: 'accounts' }))
 const resourcePageHtml = renderToStaticMarkup(React.createElement(View, { ...dashboardProps, initialPage: 'resources' }))
 const habitPageHtml = renderToStaticMarkup(React.createElement(View, { ...dashboardProps, initialPage: 'habits' }))
+const pageNav = /<nav class="px-dashboard-pages"[^>]*>([\s\S]*?)<\/nav>/.exec(overviewHtml)?.[1] ?? ''
+const pageLabels = [...pageNav.matchAll(/<b>([^<]+)<\/b>/g)].map(([, label]) => label)
+must(pageLabels.join(' → ') === '总览 → 账户与模型 → 使用习惯 → 资源去向', '看板顶部应按 1→4→2→3 的顺序显示分页')
 // Legacy content checks below cover both pages separately rendered, never one production long page.
 const html = overviewHtml + accountPageHtml
 must(!overviewHtml.includes('px-review-ledger-summary') && !overviewHtml.includes('px-model-group'), '总览不得继续叠加资源/模型长页')

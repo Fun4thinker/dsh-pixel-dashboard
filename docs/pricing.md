@@ -118,10 +118,12 @@ Claude Haiku 的 100K、MiniMax 的 512K）。账本里没有可靠的逐请求�
 ### OpenAI GPT — 美元，不分时
 
 来源：<https://developers.openai.com/api/docs/pricing.md>（Standard 档、短上下文 ≤272K；
-截至 **2026-11**）
+截至 **2026-11-20**）
 
 | 模型键 | 显示名 | 缓存命中 | 未命中 | 输出 | 缓存写入 |
 |---|---|---|---|---|---|
+| `gpt-6.2-astra` | GPT-6.2 Astra | 0.40 | 8 | 40 | 10 |
+| `gpt-6.2-sol` | GPT-6.2 Sol | 0.10 | 2 | 10 | 2.5 |
 | `gpt-6-astra` | GPT-6 Astra | 1 | 10 | 50 | 12.5 |
 | `gpt-6.1-sol` | GPT-6.1 Sol | 0.10 | 2 | 10 | 2.5 |
 | `gpt-6.1-terra` | GPT-6.1 Terra | 0.05 | 1 | 5 | 1.25 |
@@ -136,7 +138,8 @@ Claude Haiku 的 100K、MiniMax 的 512K）。账本里没有可靠的逐请求�
 | `gpt-5.4-nano` | GPT-5.4 nano | 0.02 | 0.20 | 1.25 | — |
 
 **只录 Standard 短上下文**：Batch 五折、Fast / Ultrafast 加价、长上下文（>272K）另有档位，
-而账本里没有这些标识，录进来只会让「按什么价算的」变成谜。
+而账本里没有这些标识，录进来只会让「按什么价算的」变成谜。GPT-6.2 两款均标「按最低档」，
+缓存写入取 **30 分钟**档，不取 12 小时档。
 `gpt-5.6-sol` 是**促销价**（官方注明至 2026-11-30）。
 
 ### Anthropic Claude — 美元，不分时

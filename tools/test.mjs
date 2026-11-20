@@ -22,6 +22,7 @@ import {
   periodState,
   pricingOf,
   ratesOf,
+  usdToCny,
   zonedFacts,
   zonedParts,
   CANONICAL_COLLISIONS,
@@ -320,6 +321,34 @@ await check('智谱 GLM 单价与官方一致（元 / 百万 token）', () => {
   // 智谱历史模型按官方说明自动折叠到现行模型
   assert.equal(normalizeModel('glm-5.1'), 'glm-5.3', 'GLM-5.1 应折到 GLM-5.3')
   assert.equal(normalizeModel('glm-4.7'), 'glm-5.3-flash', 'GLM-4.7 应折到 GLM-5.3-Flash')
+})
+
+await check('GPT-6.2 Astra / Sol 按各自的 Standard 短上下文官价估算', () => {
+  const official = {
+    'gpt-6.2-astra': { cacheHit: 0.4, cacheMiss: 8, output: 40, cacheWrite: 10 },
+    'gpt-6.2-sol': { cacheHit: 0.1, cacheMiss: 2, output: 10, cacheWrite: 2.5 },
+  }
+  for (const [model, fields] of Object.entries(official)) {
+    const price = pricingOf(model)
+    assert.equal(price.known, true, `${model} 应有官价，不能落兜底`)
+    assert.equal(price.key, model, `${model} 不应折进上一代 GPT`)
+    for (const route of [`openai/${model}`, `openai-codex/${model.toUpperCase()}`]) {
+      const routedPrice = pricingOf(route)
+      assert.equal(routedPrice.key, model, `${route} 应命中自己的价目`)
+      assert.equal(routedPrice.known, true, `${route} 不应按兜底价估算`)
+    }
+    assert.equal(price.tierNote, '按最低档', `${model} 长上下文有另一档价格`)
+    assert.equal(price.rates.flat, true)
+    assert.equal(price.rates.currency, 'CNY')
+    assert.equal(price.native.currency, 'USD')
+    for (const [field, usd] of Object.entries(fields)) {
+      const cny = Number((usd * usdToCny()).toFixed(6))
+      assert.deepEqual(price.native[field], { peak: usd, idle: usd }, `${model}.${field} 应保留官价`)
+      assert.deepEqual(price.rates[field], { peak: cny, idle: cny }, `${model}.${field} 应按当前汇率折算`)
+    }
+    assert.equal(costOf({ cacheWrite: 1_000_000 }, price.rates, 'idle'), price.rates.cacheWrite.idle,
+      `${model} 的缓存写入应使用官方 30m 档，不按缓存命中推算`)
+  }
 })
 
 await check('DSH 实际模型名折到 flash（否则会被标成估算价）', () => {

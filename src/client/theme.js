@@ -17,6 +17,7 @@ import { ACCOUNTS_CSS } from './styles/accounts.js'
 import { PRICING_CSS } from './styles/pricing.js'
 import { SESSION_CSS } from './styles/session.js'
 import { REVIEW_CSS } from './styles/review.js'
+import { SUBSCRIPTION_VALUE_CSS } from './styles/subscription-value.js'
 
 /*
  * 这里**不该再有** PIXEL_THEMES / PALETTE_OVERRIDES 一类东西。
@@ -1185,28 +1186,20 @@ const DASHBOARD = `
 .px-source a { color: var(--px-tone-pink); text-decoration: underline; text-underline-offset: 2px; }
 .px-source a:hover { color: var(--px-pink-deep); }
 
-/* 输入框下方的会话费用徽标（费用 + 余额 + 套餐额度）。
-   conversation.composer.dock 是**横向 flex 行**（.dock：display:flex +
-   justify-content:center + gap:12px），我们是这行里的**一项**，因此这一层只做
-   inline-flex、按内容取宽，绝不占满整行。
-   占满整行会与官方胶囊抢宽度，把「1 轮 · 38 步」「2.1M tok」挤成省略号——那正是
-   用户截图反馈的现象。旧版这里写作 width:100%（还带左右内边距），前提是「容器为
-   纵向 flex 且没有 gap」——那是 .root 的样式，不是 .dock 的，属于认错了容器。
-   两种落位共用这一层：
-     · 旧契约（DSH ≤ 0.2.0-rc.2）portal 进官方统计容器，追加为末子节点 → 官方右边；
-     · 新契约（DSH ≥ 0.2.1-alpha.1）作为槽位项，靠 order 排在官方胶囊之后 → 官方右边。 */
+/* 费用组是 composer dock 横向 flex 行里的一项，不占满整行。
+   侧栏挤窄的是 dock 可用宽度，而非视口：跟原生统计一样，在同一行内收缩文字。
+   旧版 portal 进官方统计容器、新版作为独立槽位项，两种落位共用这一层。 */
 .px-pill-group {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 12px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   max-width: 100%;
   min-width: 0;
-  /* 字号必须自己定：.px-pill 用 font: inherit，而 dock 那一行没有自己的字号。
-     旧版这一点由 .px-cost-row 提供，它被本层取代后要照旧带上，否则徽标会跟着
-     产品外壳的字号走，和官方胶囊并排时大小不一致。 */
-  font-size: var(--dsh-content-font-size-secondary, 13px);
+  /* 与原生 StatsPills 的次级文字同高，宽窄两态都不撑高 dock。 */
+  font-size: calc(var(--dsh-content-font-size-secondary, 13px) - 1px);
+  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
 }
 
 /* 一枚徽标：刻意对齐产品统计胶囊的观感（13px、tertiary 文字、24px 圆角、
@@ -1216,7 +1209,9 @@ const DASHBOARD = `
   align-items: center;
   gap: 6px;
   box-sizing: border-box;
+  min-width: 0;
   max-width: 100%;
+  overflow: hidden;
   padding: 1px 8px;
   border: none;
   border-radius: 24px;
@@ -1230,8 +1225,12 @@ const DASHBOARD = `
 }
 .px-pill:hover { background: color-mix(in srgb, var(--px-ink) 7%, transparent); }
 .px-pill-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--px-tone-pink); }
+/* 先省略标签，尽量留下金额/百分比；极窄时数值也能省略，不把相邻读数挤出 dock。 */
+.px-pill-reading { display: inline-flex; min-width: 0; gap: 6px; }
+.px-pill-label, .px-pill-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .px-pill-label { color: inherit; }
-.px-pill-value { color: var(--px-ink); font-weight: 620; }
+.px-pill-value { flex: none; max-width: 100%; color: var(--px-ink); font-weight: 620; }
+.px-pill-label + .px-pill-value { max-width: calc(100% - 6px); }
 /* 角标：点明「这个数字是怎么来的」（如「估算」）。
    只写进 title 是不够的——不主动悬停的用户永远看不到那一层说明。 */
 .px-pill-tag {
@@ -1472,8 +1471,8 @@ const DASHBOARD = `
    早先在插槽内部用绝对定位 + right，那个 right 是相对**图标槽**解析的，
    文字因此怎么都离不开柱状图标。portal 到 row 之后这个问题从结构上消失。
 
-   图标继承宿主颜色，倒计时消费宿主深浅色语义令牌并混入正文色保证小字可读；
-   仅消费令牌，不注册主题或修改宿主的行、选中态与焦点样式。 */
+   图标继承宿主颜色，倒计时沿用旧版看板的深浅配色；
+   不注册主题或修改宿主的行、选中态与焦点样式。 */
 
 /* 图标槽只提供被动内容；整行选中底色、悬停和焦点环完全由宿主负责。 */
 .px-panel-entry {
@@ -1490,22 +1489,22 @@ const DASHBOARD = `
 }
 
 /* 倒计时文字：row 里的普通 flex 项；margin-left: auto 把它推到行尾，
-   标题因此仍从左对齐、不会被挤到中间。 */
+   标题因此仍从左对齐、不会被挤到中间。保留旧版看板的字体、字重与字距。 */
 .px-period-inline {
   margin-left: auto;
   padding-left: 8px;
   white-space: nowrap;
   flex: none;
   cursor: inherit;
-  font-family: inherit;
+  font-family: var(--px-num-font);
   font-size: 11px;
-  font-weight: 500;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
-  letter-spacing: 0;
+  letter-spacing: 0.2px;
 }
-/* 只消费宿主令牌；绿500过亮不宜直接作11px正文，混入正文色保持两套主题可读。 */
-.px-period-tone-red { color: color-mix(in srgb, var(--dsw-alias-state-error-primary, var(--px-tone-red)) 50%, var(--dsw-alias-label-primary, var(--px-ink))); }
-.px-period-tone-green { color: color-mix(in srgb, var(--dsw-alias-state-success-primary, var(--px-tone-green)) 50%, var(--dsw-alias-label-primary, var(--px-ink))); }
+/* 直接使用旧版看板的高峰红／空闲绿，令牌随深浅主题切换。 */
+.px-period-tone-red { color: var(--px-tone-red); }
+.px-period-tone-green { color: var(--px-tone-green); }
 
 /* 时段与计费：倒计时降级为一行次要信息，与计费口径同处一张紧凑卡片，
    不再单独占一张大面板（用户反馈「内容不多却占大量空间」）。 */
@@ -2435,6 +2434,6 @@ export const STYLES = [
   ['tokens', TOKENS],
   ['dashboard', DASHBOARD + REVIEW_CSS],
   ['pricing', PRICING_CSS],
-  ['accounts', ACCOUNTS_CSS],
+  ['accounts', ACCOUNTS_CSS + SUBSCRIPTION_VALUE_CSS],
   ['session', SESSION_CSS],
 ]

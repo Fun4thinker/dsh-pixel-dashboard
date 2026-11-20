@@ -42,6 +42,8 @@ import { PlansService } from './plans.js'
 import { Preferences, resolvePrefsPath } from './prefs.js'
 import { TimingBreakdown } from './timing.js'
 import { ReviewFacts, buildReview, reviewRange, completedExecutionTurns } from './review.js'
+import { buildSubscriptionValue } from './subscription-value.js'
+import { SubscriptionValueStore, codexQuotaSample, subscriptionValueConfigTool } from './subscription-value-store.js'
 import {
   NOTIFY_DEFAULTS,
   NotifyJournal,
@@ -163,6 +165,7 @@ const CAPABILITIES = [
   // 客户端据此才可以高频轮询（否则每 3 秒要传 700 KB）；旧宿主不认识这个参数，
   // 客户端会退回到 30 秒一次的低频轮询——**别让旧宿主被 3 秒一次的全量请求打爆**。
   'deltaRev',
+  'subscriptionValue',
 ]
 
 /** 快照缓存有效期：会话日志只在使用后变化，短缓存即可挡住频繁刷新。 */
@@ -238,7 +241,7 @@ const AGENT_FACT_LIMIT = 500
  * 旧缓存挡住——读出来的对象没有新字段，界面显示成空或 0，而且不报错。
  * 这个坑已经踩过一次（加 timing 时，用户看到「模型耗时 —」）。
  */
-const CACHE_SCHEMA = 5
+const CACHE_SCHEMA = 6
 
 /**
  * 磁盘快照（整份看板数据 + 逐会话明细）的格式版本。
@@ -474,6 +477,7 @@ async function readSession(persistence, id, timeZone) {
         // 这样「设置里改了模型名」仍然立刻反映到看板上。
         const record = recordOf(id, event)
         if (record === undefined) continue
+        if (!own) record.v = false
         records.push(record)
         // 一次格式化同时得到日期键与高峰判定中的日期部分（见 zonedFacts）
         days.add(zonedFacts(record.t, timeZone).key)
@@ -1452,6 +1456,16 @@ export class UsageCatalog {
     return this.reviewCache.get(key)
   }
 
+  /** Reuse the catalog's settled ledger; daily rollups cannot split a reset inside a day. */
+  async readSubscriptionUsage() {
+    await this.read()
+    if (this.reviewInput === undefined) await this.read({ refresh: true })
+    const input = this.reviewInput
+    if (input === undefined) throw new Error('Usage ledger is not ready')
+    const usagePartial = Boolean(input.ledgerError || input.listError || input.sessionReadFailures)
+    return { records: input.records, dataThrough: input.generatedAt, usagePartial }
+  }
+
   /**
    * 扫描全部会话：抽账本记录、收集会话元信息，并把记录并入账本。
    *
@@ -1703,6 +1717,7 @@ export class UsageCatalog {
       ratesStatus = undefined
     }
     const { records, sessions, ledger, directory } = await this.collect(now)
+    const subscriptionRoutes = new Set(directory.providerNames.keys())
 
     /** @type {Map<string, object>} */
     const days = new Map()
@@ -1747,6 +1762,7 @@ export class UsageCatalog {
     const firstDayUtc = anchorUtc - (HEATMAP_DAYS - 1) * 86_400_000
 
     for (const record of records) {
+      if (record.v === true && record.p) subscriptionRoutes.add(record.p)
       const usage = usageOfRecord(record)
       if (usage.local <= 0 && usage.requests === 0) continue
       const sessionId = String(record.s ?? '')
@@ -2071,6 +2087,7 @@ export class UsageCatalog {
         teamId, role, depth, ...(detached === true ? { detached: true } : {}), memberName, memberLabel,
       })),
       facts: reviewFacts, ledgerError: ledger.error, listError: this.reviewListError,
+      sessionReadFailures: [...reviewFacts.values()].some((fact) => fact.error !== undefined),
       modelOfRecord: (record) => {
         const rollup = String(record.r ?? '') || rollupOf(record.n ?? record.m)
         const provider = directory.nativeProvider.get(String(record.n ?? '')) ?? String(record.p ?? '')
@@ -2095,6 +2112,8 @@ export class UsageCatalog {
       timezone,
       version: IMPL_VERSION,
       capabilities: CAPABILITIES,
+      // Route choices must match the persisted provider field, not the report's model-directory inference.
+      subscriptionRoutes: [...subscriptionRoutes].sort().map((provider) => ({ provider, providerLabel: directory.providerNames.get(provider) ?? provider })),
       // 账本信息：路径与来源机器，用于确认跨设备同步是否生效
       machine: this.machine,
       ledger,
@@ -2593,6 +2612,43 @@ export default {
       credentials: () => ctx.get('credentials'),
       prefs: () => prefs.read(),
     })
+    const prefsPath = prefs.path
+    const subscriptionValues = new SubscriptionValueStore(prefsPath === undefined
+      ? undefined
+      : join(dirname(prefsPath), 'subscription-values.json'))
+    let quotaFetchedAt = 0
+    let quotaSample
+    let observationError = false
+
+    const rememberQuota = async (sample) => {
+      if (!sample) return
+      try {
+        await subscriptionValues.observe(sample)
+        if (quotaSample === sample) observationError = false
+      } catch {
+        // Observations are supplementary. A write failure must not break the existing quota page.
+        if (quotaSample === sample) observationError = true
+      }
+    }
+    const observePlans = async (payload) => {
+      if (payload.enabled === false) {
+        quotaFetchedAt = 0
+        quotaSample = undefined
+        return
+      }
+      if (!(payload.fetchedAt > quotaFetchedAt)) return
+      quotaFetchedAt = payload.fetchedAt
+      const codex = payload.providers.find((provider) => provider.id === 'codex')
+      quotaSample = codexQuotaSample(codex, plans.codexScopeOf(codex), quotaFetchedAt)
+      await rememberQuota(quotaSample)
+    }
+
+    const registerValueTool = (context) => {
+      const tools = context.get('tools')
+      if (tools) context.effect(() => tools.register(subscriptionValueConfigTool(subscriptionValues)), 'pixel-dashboard: 套餐价值配置工具')
+    }
+    if (typeof ctx.inject === 'function') ctx.inject(['tools'], registerValueTool)
+    else registerValueTool(ctx)
 
     /**
      * 会话结束事实的通知日志（见 lib/notify.js）。
@@ -2777,7 +2833,72 @@ export default {
           sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
           return
         }
+        if (req.method === 'GET') await observePlans(payload)
         sendJson(res, 200, payload, req.method === 'HEAD')
+      },
+    })
+
+    route({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/subscription-value`,
+      handler: async (req, res) => {
+        const head = req.method === 'HEAD'
+        if (crossSite(req)) {
+          req.resume?.()
+          sendJson(res, 403, { error: 'invalid-request' }, head)
+          return
+        }
+        if (req.method === 'GET' || head) {
+          let state
+          try {
+            state = await subscriptionValues.read()
+            // A binding can be created immediately after the normal quota card's first read.
+            // Reuse that recent observation; this route never starts its own upstream requests.
+            if (!head && state.quota === null && state.configs.some((config) => config.quotaVendor === 'codex')
+              && quotaSample?.windows.some((window) => window.usedPercent > 0)
+              && Date.now() - quotaSample.at < 60_000) {
+              await rememberQuota(quotaSample)
+              state = await subscriptionValues.read()
+            }
+          } catch {
+            sendJson(res, 500, { error: 'storage-failed' }, head)
+            return
+          }
+          try {
+            const input = state.configs.length === 0 ? { records: [], dataThrough: null } : await catalog.readSubscriptionUsage()
+            const now = Date.now()
+            const observations = new Map()
+            if (state.quota) observations.set(state.quota.route, state.quota.windows)
+            const data = buildSubscriptionValue({ configs: state.configs, observations, ...input, now })
+            const quotaTracking = !await plans.enabled() ? 'disabled'
+              : quotaSample?.windows.some((window) => window.end > now) ? 'ready' : 'unavailable'
+            sendJson(res, 200, { ...data, quotaTracking, ...(observationError ? { observationError: true } : {}) }, head)
+          } catch {
+            sendJson(res, 500, { error: 'usage-unavailable' }, head)
+          }
+          return
+        }
+        if (req.method !== 'POST') {
+          req.resume?.()
+          sendJson(res, 405, { error: 'invalid-action' })
+          return
+        }
+        if (String(req.headers?.['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
+          req.resume?.()
+          sendJson(res, 415, { error: 'invalid-request' })
+          return
+        }
+        let body
+        try {
+          body = await readJsonBody(req)
+        } catch {
+          sendJson(res, 400, { error: 'invalid-request' })
+          return
+        }
+        const result = await subscriptionValues.configure(body)
+        const status = result.ok ? 200 : result.error === 'storage-failed' ? 500
+          : ['codex-in-use', 'plan-limit'].includes(result.error) ? 409 : 400
+        sendJson(res, status, result)
       },
     })
 

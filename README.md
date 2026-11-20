@@ -11,12 +11,13 @@
 >   按天、按峰谷把这条会话拆给你看。
 > - **账户与套餐**：现金余额只查 DeepSeek 官方；智谱 / Command Code / 火山方舟 / Codex /
 >   Cursor / Opencode 六家订阅额度一页切换查看。
+> - **套餐购买力**：一张卡看额度、API 等效金额，以及套餐每付 $1 用出了多少 API 价值；展开比较历史周期和各套餐的月均购买力。
 > - **不改产品配色**：深色 / 浅色、背景、按钮全部保持 DSH 原版，插件只在自己那一页用色。
 
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![node](https://img.shields.io/badge/node-%3E%3D18-blue)
 
-装完即生效，**不需要**任何配置。所有金额都是本机估算，不联网上报。
+基础用量统计无需配置。可在「套餐购买力」中选填自己的月费与账期；所有估算在本机完成，不联网上报。
 
 ---
 
@@ -166,6 +167,12 @@ node tools/install-official.mjs --profile web      # 建 link: 软链指向本�
 Codex 要登录态 access token，不是 `sk-` 平台 Key**）、以及移除凭据的三种「删不掉」情形，
 见 **[docs/account-and-plans.md](docs/account-and-plans.md)**。
 
+### 套餐购买力：套餐每付 $1，相当于多少 API 用量？
+
+**用量看板 → 账户与模型 → 套餐购买力**默认只显示当前周期的额度已用、累计 API 等效金额和购买力；设置与历史点开才显示。API 按量付 $1 是 **1×**，套餐购买力 = 同周期 API 等效金额 ÷ 套餐周期成本。月账期取月费；Codex 周、5 小时等窗口按整个窗口时长分摊月费，不按已用额度分摊，也不能相加。
+
+打开 **对比**，查看同长度的历史窗口，或用已结束的月账期横向比较各套餐的均值。未观测窗口不补造；读数只覆盖本地 DSH 的已计价部分，不是实际账单或省下的钱。详见 **[套餐购买力说明](docs/subscription-value.md)**。
+
 ## 通知
 
 只保留**任务类**提醒：完成、失败 / 中断、等待授权 / 回答、子智能体进展、当前会话不打扰。
@@ -189,7 +196,7 @@ Codex 要登录态 access token，不是 `sk-` 平台 Key**）、以及移除凭
 | API Key | **不出本机**，只用于拼 `Authorization` 头；响应里只回报金额、币种与来源层名 |
 | 余额请求 | 只发往 settings 里显式配置的 `baseURL`，否则官方 `https://api.deepseek.com`。**不读 `DEEPSEEK_BASE_URL`** |
 | 套餐请求 | 只发往写死的官方域名，不接受改写 |
-| 落盘 | 只写本机文件：用量账本 `usage-ledger.jsonl` 与其快照 `usage-ledger.jsonl.snapshot.json`（打开看板不用等全量扫描）、会话扫描缓存 `session-cache.json`、开关 `balance-prefs.json`、自定义单价 `custom-rates.json` |
+| 落盘 | 只写本机文件：用量账本 `usage-ledger.jsonl` 与其快照 `usage-ledger.jsonl.snapshot.json`（打开看板不用等全量扫描）、会话扫描缓存 `session-cache.json`、开关 `balance-prefs.json`、自定义单价 `custom-rates.json`、本地套餐配置与窗口观测 `subscription-values.json` |
 | 移除凭据 | **只在你勾选并二次确认之后**才写，删的是 DSH 凭据文件里那几个引用名；插件不保留副本 |
 
 用量账本默认在 `$DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl`，按 `sessionId:seq`

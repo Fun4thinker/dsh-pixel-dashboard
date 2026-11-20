@@ -120,9 +120,9 @@ const ratesRoute = routeOf('/dsh-pixel/rates')
 const credsRoute = routeOf('/dsh-pixel/plan-credentials')
 // 路由条数是**有意**钉死的：新增路由必须在这里显式加一行，并想清楚它是否需要
 // 同源闸门与写权限，而不是让新增悄悄溜过去（见 lib/host.js 的注册处）。
-// 12 = 原有十一条 + 只读窗口复盘 review（不改变 /data 形状）
 const reviewRoute = routeOf('/dsh-pixel/review')
-assert.equal(routes.length, 12, `应注册恰好十二条路由，实际 ${routes.length}`)
+routeOf('/dsh-pixel/subscription-value')
+assert.equal(routes.length, 13, `应注册恰好十三条路由，实际 ${routes.length}`)
 
 /**
  * 最小 req/res 替身。
@@ -231,7 +231,7 @@ const REQUIRED_CAPABILITIES = [
   'sessionTitle',
   // 单会话明细路由。缺这一项说明宿主还是旧版本，会话标签页据此显示
   // 「当前宿主不支持这条明细」，而不是画一张空表。
-  'sessionDetail',
+  'sessionDetail', 'subscriptionValue',
 ]
 assert.ok(Array.isArray(payload.capabilities), '响应应含 capabilities 数组')
 for (const name of REQUIRED_CAPABILITIES) {

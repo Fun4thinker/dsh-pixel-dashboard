@@ -17,6 +17,7 @@ import React from 'react'
 // 都渲染不出来。默认导入在两种环境下都成立（CJS 互操作给的是 module.exports）。
 import ReactDOM from 'react-dom'
 import { AccountPanel } from './accountPanel.js'
+import { SubscriptionValuePanel } from './subscriptionValue.js'
 import { ReviewSection } from './review.js'
 import { PriceSettingsButton, PriceSettingsView } from './priceSettings.js'
 // 「消费 Top 会话」点开时要在原地取这条会话的明细，因此复用会话标签页那条取数口
@@ -95,7 +96,7 @@ import {
   toneBg,
 } from './usage.js'
 
-const { createElement: h, useCallback, useEffect, useMemo, useRef, useState } = React
+const { createElement: h, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } = React
 
 // 详情视图的实现在 sessionDetailView.js（会话标签页的费用页共用同一份）。
 // 这里转出一道导出：渲染闸门与既有调用方都按 `dashboard.js` 取 SessionDetail，
@@ -105,9 +106,9 @@ export { SessionDetail }
 /** 按复盘任务分页，避免把所有长表堆进总览。 */
 const DASHBOARD_PAGES = [
   { id: 'overview', label: '总览', hint: '费用趋势与活跃概况' },
+  { id: 'accounts', label: '账户与模型', hint: '套餐购买力、额度与模型账目' },
   { id: 'habits', label: '使用习惯', hint: '什么时候在推进对话' },
   { id: 'resources', label: '资源去向', hint: '钱和时间花在哪' },
-  { id: 'accounts', label: '账户与模型', hint: '套餐额度与模型账目' },
 ]
 
 const RANGES = [
@@ -725,7 +726,10 @@ function MarkIcon() {
  * 因此不塞进同一次取数的成败里。
  * @returns {object} React 元素。
  */
-export function Dashboard() {
+export function Dashboard({ localeService, valueText } = {}) {
+  const subscribeLocale = useCallback((listener) => localeService?.subscribe?.(listener) ?? (() => {}), [localeService])
+  const getLocale = useCallback(() => localeService?.getSnapshot?.()?.active ?? 'zh', [localeService])
+  const valueLocale = useSyncExternalStore(subscribeLocale, getLocale, getLocale)
   const [state, setState] = useState({ status: 'loading', data: null, error: '' })
   const [now, setNow] = useState(() => Date.now())
   const [balance, setBalance] = useState({ payload: undefined, busy: false, error: '' })
@@ -777,12 +781,22 @@ export function Dashboard() {
   }, [])
 
   const loadPlans = useCallback((refresh) => {
-    fetchPlans({ refresh })
-      .then((payload) => { setPlans((prev) => ({ ...prev, payload, error: '' })) })
+    return fetchPlans({ refresh })
+      .then((payload) => {
+        setPlans((prev) => ({ ...prev, payload, error: '' }))
+        return payload
+      })
       .catch((error) => {
         setPlans((prev) => ({ ...prev, error: String(error?.message ?? error) }))
       })
   }, [])
+
+  const refreshQuota = useCallback(async () => {
+    const payload = await loadPlans(true)
+    if (payload?.providers?.find((provider) => provider.id === 'codex')?.ok !== true) {
+      throw new Error('Codex quota unavailable')
+    }
+  }, [loadPlans])
 
   const loadCredentials = useCallback(() => {
     fetchPlanCredentials()
@@ -902,6 +916,9 @@ export function Dashboard() {
     plansError: plans.error,
     plansBusy: plans.busy,
     onTogglePlans: (enabled) => { toggle('plans', enabled, setPlans, loadPlans) },
+    onRefreshQuota: refreshQuota,
+    valueText,
+    valueLocale,
     credentials: credentials.payload,
     credentialsError: credentials.error,
     onRemoved: afterRemoval,
@@ -920,9 +937,9 @@ export function View(props) {
   const {
     data, now, refreshing, onRefresh,
     balance, balanceError, balanceBusy, onToggleBalance,
-    plans, plansError, plansBusy, onTogglePlans,
+    plans, plansError, plansBusy, onTogglePlans, onRefreshQuota,
     credentials, credentialsError, onRemoved,
-    onRatesSaved,
+    onRatesSaved, valueText, valueLocale,
   } = props
   /**
    * 四组显示偏好全部存在 localStorage（前缀 `px.pref.`），脏值回默认。
@@ -1378,6 +1395,9 @@ export function View(props) {
     }) : null,
 
     page === 'accounts' ? h('div', { className: 'px-dashboard-page', 'data-page': 'accounts' },
+    h(SubscriptionValuePanel, {
+      models: data.subscriptionRoutes ?? data.models, revision: data.generatedAt, plans, onRefreshQuota, t: valueText, locale: valueLocale,
+    }),
     // ── 套餐余额：第三方订阅额度（每家一张卡，环形条 + 进度条）────────
     h(AccountPanel, {
       balance,

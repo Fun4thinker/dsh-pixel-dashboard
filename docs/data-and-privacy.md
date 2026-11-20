@@ -11,13 +11,15 @@ $DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl
 每次模型请求一条记录。记录按 `sessionId:seq` 去重，因此**重复扫描不会让历史翻倍**——
 重装、换机、重复导入都安全。
 
-同一目录下还有三份小文件，都不是历史数据，**换机不必带走**（不带就回默认值）：
+同一目录下还有一些配置、缓存和有限的窗口观测。换机只想保留 Token 用量时，复制账本即可；要保留套餐配置与重置窗口对比，需要一并复制 `subscription-values.json`：
 
 | 文件 | 内容 | 覆盖用的环境变量 |
 |---|---|---|
 | `balance-prefs.json` | 余额 / 套餐开关、通知开关 | `DSH_PIXEL_BALANCE_PREFS` |
 | `custom-rates.json` | 你补充的单价、美元折算汇率（提供商倍率仍可手填，界面不提供） | `DSH_PIXEL_RATES` |
 | `session-cache.json` | 会话日志的**派生结果**缓存（只为加速，删掉会自动重建） | 跟账本同目录 |
+| `usage-ledger.jsonl.snapshot.json` | 看板启动快照（只为加速） | 跟账本同目录 |
+| `subscription-values.json` | 套餐路由、月费与账期；有限的已观测 Codex 时间窗及百分比。只保存用于区分额度账号的散列，不保存原始账号标识或登录态 | 跟 `balance-prefs.json` 同目录 |
 
 `DSH_PIXEL_LEDGER` 可以覆盖账本路径。
 
@@ -37,12 +39,12 @@ $DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl
 | 开关 | 余额与套餐各自独立开关；关掉后**一个请求都不发**。`DSH_PIXEL_BALANCE=0` / `DSH_PIXEL_PLANS=0` 可硬性关闭。 |
 | 统计 | 只读本机会话日志与账本，不向任何第三方发送。 |
 | 通知 | 触发提醒**不发任何网络请求**；弹的是本机系统通知。（余额 / 额度预警已取消，不再有定时轮询。） |
-| 落盘 | 只写上面那四份本机文件。通知日志与「最近通知」**只在内存**。 |
+| 落盘 | 只写上面的本机账本、配置与缓存。通知日志与「最近通知」**只在内存**。 |
 | 移除凭据 | **只有你在看板上勾选并二次确认之后**才会写：删掉的是 DSH 凭据文件里那几个引用名（走 DSH 自己的 `credentials.unset`，不手改 YAML）。不勾就一个字节都不动；插件**不保留被删凭据的副本**。 |
 
 ## 宿主暴露的路由
 
-插件在本地 webServer 上注册 12 条**精确匹配**路由，全部挂在 `/dsh-pixel` 前缀下：
+插件在本地 webServer 上注册 13 条**精确匹配**路由，全部挂在 `/dsh-pixel` 前缀下：
 
 | 路由 | 方法 | 说明 |
 |---|---|---|
@@ -50,7 +52,8 @@ $DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl
 | `/dsh-pixel/session` | GET | **单会话明细**（会话标签页用）；`?id=<会话 id>`，只读 |
 | `/dsh-pixel/review` | GET | 使用习惯与资源去向复盘；`?days=7|30|90&scope=recent|all`，默认近期未归档，只读，只返回数字、来源证据、调用时间与所属会话，不包含调用参数或结果正文 |
 | `/dsh-pixel/balance` | GET | DeepSeek 官方余额 |
-| `/dsh-pixel/plans` | GET | 六家订阅额度 |
+| `/dsh-pixel/plans` | GET | 六家订阅额度；启用 Codex 窗口对比时顺便保存有效窗口 |
+| `/dsh-pixel/subscription-value` | GET / POST | 本地套餐价值汇总 / 保存或移除配置；不额外请求上游额度 |
 | `/dsh-pixel/period` | GET | 纯时钟（高峰 / 空闲与切换时刻），不读账本 |
 | `/dsh-pixel/version` | GET | 在线实现版本 |
 | `/dsh-pixel/notify` | GET / POST | 通知日志（增量）与开关 |
@@ -59,8 +62,8 @@ $DSH_HOME/plugins/dsh-pixel-dashboard/usage-ledger.jsonl
 | `/dsh-pixel/plan-credentials` | GET / POST | 各家凭据现状 / 按勾选移除 |
 | `/dsh-pixel/focus` | POST | 桌面端把窗口拉到前台（尽力而为） |
 
-两条写路由（`/notify` 之外的 `/toggle`）与 `/plan-credentials`、`/rates` 都带**同源检查**：
-不接受跨站表单触发。`/plan-credentials` 另有**引用名白名单**——它从浏览器可达，
+配置写路由均带**同源检查**，不接受跨站表单触发。`/subscription-value` 另要求 JSON 请求体；
+`/plan-credentials` 另有**引用名白名单**——它从浏览器可达，
 凭一个字符串删任意环境变量是危险的。
 
 无遥测、无自动上报、无外部依赖。
