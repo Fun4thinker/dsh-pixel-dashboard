@@ -73,13 +73,25 @@ function fail(message) {
   process.exit(1)
 }
 
+/** semver 比较：a>b 返回正数，相等返回 0，a<b 返回负数。两版都必须是 x.y.z。 */
+function compareVersions(a, b) {
+  const parse = (v) => {
+    const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v)
+    if (m === null) fail(`版本号 ${v} 不是 x.y.z 形式，无法比较大小`)
+    return [Number(m[1]), Number(m[2]), Number(m[3])]
+  }
+  const [a1, a2, a3] = parse(a)
+  const [b1, b2, b3] = parse(b)
+  return a1 - b1 || a2 - b2 || a3 - b3
+}
+
 /** semver 的递增，只支持本仓库用到的三种。 */
 function bump(version, kind) {
   const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version)
   if (m === null) fail(`当前版本 ${version} 不是 x.y.z 形式，无法自动递增；请直接传目标版本号`)
   const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3])]
   if (kind === 'major') return `${major + 1}.0.0`
-  if (kind === 'minor') return `${minor + 1}.0`
+  if (kind === 'minor') return `${major}.${minor + 1}.0`
   return `${major}.${minor}.${patch + 1}`
 }
 
@@ -102,6 +114,12 @@ if (!tagOnly) {
     fail(`无法理解的版本参数 ${JSON.stringify(spec)}；用 patch / minor / major 或 x.y.z`)
   }
   if (target === current) fail(`目标版本与当前版本相同（${current}）`)
+  // 版本必须严格往上走：递增算错过一次（minor 丢掉了主版本号，3.0.0 → 1.0），
+  // 而 npm 把 `1.0` 规整成 `1.0.0` 接受下来，latest 就会被挪回旧版本——
+  // 发布本身不会报错，事后要撤只能 unpublish。所以这里按 semver 逐段比一遍。
+  if (compareVersions(target, current) <= 0) {
+    fail(`目标版本 ${target} 不高于当前版本 ${current}；发版只能往上走`)
+  }
 }
 
 // ── 2. 发布前检查：这个版本是不是已经在 npm 上了 ──────────────────
