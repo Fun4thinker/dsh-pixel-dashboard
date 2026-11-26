@@ -449,13 +449,34 @@ function initialPeriod(periods) {
   return quota.find((period) => period.durationMs === 7 * DAY) ?? quota.at(-1) ?? periods[0]
 }
 
-function Receipt({ tr, fmt, plan, period, row, tracking }) {
+/** 「本周」「本 5 小时」——给 powerIn 用的短周期名，避免和 periodTitle 的「周额度」重叠。 */
+function periodName(tr, period) {
+  if (period.durationMs === 7 * DAY) return tr('thisWeek')
+  if (period.durationMs === 5 * HOUR) return tr('thisFiveHours')
+  return tr('thisQuota')
+}
+
+function Receipt({ tr, fmt, plan, period, row, tracking, monthly }) {
   const quota = period.id !== 'billing'
   const { currency, fee } = plan.config
   const amount = (value, compact = false) => moneyText(tr, fmt, value, currency, compact)
   const percent = row?.usedPercent
   const percentKnown = amountKnown(percent)
   const headline = ratioText(tr, fmt, row?.power)
+  /**
+   * 窗口的购买力必须把周期写进标签。
+   *
+   * 同一个「$100 月费」的套餐，月账期算 $100、7 天窗口只算 $100×7/30≈$23.33，
+   * 于是同一批用量会显示成 2.6× 和 11×。默认展示的是窗口，标签若只写「购买力」，
+   * 用户会拿它和月费对账，然后得到「11 倍」这个他们没法解释的数。
+   */
+  const powerLabel = quota ? tr('powerIn', { period: periodName(tr, period) }) : tr('power')
+  // 月口径并列在窗口读数下面：它才是「这个月花 $100 值不值」的答案。
+  const monthLine = quota && monthly !== undefined
+    ? amountKnown(monthly.power)
+      ? tr('monthLine', { power: ratioText(tr, fmt, monthly.power), api: amount(monthly.apiValue), fee: amount(fee) })
+      : tr('monthLinePending')
+    : null
   const metric = (tone, label, value, child = null, title) => h('div', {
     className: 'px-value-metric', 'data-tone': tone, title,
   }, h('dt', null, label), h('dd', null, value, child))
@@ -474,7 +495,8 @@ function Receipt({ tr, fmt, plan, period, row, tracking }) {
           h(Bar, { value: percent, scale: 100, quota: true }), quotaAt)
         : metric('quota', tr('monthlyFee'), amount(fee)),
       metric('amount', tr(row?.current ? 'equivalentToDate' : 'equivalent'), amount(row?.apiValue)),
-      metric('power', tr('power'), headline, null, formula)),
+      metric('power', powerLabel, headline,
+        monthLine === null ? null : h('span', { className: 'px-value-month' }, monthLine), formula)),
     h('div', { className: 'px-value-context' },
       h('span', { className: 'px-value-line' }, unitLine,
         h('span', null, tr('baseline', { unit }))),
@@ -599,6 +621,16 @@ export function SubscriptionValuePanel({ models, revision, plans, onRefreshQuota
   const route = selected?.config.route
   const period = selected && (selected.periods.find((entry) => entry.id === selectedPeriod) ?? initialPeriod(selected.periods))
   const row = period?.rows.find((entry) => entry.current) ?? period?.rows[0]
+  /**
+   * 月口径的现行读数：与窗口并列显示，回答「这个月付 $100 值不值」。
+   * 只取 `periods[0]`（billing）的当前行或最近一行；窗口周期与月账期不互相替代。
+   */
+  const monthly = (() => {
+    const billing = selected?.periods?.[0]
+    if (!billing || billing.id !== 'billing') return undefined
+    const entry = billing.rows.find((item) => item.current) ?? billing.rows[0]
+    return entry === undefined ? undefined : { power: entry.power, apiValue: entry.apiValue }
+  })()
   const openEditor = (config, event) => {
     editorTrigger.current = event.currentTarget
     setNotice(null)
@@ -644,7 +676,7 @@ export function SubscriptionValuePanel({ models, revision, plans, onRefreshQuota
     state.payload !== null && !selected && editor === null ? h('div', { className: 'px-value-empty' },
       h('p', { className: 'px-value-muted' }, tr('noPlans')),
       button(tr('add'), { 'data-primary': '', disabled: state.error !== null, onClick: (event) => openEditor(null, event) })) : null,
-    selected ? h(Receipt, { tr, fmt, plan: selected, period, row, tracking: state.payload.quotaTracking }) : null,
+    selected ? h(Receipt, { tr, fmt, plan: selected, period, row, tracking: state.payload.quotaTracking, monthly }) : null,
     h('p', { id: `${id}-guide`, className: 'px-value-muted' }, tr('cardGuide')),
     mode === 'compare' && selected ? h(PeriodDetail, {
       key: route, tr, fmt, selected, period, row, all: configs, routes, snapshot: state.payload, onRefreshQuota,

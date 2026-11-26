@@ -1,9 +1,8 @@
 /**
  * 会话标签页（`conversation.view` 槽位里的「费用」）。
  *
- * 定位：看板回答「全局花了多少、花在哪」；这一页回答「**这条会话**花了多少、
- * 花在哪些模型上、当前走的账户还剩多少」。它与输入框下方那枚费用条是同一份数据
- * 的摘要与明细关系——费用条是摘要，这里是完整明细。
+ * 单人会话先看本次费用；团队会话先看整队合计和成员表，再看当前会话自己的
+ * 逐模型、逐日和提供商明细。这里不读取账户余额。
  *
  * 数据来自宿主的 `GET /dsh-pixel/session?id=<sessionId>`（按会话 × 模型的逐条明细），
  * 而不是看板的全量 `/data`：后者不含按会话的模型明细（那会让响应体积翻几倍）。
@@ -55,9 +54,8 @@
  *
  * ## 加法必须对得上（严格相等，不是近似）
  *
- * 页面上一共两个「合计」，都**只由它自己的明细行相加得到**：
- *   - 顶部「本次会话费用」= 逐模型金额之和（宿主保证与它自己的 `cost` 逐位相等）；
- *   - 逐日一节**不另立合计**，避免同一页出现两个可能差 10⁻⁶ 的总数（Lead 口径）。
+ * 团队合计取自宿主的成员自有用量汇总，缺外部成员用量时显示已记录小计。
+ * 当前会话的小计来自其逐模型明细；逐日一节不另立合计。两种范围不混算。
  *
  * ## 缺失写 `—`，不写 0
  *
@@ -68,6 +66,8 @@
 
 import React from 'react'
 import { formatCny, formatDurationMs, formatTokens, shortDate } from './format.js'
+import { memberNameOf } from './team.js'
+import { teamTranslator } from './sessionTeamLocale.js'
 // 「图二」那套彩色富信息的两个零件：hero 卡（左侧色条）与三色耗时堆叠条。
 // 与看板共用同一份实现（sessionDetailView.js），两处视觉不会各写一版。
 import { HeroCard, TimingBreakdownView } from './sessionDetailView.js'
@@ -398,7 +398,70 @@ function runtimeBadgeOf(session) {
   return undefined
 }
 
-export function sessionCostModel(payload) {
+/** A completed 0ms turn is measured; a missing counter or no completed turns is not. */
+function effectiveMsOf(row) {
+  const ms = maybeNumber(row?.completedTurnMs)
+  return row?.completedTurns > 0 && ms !== undefined && ms >= 0 ? ms : undefined
+}
+
+/** Team headlines use the host's team snapshot, never the selected member's entries. */
+function formatTeamCost(amount) {
+  if (amount === undefined) return DASH
+  return amount > 0 && amount < 0.0001 ? '<¥0.0001' : formatCny(amount)
+}
+
+const defaultTeamText = teamTranslator()
+
+function teamCostModel(team, currentId, t) {
+  const recorded = Array.isArray(team?.members) ? team.members : []
+  const unmetered = Array.isArray(team?.unmeteredMembers) ? team.unmeteredMembers : []
+  if (!recorded.length || recorded.length + unmetered.length < 2) return undefined
+  const cost = maybeNumber(team.cost?.standard ?? team.cost)
+  const members = recorded.map((member) => {
+    const amount = maybeNumber(member?.cost?.standard ?? member?.cost)
+    const duration = effectiveMsOf(member)
+    const share = cost > 0 && amount !== undefined ? amount / cost : undefined
+    return {
+      id: member.id, name: memberNameOf(member), current: member.id === currentId,
+      roleLabel: member.role === 'lead' ? t('lead') : (member.depth > 1 ? t('nestedWorker', { depth: member.depth }) : t('worker')),
+      amountText: formatTeamCost(amount), share, shareText: share > 0 && share < 0.001 ? '<0.1%' : shareTextOf(share),
+      duration, durationText: duration === undefined ? DASH : formatDurationMs(duration),
+    }
+  })
+  for (const member of unmetered) {
+    members.push({ id: member.id, name: memberNameOf(member), roleLabel: t('externalWorker'),
+      amountText: t('unavailable'), durationText: DASH })
+  }
+  const partial = unmetered.length > 0
+  /**
+   * 团队用时取宿主算好的**区间并集**（`team.busyMs`），不是成员之和。
+   *
+   * 两个成员并行各跑 5 分钟，用户只等了 5 分钟；把各自时长相加会显示 10 分钟，
+   * 那是「算力总量」而不是「我等了多久」。成员各自的时长仍逐行给出。
+   */
+  // 0ms 是**已测量**的零（有成员计时但因扣除等待而为 0），只有缺字段才是不知道。
+  const busyMs = maybeNumber(team.busyMs)
+  const busyMembers = maybeNumber(team.busyMembers) ?? 0
+  const timed = busyMs === undefined || busyMembers === 0 ? [] : [busyMs]
+  const tokens = maybeNumber(team.totals?.local)
+  const requests = maybeNumber(team.totals?.requests)
+  const tools = recorded.map((member) => maybeNumber(member.toolCalls))
+  const completeTools = tools.every((count) => count !== undefined)
+  return {
+    title: team.title || t('teamName'), members, partial,
+    heroes: [
+      { key: 'cost', tone: 'accent', label: t(partial ? 'costPartial' : 'cost'), value: formatTeamCost(cost),
+        foot: t(partial ? 'costCoverage' : 'costAll', { count: recorded.length, total: members.length }) },
+      { key: 'tokens', tone: 'blue', label: t(partial ? 'tokensPartial' : 'tokens'), value: tokens === undefined ? DASH : formatTokens(tokens),
+        foot: requests === undefined ? undefined : t('requests', { count: requests }) },
+      { key: 'timing', tone: 'green', label: t('time'), value: timed.length ? formatDurationMs(busyMs) : DASH,
+        foot: t(!timed.length ? 'timeNone' : busyMembers < members.length ? 'timePartial' : 'timeAll', { count: busyMembers, total: members.length }) },
+      { key: 'tools', tone: 'purple', label: t(partial ? 'toolsPartial' : 'tools'), value: completeTools ? t('calls', { count: tools.reduce((sum, n) => sum + n, 0) }) : DASH },
+    ],
+  }
+}
+
+export function sessionCostModel(payload, t = defaultTeamText) {
   if (payload === null || typeof payload !== 'object') return undefined
   const session = payload.session !== null && typeof payload.session === 'object' ? payload.session : {}
   const pricing = payload.pricing !== null && typeof payload.pricing === 'object' ? payload.pricing : {}
@@ -550,7 +613,7 @@ export function sessionCostModel(payload) {
   const totalTokens = maybeNumber(sessionTotals?.local)
   const timing = session.timing !== null && typeof session.timing === 'object' ? session.timing : {}
   const completedTurns = maybeNumber(session.completedTurns)
-  const modelMs = completedTurns !== undefined && completedTurns > 0 ? maybeNumber(session.completedTurnMs) : undefined
+  const modelMs = effectiveMsOf(session)
   const toolCalls = maybeNumber(session.toolCalls)
   const maxTurnMs = maybeNumber(session.maxCompletedTurnMs)
   const peakRequests = maybeNumber(sessionTotals?.peak?.requests)
@@ -601,36 +664,7 @@ export function sessionCostModel(payload) {
     },
   ]
 
-  // 团队：只在多成员时成立（宿主已保证 <2 位时为 null，这里再兜一层）。
-  //
-  // 注意 `team.cost` 是**费用对象**（`{standard, peak, idle, ifAllIdle, saved}`），
-  // 与 `entries[].cost` 同形，不是裸数字——早先按数字读会得到 NaN，界面上写「—」，
-  // 看起来像「团队没有数据」。这里两种形状都认（旧宿主可能给数字）。
-  const rawTeam = payload.team !== null && typeof payload.team === 'object' ? payload.team : undefined
-  const members = Array.isArray(rawTeam?.members) ? rawTeam.members : []
-  const teamCost = maybeNumber(rawTeam?.cost?.standard ?? rawTeam?.cost)
-  const team = rawTeam === undefined || members.length < 2
-    ? undefined
-    : {
-      cost: teamCost,
-      costText: teamCost === undefined ? DASH : formatCny(teamCost),
-      memberCount: members.length,
-      members: members.map((member) => {
-        const memberCost = maybeNumber(member?.cost?.standard ?? member?.cost)
-        return {
-          id: String(member?.id ?? member?.name ?? ''),
-          name: String(member?.name ?? member?.title ?? member?.id ?? '成员'),
-          role: String(member?.role ?? ''),
-          live: member?.live === true,
-          buckets: usageBuckets(member?.totals),
-          amount: memberCost,
-          amountText: memberCost === undefined ? DASH : formatCny(memberCost),
-          share: memberCost !== undefined && teamCost !== undefined && teamCost > 0
-            ? Math.min(1, memberCost / teamCost)
-            : undefined,
-        }
-      }),
-    }
+  const team = teamCostModel(payload.team, session.id, t)
 
   const unpriced = models.filter((row) => row.priced === false).map((row) => row.label)
   const noRate = models.filter((row) => row.priced === true && row.unitText === DASH).map((row) => row.label)
@@ -686,6 +720,7 @@ export function sessionCostModel(payload) {
     // 抬头：标题为空时给一句占位，而不是让抬头只剩一个金额
     title,
     titleText: title === '' ? '未命名会话' : title,
+    t, isSeeded: session.isSeeded === true,
     workspace,
     live: session.live === true,
     runtimeBadge: runtimeBadgeOf(session),
@@ -704,7 +739,7 @@ export function sessionCostModel(payload) {
     buckets: sessionBuckets,
     bucketRows,
     // 第一行的四枚 hero（估算金额 / 总 Token / 模型耗时 / 工具调用）
-    heroes,
+    heroes: team?.heroes ?? heroes,
     durationNote: modelMs === undefined ? undefined : `完成执行 ${completedTurns} 轮 · 原始用时 ${formatDurationMs(session.completedWallMs ?? 0)} · 有效平均每轮 ${formatDurationMs(avgTurnMs)}。已按问答工具区间近似排除等待。`,
     // 第二行左半：独立的步骤耗时诊断，不用它替代 Chat 的逐轮会话用时。
     timing,
@@ -781,7 +816,7 @@ function sumText(rows, field) {
 function Meter(props) {
   const { share, thin, tone } = props
   if (!Number.isFinite(share)) return null
-  const width = `${Math.round(Math.max(0, Math.min(1, share)) * 100)}%`
+  const width = `${Math.max(0, Math.min(1, share)) * 100}%`
   const className = thin === true ? 'px-sv-meter px-sv-meter-thin' : 'px-sv-meter'
   // `warn` 是状态红；其余 tone 是数据语义色；都没有时保持中性。
   const fill = tone === 'warn'
@@ -943,6 +978,45 @@ function ProviderList(props) {
   )
 }
 
+function TeamMembers({ team, t }) {
+  return h(PanelCard, { title: t('members'), note: t('memberCount', { count: team.members.length }), wide: true },
+    h('table', { className: 'px-sv-team-table', 'aria-label': t('members') },
+      h('thead', null, h('tr', null,
+        h('th', { scope: 'col' }, t('agent')),
+        h('th', { scope: 'col' }, t('estimatedCost')),
+        h('th', { scope: 'col', className: 'px-sv-share-col' }, t(team.partial ? 'shareLocal' : 'share')),
+        h('th', { scope: 'col' }, t('duration')))),
+      h('tbody', null, team.members.map((member) => h('tr', { key: member.id },
+        h('th', { scope: 'row' },
+          h('b', { className: 'px-sv-agent-name' }, member.name),
+          h('span', { className: 'px-sv-agent-role' }, member.roleLabel,
+            member.current ? h('span', { className: 'px-sv-tag px-sv-tag-accent' }, t('current')) : null)),
+        h('td', { className: 'px-sv-agent-cost' }, member.amountText,
+          member.shareText && h('small', { className: 'px-sv-share-inline' }, member.shareText)),
+        h('td', { className: 'px-sv-share-col' }, h('div', { className: 'px-sv-agent-share' },
+          h(Meter, { share: member.share, tone: 'accent' }),
+          h('span', null, member.shareText ?? DASH))),
+        h('td', null, member.durationText))))),
+    team.partial ? h('p', { className: 'px-sv-card-foot' }, t('externalNote'), ' ', t('localShareNote')) : null,
+    h('p', { className: 'px-sv-card-foot' }, t('timeNote')))
+}
+
+function SessionHeading({ model, teamOverview = false }) {
+  const { t } = model
+  const title = teamOverview ? model.team.title : model.titleText
+  const badge = teamOverview ? undefined : model.runtimeBadge
+  const scope = t(teamOverview ? 'overview' : model.team ? 'detail' : 'session')
+  return h('header', { className: 'px-sv-head' },
+    h('div', { className: 'px-sv-head-main' },
+      h('span', { className: 'px-sv-eyebrow' }, scope),
+      h('div', { className: 'px-sv-head-line' },
+        h('h2', { className: 'px-sv-title', title, 'aria-label': model.team ? t('heading', { scope, title }) : undefined }, title),
+        !teamOverview && model.workspace ? h('span', { className: 'px-sv-tag' }, model.workspace) : null,
+        badge ? h('span', { className: `px-sv-tag${badge.active ? ' px-sv-tag-live' : ''}`, title: badge.title }, badge.label) : null)),
+    h('span', { className: 'px-sv-hint' }, model.team && !teamOverview
+      ? t(model.isSeeded ? 'inheritedHint' : 'detailHint') : t('pricingHint')))
+}
+
 /**
  * 面板本体（**纯展示**）。
  *
@@ -970,39 +1044,14 @@ export function SessionCostPanel(props) {
 
   return h(
     'section',
-    { className: 'px-sv', 'aria-label': '本次会话费用', 'data-px-sv': 'ready' },
-    // ── 抬头：只回答「这是哪条会话」─────────────────────────────
-    // 金额已经从抬头的 34px 大数字挪进下面第一行的 hero 卡（带左侧色条）。
-    // 挪的理由是「同一个数字不该在一页里出现两次」：抬头一个大金额 + hero 里一枚
-    // 估算金额，读者会开始怀疑哪个才是总数。抬头因此回归成一条页眉。
-    h(
-      'header',
-      { className: 'px-sv-head' },
-      h(
-        'div',
-        { className: 'px-sv-head-main' },
-        h('span', { className: 'px-sv-eyebrow' }, '本次会话费用'),
-        h(
-          'div',
-          { className: 'px-sv-head-line' },
-          h('h2', { className: 'px-sv-title', title: model.titleText }, model.titleText),
-          model.workspace === '' ? null : h('span', { className: 'px-sv-tag' }, model.workspace),
-          model.runtimeBadge ? h('span', { className: `px-sv-tag${model.runtimeBadge.active ? ' px-sv-tag-live' : ''}`, title: model.runtimeBadge.title }, model.runtimeBadge.label) : null,
-        ),
-      ),
-      h('span', { className: 'px-sv-hint' }, '已按每条请求的发生时段分档计价'),
-    ),
+    { className: 'px-sv', 'aria-label': model.t(model.team ? 'teamRegion' : 'session'), 'data-px-team': model.team ? true : undefined, 'data-px-sv': 'ready' },
+    h(SessionHeading, { model, teamOverview: !!model.team }),
 
     // 后台刷新失败时不清空已读到的数字：留着旧数据，只加一行说明。
     staleError === undefined || staleError === ''
       ? null
       : h('p', { className: 'px-sv-stale', role: 'status' },
         `刷新失败，显示的是上一次读到的数据（${staleError}）。`),
-
-    // ── 空态：有会话但没有任何计费记录 ───────────────────────────
-    model.empty === true
-      ? h('p', { className: 'px-sv-empty' }, '这条会话还没有产生任何计费用量：发一条消息之后这里就会有数字。')
-      : null,
 
     // ── 第一行：三枚 hero（+ 工具调用），照「图二」的规格 ───────────
     // 这是用户点名要回来的东西：彩色左边条 + 大号数字 + 一行脚注。
@@ -1014,6 +1063,10 @@ export function SessionCostPanel(props) {
         value: hero.value,
         foot: hero.foot,
       }))),
+    model.team ? h(TeamMembers, { team: model.team, t: model.t }) : null,
+    model.team ? h(SessionHeading, { model }) : null,
+    model.empty === true
+      ? h('p', { className: 'px-sv-empty' }, model.t('empty')) : null,
     model.durationNote ? h('p', { className: 'px-sv-hint px-sv-duration-note' }, model.durationNote) : null,
 
     // ── 第二行：耗时构成 + 计价时段 + 用量构成（并排）───────────────
@@ -1201,28 +1254,6 @@ export function SessionCostPanel(props) {
       ),
     ),
 
-    // ── 团队（多成员时才有）────────────────────────────────────
-    model.team === undefined ? null : h(
-      PanelCard,
-      {
-        title: `团队成员（${model.team.memberCount} 位）`,
-        // 团队合计与本次会话合计是两笔账，附注里明写「团队合计」，避免被读成同一个数。
-        note: `团队合计 ${model.team.costText}`,
-        wide: true,
-      },
-      h('ul', { className: 'px-sv-members' }, model.team.members.map((member) => h(
-        'li',
-        { key: member.id, className: 'px-sv-member' },
-        h('span', { className: 'px-sv-member-name' }, member.name,
-          // 徽标写「负责人」而不是 role 的原值 lead：成员名本身常常就叫 lead，
-          // 两处同字会读成重复。
-          member.role === 'lead' ? h('span', { className: 'px-sv-tag' }, '负责人') : null),
-        h(Meter, { share: member.share, thin: true, tone: 'accent' }),
-        h('b', { className: 'px-sv-num px-sv-member-value' }, member.amountText),
-      ))),
-      h('p', { className: 'px-sv-card-foot' }, '团队口径是给「一支团队一起花了多少」用的，本会话自己的金额在上方。'),
-    ),
-
     // ── 脚注：只在数字需要打折扣时才出现 ────────────────────────
     model.notes.length === 0
       ? null
@@ -1397,7 +1428,12 @@ export function SessionCostView(props) {
   }, [sessionId])
 
   const payload = injected !== undefined ? injected : state.data
-  const dataModel = useMemo(() => sessionCostModel(payload), [payload])
+  const localeService = props?.localeService
+  const subscribeLocale = useCallback((listener) => localeService?.subscribe?.(listener) ?? (() => {}), [localeService])
+  const getLocale = useCallback(() => localeService?.getSnapshot?.()?.active ?? 'zh', [localeService])
+  const locale = React.useSyncExternalStore(subscribeLocale, getLocale, getLocale)
+  const t = props?.sessionText ?? defaultTeamText
+  const dataModel = useMemo(() => sessionCostModel(payload, t), [payload, t, locale])
   const model = useMemo(() => {
     if (!dataModel || !hasStatusHook) return dataModel
     // An available native source is authoritative even before it has a baseline.

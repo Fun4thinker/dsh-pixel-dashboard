@@ -59,4 +59,43 @@ check('an available but uninitialized native status never resurrects cached runn
   assert.ok(!html.includes('运行中'),'unknown native status fell back to cached running')
  }
 })
+check('team fee tab headlines include lead and worker, not just the selected session',()=>{
+ const lead={id:'a',name:'lead',role:'lead',cost:{standard:2},completedTurns:1,completedTurnMs:2000,toolCalls:2}
+ const worker={id:'b',name:'researcher',role:'teammate',cost:{standard:3},completedTurns:1,completedTurnMs:3000,toolCalls:5}
+ // 并行重叠：成员各自 2s/3s，但两人同时开工，团队只过了 3s。
+ const team={leadId:'a',members:[lead,worker],cost:{standard:5},totals:{local:5000,requests:4},busyMs:3000,busyMembers:2}
+ for(const session of [lead,worker]){
+  const model=sessionCostModel({session,entries:[{cost:session.cost}],team})
+  assert.equal(model.heroes.find(hero=>hero.key==='cost')?.value,'¥5.00')
+  // 用时取并集（3s），不是 2s+3s=5s：并行重叠只算一次。
+  assert.deepEqual(model.heroes.map(hero=>hero.value),['¥5.00','5.0K','3s','7 次'])
+  const html=renderToStaticMarkup(React.createElement(SessionCostView,{sessionId:session.id,data:{session,entries:[{cost:session.cost}],team}}))
+  const start=html.indexOf('成员费用明细'), end=html.indexOf('当前会话明细')
+  assert.ok(start>0 && end>start && html.indexOf('¥5.00')<start)
+  const rows=html.slice(start,end).match(/<tbody>(.*?)<\/tbody>/s)?.[1].match(/<tr>.*?<\/tr>/gs)
+  assert.equal(rows?.length,2)
+  for(const [i,m] of [lead,worker].entries()){
+   assert.ok(rows[i].includes(m.name) && rows[i].includes(i?'¥3.00':'¥2.00') && rows[i].includes(i?'3s':'2s'))
+   assert.equal(rows[i].includes('当前会话'),m.id===session.id)
+  }
+  assert.equal(model.modelsTotal,session.cost.standard,'model detail remains session scoped')
+ }
+})
+check('partial or legacy timing is distinct from measured zero, including external-only delegation',()=>{
+ const lead={id:'l',name:'lead',role:'lead',completedTurns:1,completedTurnMs:0,cost:{standard:0},toolCalls:0}
+ const external={id:'e',name:'external-reviewer'}
+ const team={members:[lead],unmeteredMembers:[external],cost:lead.cost,totals:{local:0},busyMs:0,busyMembers:1}
+ const model=sessionCostModel({session:lead,team})
+ assert.deepEqual(model.heroes.map(hero=>hero.value),['¥0','0','0s','0 次'])
+ const html=renderToStaticMarkup(React.createElement(SessionCostPanel,{model}))
+ assert.ok(html.includes('已计入 1/2') && html.includes('仅 1/2 位成员有计时'))
+ assert.ok(html.includes('external-reviewer') && html.includes('未提供') && html.includes('本地费用占比'))
+ const legacy=sessionCostModel({session:lead,team:{leadId:'l',cost:lead.cost,totals:{local:0},members:[{id:'l'},{id:'w'}]}})
+ assert.equal(legacy.heroes.find(hero=>hero.key==='timing').value,'—')
+ assert.equal(legacy.heroes.find(hero=>hero.key==='tools').value,'—')
+ assert.equal(legacy.team.members[1].amountText,'—')
+ const solo=sessionCostModel({session:lead,entries:[{cost:lead.cost}],team:{members:[lead]}})
+ assert.equal(solo.team,undefined)
+ assert.equal(solo.heroes[0].label,'估算金额')
+})
 console.log(`\n${passed} metric semantic checks passed (${source})`)

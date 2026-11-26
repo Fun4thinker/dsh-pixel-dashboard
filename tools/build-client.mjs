@@ -58,6 +58,7 @@ const MODULES = [
   // 与看板整页（dashboard.js）不共享任何内部状态。
   'priceSettings.js',
   'accountPanel.js',
+  'sessionTeamLocale.js',
   'sessionView.js',
   // 「图二」的会话详情视图（hero 卡 / 耗时堆叠条 / 明细行）从看板里抽出来，
   // 会话标签页的费用页也用它 —— 两处共用一份视觉实现，避免各自漂移。

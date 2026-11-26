@@ -441,8 +441,7 @@ export const SESSION_CSS = `
 /* 原来是一排「日期 / 大号金额 / token 数」，三列都重。改成一根按最大值归一化的
    细条之后，哪天最贵一眼就看出来，金额仍然在，token 数收掉了（它与金额重复表达
    同一件事，而这一格只有半栏宽）。 */
-.px-sv-days,
-.px-sv-members {
+.px-sv-days {
   margin: 0;
   padding: 0;
   list-style: none;
@@ -525,26 +524,36 @@ export const SESSION_CSS = `
 }
 
 /* ── 团队成员 ─────────────────────────────────────────────────── */
-.px-sv-member {
-  display: grid;
-  grid-template-columns: minmax(6em, 1fr) minmax(48px, 1.2fr) auto;
-  align-items: center;
-  gap: 12px;
+.px-sv-team-table {
+  width: 100%; border-collapse: collapse; table-layout: fixed;
+  font-variant-numeric: tabular-nums;
 }
-.px-sv-member-name {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
+.px-sv-team-table th, .px-sv-team-table td { padding: 10px 6px; text-align: right; }
+.px-sv-team-table tr > :first-child { width: 35%; padding-left: 0; text-align: left; }
+.px-sv-team-table tr > :last-child { padding-right: 0; }
+.px-sv-team-table thead th { color: var(--px-detail-label); font-size: 11px; font-weight: 500; }
+.px-sv-team-table tbody tr { border-top: 1px solid var(--px-line); }
+.px-sv-agent-name { display: block; overflow-wrap: anywhere; font-size: 13px; }
+.px-sv-agent-role { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; margin-top: 2px; color: var(--px-detail-label); font-size: 11px; font-weight: 400; }
+.px-sv-agent-role .px-sv-tag { height: auto; padding: 0 6px; }
+.px-sv-agent-cost { color: var(--px-ink); font-weight: 650; overflow-wrap: anywhere; }
+.px-sv-agent-share { display: flex; justify-content: flex-end; align-items: center; gap: 8px; color: var(--px-detail-label); font-size: 11px; }
+.px-sv-agent-share .px-sv-meter { flex: 1 1 48px; max-width: 104px; }
+.px-sv-agent-share > :last-child { min-width: 4em; }
+.px-sv-share-inline { display: none; color: var(--px-detail-label); font-weight: normal; }
+.px-sv[data-px-team] { container-type: inline-size; }
+.px-sv[data-px-team] .px-hero-label, .px-sv[data-px-team] .px-hero-foot { white-space: normal; color: var(--px-detail-label); }
+.px-sv[data-px-team] .px-hero-value { overflow-wrap: anywhere; }
+@container (max-width: 640px) {
+  .px-sv-heroes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-.px-sv-member-value {
-  font-size: 12px;
-  font-weight: 600;
-  text-align: right;
+@container (max-width: 440px) {
+  .px-sv-share-col { display: none; }
+  .px-sv-share-inline { display: block; }
+  .px-sv-team-table tr > :first-child { width: 42%; }
+}
+@container (max-width: 240px) {
+  .px-sv-heroes { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* ── 脚注：只在数字需要打折扣时出现 ───────────────────────────── */
@@ -690,8 +699,8 @@ export const SESSION_CSS = `
   .px-sv-table th,
   .px-sv-table td { padding: 8px 4px; }
   .px-sv-day { grid-template-columns: 2.6em minmax(28px, 1fr) auto; gap: 8px; }
-  .px-sv-member { grid-template-columns: minmax(4em, 1fr) auto; }
-  .px-sv-member .px-sv-meter { display: none; }
+  .px-sv-team-table th, .px-sv-team-table td { padding: 8px 3px; }
+  .px-sv-agent-share .px-sv-meter { display: none; }
   .px-sv-state { padding: 32px 18px; }
   .px-sv-figure-value { font-size: 16px; }
 }

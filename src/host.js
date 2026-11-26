@@ -241,7 +241,7 @@ const AGENT_FACT_LIMIT = 500
  * 旧缓存挡住——读出来的对象没有新字段，界面显示成空或 0，而且不报错。
  * 这个坑已经踩过一次（加 timing 时，用户看到「模型耗时 —」）。
  */
-const CACHE_SCHEMA = 6
+const CACHE_SCHEMA = 7
 
 /**
  * 磁盘快照（整份看板数据 + 逐会话明细）的格式版本。
@@ -325,10 +325,8 @@ function addUsage(acc, usage, peak) {
  *
  * ## 顺带抽取的两样「团队」事实
  *
- * - **本会话自己声明的成员**（`team/member` 事件，只在 Lead 日志里）：给出
- *   `teammate id → 名字` 这张表。这是**唯一**可信的名字来源——子会话的
- *   `subagent/descriptor.label` 存的是 spawn 时的 `description`（一句职责说明），
- *   不是团队里那个稳定、不可复用的 `name`。两者都收，名字优先取这张表。
+ * - **父会话自己声明的成员**：当前 `subagent/catalog` 或旧 `team/member`。
+ *   `name` 是成员名；`label` 是职责描述。只取本会话自有后缀，不认 fork 复制的名册。
  * - **本会话作为子代理时的描述**（`subagent/descriptor`）：只作名字缺失时的回落。
  *
  * 两样都只有几十字节，与「绝不缓存原始事件」不冲突（见上面那段内存账）。
@@ -368,11 +366,8 @@ async function readSession(persistence, id, timeZone) {
   /** 最新的 `session/title` 文本（last-wins）。 */
   let title = ''
   /**
-   * 本会话**作为 Lead** 声明过的团队成员：`[{ id, name, phase }]`。
-   *
-   * 同一成员会在每次生命周期变化时再写一条整体快照（provisioning → active /
-   * failed），因此按 id 覆盖成 last-wins，而不是追加——否则一个成员会变成两行。
-   * @type {Map<string, {id:string,name:string,phase:string}>}
+   * 本会话直接登记的成员。旧 team/member 可重复登记生命周期；按 id 去重。
+   * @type {Map<string, {id:string,name:string,phase?:string,label?:string,external?:boolean}>}
    */
   const members = new Map()
   /**
@@ -455,7 +450,7 @@ async function readSession(persistence, id, timeZone) {
         }
         // 团队名册（只在 Lead 的日志里）：整体快照，按成员 id last-wins。
         // 认不出形状就跳过那一条，绝不把已有名册清空——与标题同一条原则。
-        if (event?.type === 'team/member') {
+        if (own && event?.type === 'team/member' && (event.data?.teamId === undefined || event.data.teamId === id)) {
           const member = event.data?.member
           const memberId = typeof member?.id === 'string' ? member.id : ''
           const name = typeof member?.name === 'string' ? member.name : ''
@@ -467,8 +462,18 @@ async function readSession(persistence, id, timeZone) {
             })
           }
         }
+        if (own && event?.type === 'subagent/catalog') {
+          const { childId, name, label, mode } = event.data ?? {}
+          // External activations have no local child Session. Older local catalogs lack a name.
+          if (typeof childId === 'string' && childId && ['continuable', 'one-shot', 'unknown', 'external'].includes(mode)) {
+            const previous = members.get(childId)
+            members.set(childId, { ...previous, id: childId,
+              name: typeof name === 'string' && name.trim() ? name.trim() : previous?.name ?? '',
+              ...(typeof label === 'string' && label.trim() ? { label: label.trim() } : {}), external: mode === 'external' })
+          }
+        }
         // 子代理描述：团队 spawn 时存的是 description，只作名字回落。
-        if (event?.type === 'subagent/descriptor') {
+        if (own && event?.type === 'subagent/descriptor') {
           const next = event.data?.label
           if (typeof next === 'string' && next.trim() !== '') label = next.trim()
         }
@@ -670,7 +675,7 @@ function sessionCost(byModel) {
 /**
  * 把一个会话解析成「团队里的一员」。
  *
- * ## 判据只用会话头的**持久**字段，不猜
+ * ## 优先会话头的持久字段；旧头缺 origin 时，仅接受直接父会话自有名册的佐证
  *
  * | 字段 | 含义 | 来源 |
  * |---|---|---|
@@ -687,45 +692,35 @@ function sessionCost(byModel) {
  *
  * teammate 自己**也可以再派子代理**。因此归属要一路向上走到没有父会话的那个
  * 根，而不是只看直接父。走链时有两条保护：
- *   - **必须有界**：`delegationDepth` 与访问集合双保险，防止日志里的环（或
- *     伪造数据）把扫描拖成死循环。
+ *   - **必须有界**：只访问已知父节点，每个节点至多一次。遇环就保持独立，不猜根。
  *   - **父会话不在本机存储里时，把已知的最高祖先当根**，并标记 `detached`。
  *     那种情况是「父会话已被删除」——链断了，但仍然要把这段用量归到某个团队，
  *     否则它会从团队合计里凭空消失。
  * @param {{id:string,header:object}} session - 会话元信息（含持久 header）。
- * @param {Map<string, {id:string,header:object}>} byId - 本次扫描的全部会话。
+ * @param {Map<string, {id:string,header:object,roster:Map}>} byId - 本次扫描的会话及各自的本地成员名册。
  * @returns {{teamId:string,role:'lead'|'teammate',depth:number,parent:string,detached:boolean}} 归属。
  */
 function teamPlacementOf(session, byId) {
-  const header = session.header ?? {}
-  const parent = typeof header.parentSession === 'string' ? header.parentSession : ''
-  const depth = Number.isSafeInteger(header.delegationDepth) ? header.delegationDepth : 0
-  // 没有父会话 = 自己就是一个根 ⇒ 它是一个独立的团队（哪怕它是子代理——
-  // 见函数说明：那种情况下宁可当独立根，也不猜一个父）。
-  if (parent === '') {
-    return { teamId: session.id, role: 'lead', depth: 0, parent: '', detached: false }
-  }
-  let currentId = parent
-  let root = parent
-  let detached = false
+  const standalone = { teamId: session.id, role: 'lead', depth: 0, parent: '', detached: false }
   const seen = new Set([session.id])
-  // 有界推进：真实深度是个位数量级，64 段足够，且能挡住环。
-  for (let hop = 0; hop < 64; hop += 1) {
-    if (currentId === '' || seen.has(currentId)) break
-    seen.add(currentId)
-    root = currentId
-    const next = byId.get(currentId)
-    if (next === undefined) {
-      // 父会话不在本机（已删除 / 来自别的机器）：链到此为止，以已知的最高祖先为根。
-      detached = true
-      break
-    }
-    const nextHeader = next.header ?? {}
-    const grandParent = typeof nextHeader.parentSession === 'string' ? nextHeader.parentSession : ''
-    if (grandParent === '') break
-    currentId = grandParent
+  let root = session.id, current = session
+  while (current !== undefined) {
+    const { parentSession: parent, origin } = current.header
+    if (typeof parent !== 'string' || !parent) break
+    const creator = byId.get(parent)
+    // Historical ordinary forks can name their source as parent; check *every* edge.
+    if (origin !== 'subagent' && !(origin === undefined && creator?.roster.has(root))) break
+    if (seen.has(parent)) return standalone // broken cycle: no authoritative root
+    seen.add(parent)
+    root = parent
+    current = creator
   }
-  return { teamId: root, role: 'teammate', depth, parent, detached }
+  if (root === session.id) return standalone
+  const depth = session.header.delegationDepth
+  return {
+    teamId: root, role: 'teammate', depth: Number.isSafeInteger(depth) && depth > 0 ? depth : seen.size - 1,
+    parent: session.header.parentSession, detached: current === undefined,
+  }
 }
 
 /**
@@ -752,6 +747,43 @@ function teamPlacementOf(session, byId) {
  * @param {object[]} members - 该团队的成员（含 lead）会话行。
  * @returns {{totals:object,cost:object}} 汇总。
  */
+/**
+ * 把多条会话的有效处理区间合并成一段并集，累加重叠只算一次。
+ *
+ * 这是「团队一起干活用了多久」的唯一正确算法：并行成员的区间重叠时，
+ * 用户等待的墙钟只有一份，把各自时长相加会凭空翻倍。
+ * @param {Array<Array<[number, number]>>} groups - 每个成员一组区间。
+ * @returns {{ms:number, coveredMembers:number}} 并集总时长与有区间的成员数。
+ */
+function unionBusyMs(groups) {
+  const spans = []
+  let coveredMembers = 0
+  for (const group of groups) {
+    if (!Array.isArray(group) || group.length === 0) continue
+    coveredMembers += 1
+    for (const span of group) {
+      if (!Array.isArray(span)) continue
+      const [start, end] = span
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start) spans.push([start, end])
+    }
+  }
+  spans.sort((a, b) => a[0] - b[0])
+  let total = 0
+  let current = null
+  for (const [start, end] of spans) {
+    if (current === null) {
+      current = [start, end]
+    } else if (start <= current[1]) {
+      if (end > current[1]) current[1] = end
+    } else {
+      total += current[1] - current[0]
+      current = [start, end]
+    }
+  }
+  if (current !== null) total += current[1] - current[0]
+  return { ms: total, coveredMembers }
+}
+
 function summarizeTeam(members) {
   const round = (value) => Math.round(value * 1e6) / 1e6
   let standard = 0
@@ -1383,22 +1415,22 @@ export class UsageCatalog {
     }
 
     // 团队口径：只有**真的多成员**的团队才给（单人会话在界面上不该变成「团队」）。
-    const teamRow = (data.teams ?? []).find((team) => team.id === session.teamId)
-    const team = teamRow !== undefined && Number(teamRow.memberCount ?? 0) >= 2
+    const teamRow = (data.teams ?? []).find((team) => team.id === session.teamId) ?? detail.team
+    const unmeteredMembers = teamRow?.unmeteredMembers ?? []
+    const memberCount = Number(teamRow?.memberCount ?? 0) + unmeteredMembers.length
+    const team = teamRow !== undefined && memberCount >= 2
       ? {
         id: teamRow.id,
         title: teamRow.title,
-        memberCount: teamRow.memberCount,
+        memberCount,
+        unmeteredMembers,
         cost: teamRow.cost,
         totals: teamRow.totals,
+        busyMs: teamRow.busyMs,
+        busyMembers: teamRow.busyMembers,
         members: (teamRow.members ?? []).map((member) => ({
-          id: member.id,
-          name: member.name,
-          role: member.role,
-          live: member.live === true,
+          ...member,
           ...this.runtimeOf(member.id),
-          totals: member.totals,
-          cost: member.cost,
         })),
       }
       : null
@@ -1508,25 +1540,18 @@ export class UsageCatalog {
     const records = []
     /** @type {object[]} */
     const sessions = []
-    /**
-     * 本轮扫描到的全部会话元信息（id → `{ id, header }`），供团队归属向上走链。
-     *
-     * 单列一张表而不是复用 `sessions[]`：归属计算发生在行构造**之前**，而
-     * `sessions[]` 的行是按显示顺序排的、字段也已经被加工过。
-     * @type {Map<string, {id:string,header:object}>}
-     */
+    /** 原始头与直接成员名册留到扫描完再解析；子会话可能先于其父会话列出。 */
     const byId = new Map()
+    /**
+     * 每条会话的有效处理区间（毫秒区间对），只在内存里供团队合计做并集。
+     * 声明放在会话扫描之前：写入发生在扫描循环里（见 busyIntervals.set）。
+     * @type {Map<string, Array<[number, number]>>}
+     */
+    const busyIntervals = new Map()
 
-    // 第一遍：会话元信息 + 团队归属。归属要「向上走链」，因此必须先把本条
-    // 会话的父会话也收齐，而不能边遍历边判（父会话可能排在子会话之后）。
     const visits = snapshots
       .map((snapshot) => ({ snapshot, header: snapshot.header ?? {} }))
       .filter((item) => String(item.header.id ?? '') !== '')
-    for (const { header } of visits) {
-      const id = String(header.id)
-      byId.set(id, { id, header })
-    }
-
     for (const { snapshot, header } of visits) {
       const id = String(header.id)
       const timezone = this.timezone()
@@ -1562,8 +1587,18 @@ export class UsageCatalog {
       for (const record of derived.records) records.push(withRouteOf(record, directory))
 
       const cwd = typeof header.cwd === 'string' ? header.cwd : ''
-      const placement = teamPlacementOf({ id, header }, byId)
+      byId.set(id, { id, header, roster: new Map(derived.members.filter((member) => !member.external).map((member) => [member.id, member])) })
       const completed = completedExecutionTurns(derived.review ?? {}, now).filter((turn) => turn.durationMs !== null)
+      /**
+       * 该会话**真正在处理**的时间区间（并集用），供团队合计。
+       *
+       * 区间取 `[start, start + durationMs]`：`durationMs` 已经扣掉等待用户答复的
+       * 部分，因此长度是「有效处理」而不是墙钟。并行成员的区间在合计时会合并，
+       * 重叠只算一次——两个各跑 5 分钟的成员，用户只等了 5 分钟，不是 10 分钟。
+       * 只留在内存里参与聚合，不进 `/data`。
+       * @type {Array<[number, number]>}
+       */
+      busyIntervals.set(id, completed.map((turn) => [turn.start, turn.start + turn.durationMs]))
       sessions.push({
         id,
         // 成员名/职责默认空串而不是缺字段：客户端会读它们决定徽标文案，
@@ -1577,7 +1612,7 @@ export class UsageCatalog {
         // 一行十六进制 id 换成用户认得出的那一句话。
         title: displayTitleOf(derived.title, cwd, id),
         agentPreset: typeof header.agentPreset === 'string' ? header.agentPreset : '',
-        isSeeded: header.isSeeded === true,
+        isSeeded: header.isSeeded === true || derived.review?.inheritedEventCount > 0,
         turns: derived.turns,
         // ── 用量视角的时间维度 ──────────────────────────────────────
         //
@@ -1614,15 +1649,6 @@ export class UsageCatalog {
         days: sessionDays,
         live: this.sessions?.()?.get?.(id) !== undefined, // loaded presence only (legacy field)
         ...this.runtimeOf(id),
-        // 团队归属：`lead` 是团队根，`teammate` 归到 `teamId` 名下。
-        // 缺这两个字段的就是旧宿主（客户端据此退回单会话口径，见 capabilities 的 agentTeam）。
-        teamId: placement.teamId,
-        role: placement.role,
-        // 深度 > 1 的成员是「teammate 自己再派的子代理」——它仍算该团队的一部分，
-        // 但界面上要说清它离 lead 有多远，否则会与直接成员混成一排。
-        depth: placement.depth,
-        // 父会话已被删除 / 不在本机：链断了，但仍然归到已知的最高祖先。
-        ...(placement.detached ? { detached: true } : {}),
       })
     }
 
@@ -1638,32 +1664,17 @@ export class UsageCatalog {
     // 放在循环之后统一写一次，避免 300 个会话产生 300 次小写入。
     this.scheduleCacheSave()
 
-    /**
-     * 名册：`teammate id → 团队里的名字`。
-     *
-     * **只有 Lead 的日志里有 `team/member`**（见 readSession），因此这里按
-     * `derived.members` 逐条铺开。名字缺失时退回子会话的 `subagent/descriptor.label`
-     * 再退回 id 片段——三层回落，但**绝不猜**一个名字出来。
-     * @type {Map<string, {name:string,phase:string}>}
-     */
-    const roster = new Map()
-    for (const session of visits) {
-      const id = String(session.header.id)
-      const derived = this.cache.get(id)
-      for (const member of derived?.members ?? []) {
-        roster.set(member.id, { name: member.name, phase: member.phase })
-      }
-    }
+    // Resolve after reading all creator-owned rosters: list() promises no order.
     for (const row of sessions) {
+      const { parent, detached, ...placement } = teamPlacementOf(byId.get(row.id), byId)
+      Object.assign(row, placement)
+      if (detached) row.detached = true
       if (row.role !== 'teammate') continue
-      const known = roster.get(row.id)
-      const derived = this.cache.get(row.id)
-      row.memberName = known?.name ?? ''
-      // 名册上的生命周期（provisioning / active / failed）只在**名册有它**时才有意义；
-      // 普通子代理不在任何团队里，因此留空而不是编一个 phase。
-      if (known !== undefined) row.memberPhase = known.phase
-      // 一句话职责（spawn 时的 description）——与 name 不是一回事，单独一个字段。
-      if (typeof derived?.label === 'string' && derived.label !== '') row.memberLabel = derived.label
+      const member = byId.get(parent)?.roster.get(row.id)
+      row.memberName = member?.name ?? ''
+      if (member?.phase !== undefined) row.memberPhase = member.phase
+      const label = this.cache.get(row.id)?.label || member?.label
+      if (label) row.memberLabel = label
     }
 
     // 账本不可用时（路径都推不出）退化为只统计本机日志，而不是整块失败
@@ -1688,6 +1699,8 @@ export class UsageCatalog {
       this.ledger.dropped = 0
     }
     const merged = this.ledger === undefined ? records : this.ledger.records
+    // collect() 收集、build() 汇总：区间只在内存里传递，不随 /data 序列化。
+    this.busyIntervals = busyIntervals
     return { records: merged, sessions, ledger, directory }
   }
 
@@ -1727,6 +1740,13 @@ export class UsageCatalog {
     const modelMeta = new Map()
     /** @type {Map<string, object>} */
     const bySession = new Map()
+    // The existing session/ledger detail includes fork history. For seeded members only,
+    // also accumulate owned usage at the exact read-handle cut (not provider evidence v).
+    const ownedUsage = new Map()
+    for (const { id } of sessions) {
+      const cut = this.cache.get(id)?.review?.inheritedEventCount
+      if (cut > 0) ownedUsage.set(id, { cut, byModel: {} })
+    }
     /**
      * 单会话的逐模型 / 逐日用量：**只给会话标签页那条路由**用，不进 `/data`。
      *
@@ -1791,6 +1811,10 @@ export class UsageCatalog {
       modelMeta.set(model, meta)
 
       addUsage((modelTotals[model] ??= emptyUsage()), usage, peak)
+      const owned = ownedUsage.get(sessionId)
+      if (owned && Number(record.k.slice(sessionId.length + 1)) >= owned.cut) {
+        addUsage((owned.byModel[model] ??= emptyUsage()), usage, peak)
+      }
 
       const sessionAcc = bySession.get(sessionId)
         ?? { totals: emptyUsage(), byModel: {}, days: new Set(), byDay: {} }
@@ -2035,11 +2059,28 @@ export class UsageCatalog {
       })
       const out = []
       for (const [teamId, list] of groups) {
-        if (list.length < 2) continue
-        const members = orderMembers(list)
+        // External catalog entries have no child log or measurable usage. Retain their
+        // identity for coverage, but never feed them to summarizeTeam or the ledger.
+        const external = new Map()
+        const meteredIds = new Set(list.map((row) => row.id))
+        for (const creator of list) {
+          for (const child of this.cache.get(creator.id)?.members ?? []) {
+            if (!child.external || meteredIds.has(child.id)) continue
+            external.set(child.id, { id: child.id, name: child.name || child.label || child.id,
+              role: 'teammate', depth: creator.depth + 1, parentId: creator.id })
+          }
+        }
+        if (list.length < 2 && !external.size) continue
+        const members = orderMembers(list.map((row) => {
+          const owned = ownedUsage.get(row.id)
+          return owned ? { ...row, totals: roundUsage(sumUsageOf(owned.byModel)), cost: sessionCost(owned.byModel) } : row
+        }))
         const lead = members.find((member) => member.role === 'lead')
         const summary = summarizeTeam(members)
-        out.push({
+        // 团队用时 = 各成员有效处理区间的并集（并行重叠只算一次）。
+        // 成员各自的时长仍按 member.completedTurnMs 给出，两者不可相加替代。
+        const busy = unionBusyMs(members.map((member) => this.busyIntervals?.get(member.id)))
+        const teamRow = {
           id: teamId,
           // 团队本身没有名字（DSH 的团队是隐式根，只有成员有名字），
           // 因此用 lead 的标题当团队标题——那正是用户在侧栏认得出的那一句话。
@@ -2049,6 +2090,8 @@ export class UsageCatalog {
           memberCount: members.length,
           totals: summary.totals,
           cost: summary.cost,
+          busyMs: busy.ms,
+          busyMembers: busy.coveredMembers,
           members: members.map((member) => ({
             id: member.id,
             title: member.title,
@@ -2063,11 +2106,17 @@ export class UsageCatalog {
             ...(member.detached === true ? { detached: true } : {}),
             ...(member.memberPhase === undefined ? {} : { phase: member.memberPhase }),
             turns: member.turns,
+            completedTurns: member.completedTurns,
+            completedTurnMs: member.completedTurnMs,
+            toolCalls: member.toolCalls,
             tokens: Number(member.totals?.local ?? 0),
             totals: member.totals,
             cost: member.cost,
           })),
-        })
+        }
+        if (external.size) teamRow.unmeteredMembers = [...external.values()]
+        if (members.length > 1) out.push(teamRow)
+        else sessionDetails.get(members[0].id).team = teamRow // detail-only: no external-only row in the financial dashboard
       }
       return out.sort((a, b) => Number(b.cost?.standard ?? 0) - Number(a.cost?.standard ?? 0))
     })()

@@ -30,15 +30,22 @@ function review(overrides = {}) {
 }
 function persistenceOf(fixtures, { failOpen = false, failRead = false, failList = false } = {}) {
   let reads = 0
+  const headerOf = ({ id, cwd, parentSession, origin, delegationDepth, isSeeded, inheritedEventCount }) => ({
+    id, cwd, createdAt: 0, version: 4, parentSession, origin, delegationDepth, isSeeded: isSeeded ?? (inheritedEventCount > 0),
+  })
   return {
     get reads() { return reads },
-    async list() { if (failList) throw new Error('list exploded'); return fixtures.map(({ id, cwd, events, parentSession, origin, delegationDepth }) => ({ header: { id, cwd, createdAt: 0, parentSession, origin, delegationDepth }, revision: '1', eventCount: events.length })) },
-    async open(id) {
+    async list() {
+      if (failList) throw new Error('list exploded')
+      return fixtures.map((row) => ({ header: headerOf(row), revision: '1', eventCount: row.events.length }))
+    },
+    async open(id, access) {
+      assert.equal(access, 'read')
       if (failOpen) throw new Error('open exploded')
       const fixture = fixtures.find((row) => row.id === id)
       return {
-        inheritedEventCount: fixture.inheritedEventCount ?? 0,
-        async read(offset, length) { reads += 1; if (failRead) throw new Error('read exploded'); return { events: fixture.events.slice(offset, offset + length) } },
+        id, access, header: headerOf(fixture), inheritedEventCount: fixture.inheritedEventCount ?? 0,
+        async read(offset, length) { reads += 1; if (failRead) throw new Error('read exploded'); return { eventState: 'detached', events: fixture.events.slice(offset, offset + length) } },
         async close() {},
       }
     },
@@ -509,6 +516,151 @@ await check('review requests and money equal current 7-day ledger/day aggregatio
   assert.equal(defaults.range.days, 30)
   setMarkup({})
 })
+// Exercise the actual JSON route with a synthetic persistence backend and isolated storage.
+async function withSessionRoute(fixtures, run) {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-review-test-'))
+  dirs.push(dir)
+  const paths = { DSH_PIXEL_LEDGER: 'ledger.jsonl', DSH_PIXEL_RATES: 'rates.json', DSH_PIXEL_BALANCE_PREFS: 'prefs.json' }
+  const original = Object.fromEntries(Object.keys(paths).map((key) => [key, process.env[key]]))
+  const persistence = persistenceOf(fixtures.map((row) => ({ ...row, events: row.events.map((e, seq) => ({ ...e, seq })) })))
+  const routes = new Map(), disposers = [], clock = Date.now
+  try {
+    Date.now = () => now
+    for (const [key, file] of Object.entries(paths)) process.env[key] = join(dir, file)
+    plugin.apply({
+      get: (name) => name === 'sessionPersistence' ? persistence : undefined,
+      webServer: { register(route) { routes.set(route.path, route); return () => {} } },
+      effect(fn) { disposers.push(fn()) }, on() { return () => {} },
+    })
+    const route = routes.get('/dsh-pixel/session')
+    assert.equal(route.kind, 'exact')
+    await run(async (id) => {
+      const res = { setHeader() {}, end(body) { this.json = JSON.parse(body) } }
+      await route.handler({ method: 'GET', url: `${route.path}?id=${encodeURIComponent(id)}` }, res)
+      assert.equal(res.statusCode, 200, JSON.stringify(res.json))
+      assert.equal(res.json.session.id, id)
+      return res.json
+    })
+  } finally {
+    Date.now = clock
+    for (const dispose of disposers.reverse()) dispose?.()
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value
+    }
+  }
+}
+await check('session detail follows delegation at every hop, not ordinary fork lineage', async () => {
+  const child = (id, parentSession, delegationDepth) => ({ id, parentSession, origin: 'subagent', delegationDepth, events: [] })
+  await withSessionRoute([
+    child('nested', 'worker', 2),
+    { id: 'historical-fork', parentSession: 'worker', isSeeded: true, events: [] },
+    child('fork-worker', 'historical-fork', 1), child('worker', 'lead', 1), { id: 'lead', events: [] },
+  ], async (detail) => {
+    for (const id of ['lead', 'worker', 'nested']) {
+      const { team } = await detail(id)
+      assert.equal(team.id, 'lead')
+      assert.deepEqual(team.members.map((row) => row.id).sort(), ['lead', 'nested', 'worker'])
+    }
+    for (const id of ['historical-fork', 'fork-worker']) {
+      const { team } = await detail(id)
+      assert.equal(team.id, 'historical-fork')
+      assert.deepEqual(team.members.map((row) => row.id).sort(), ['fork-worker', 'historical-fork'])
+    }
+  })
+})
+await check('session detail uses parent-owned catalog names, accepts corroborated legacy members, ignores inherited rosters', async () => {
+  const catalogEntry = (childId, name, mode = 'continuable') => event('subagent/catalog', now, { version: 3, childId, childCreatedAt: now, mode, label: 'role, not name', name })
+  const oldEntry = event('team/member', now, { version: 2, teamId: 'root', member: { id: 'legacy', name: 'old-name', phase: 'active' } })
+  const prefix = [oldEntry, catalogEntry('worker', 'named-worker'), catalogEntry('unmetered', 'external', 'external')]
+  await withSessionRoute([
+    { id: 'leaf', origin: 'subagent', parentSession: 'worker', delegationDepth: 2, events: [event('session/title', now, { title: 'Leaf title' })] },
+    { id: 'root', events: prefix }, { id: 'legacy', parentSession: 'root', events: [] },
+    { id: 'worker', origin: 'subagent', parentSession: 'root', delegationDepth: 1, inheritedEventCount: prefix.length, isSeeded: true, events: [...prefix, catalogEntry('leaf', 'checker')] },
+    // A copied catalog entry in this fork is not evidence for either legacy child's identity or name.
+    { id: 'copy', isSeeded: true, parentSession: 'root', inheritedEventCount: 1, events: [catalogEntry('impostor', 'sibling')] },
+    { id: 'impostor', parentSession: 'copy', isSeeded: true, events: [] },
+  ], async (detail) => {
+    const { team } = await detail('leaf')
+    assert.deepEqual(Object.fromEntries(team.members.filter((row) => row.role !== 'lead').map((row) => [row.id, row.name])), { worker: 'named-worker', leaf: 'checker', legacy: 'old-name' })
+    assert.equal((await detail('legacy')).team.id, 'root')
+    assert.equal((await detail('impostor')).team, null)
+  })
+})
+await check('team charge excludes all copied requests, but selected-session model details retain their ledger scope', async () => {
+  // Peak Flash: CNY 2/million input, 8/million output. Each request emits 100 tokens.
+  const prefix = [assistant(0, now - 3000, 1_000_000)]
+  const fork = [...prefix, event('session/end-seed', now - 3000, { inherited: true }), assistant(2, now - 2000, 2_000_000)]
+  await withSessionRoute([
+    { id: 'lead', events: prefix },
+    { id: 'worker', parentSession: 'lead', origin: 'subagent', isSeeded: true, inheritedEventCount: 1, events: fork },
+    { id: 'nested', parentSession: 'worker', origin: 'subagent', isSeeded: true, inheritedEventCount: 3, events: [...fork, event('session/end-seed', now, { inherited: true })] },
+  ], async (detail) => {
+    for (const id of ['lead', 'worker', 'nested']) {
+      const { team, entries } = await detail(id)
+      assert.equal(team.totals.requests, 2)
+      assert.equal(team.totals.local, 3_000_200)
+      assert.equal(team.cost.standard, 6.0016)
+      assert.deepEqual(Object.fromEntries(team.members.map((row) => [row.id, row.cost.standard])), { lead: 2.0008, worker: 4.0008, nested: 0 })
+      assert.equal(entries[0].totals.requests, id === 'lead' ? 1 : 2)
+    }
+  })
+})
+await check('every detail selection carries member title/depth, owned tool calls and effective completed time (null ≠ zero)', async () => {
+  const prefix = [event('turn/start', now - 8000, { turn: 1 }), event('tool/call', now - 7000, { turn: 1, name: 'ask_user_question', callId: 'ask' }), event('tool/result', now - 2000, { message: { source: { callId: 'ask' } } }), event('turn/end', now, { turn: 1, reason: { kind: 'completed' } })]
+  await withSessionRoute([
+    { id: 'a', events: [event('session/title', now, { title: 'Lead title' }), ...prefix] },
+    { id: 'b', parentSession: 'a', origin: 'subagent', isSeeded: true, inheritedEventCount: prefix.length, events: [...prefix, event('turn/start', now, { turn: 2 }), event('turn/end', now, { turn: 2, reason: { kind: 'completed' } })] },
+    { id: 'c', parentSession: 'b', origin: 'subagent', events: [event('turn/start', now, { turn: 1 })] },
+  ], async (detail) => {
+    for (const id of ['a', 'b', 'c']) {
+      const { team } = await detail(id)
+      assert.equal(team.title, 'Lead title')
+      assert.deepEqual(team.members.map((m) => [m.id, m.depth, m.completedTurns, m.completedTurnMs, m.toolCalls]).sort(), [['a', 0, 1, 3000, 1], ['b', 1, 1, 0, 0], ['c', 2, 0, null, 0]])
+      assert.equal(team.members.find((m) => m.role === 'lead').title, 'Lead title')
+    }
+  })
+})
+await check('team effective time is the union of member intervals, so parallel overlap counts once', async () => {
+  const turn = (seq, start, end) => [event('turn/start', start, { turn: seq }), event('turn/end', end, { turn: seq, reason: { kind: 'completed' } })]
+  // lead 处理 [-9000, -4000]（5s），worker 处理 [-8000, -3000]（5s），重叠 4s：
+  // 并集是从 -9000 到 -3000 的 6s。若把两人时长相加会得到 10s，那正是用户不等待的时间。
+  await withSessionRoute([
+    { id: 'lead', events: turn(1, now - 9000, now - 4000) },
+    { id: 'worker', parentSession: 'lead', origin: 'subagent', events: turn(1, now - 8000, now - 3000) },
+  ], async (detail) => {
+    for (const id of ['lead', 'worker']) {
+      const { team } = await detail(id)
+      assert.equal(team.members.reduce((sum, m) => sum + m.completedTurnMs, 0), 10_000, 'member rows stay per-member')
+      assert.equal(team.busyMs, 6000, 'headline must de-duplicate the parallel overlap')
+      assert.equal(team.busyMembers, 2)
+    }
+  })
+})
+await check('cataloged external agents appear as unmetered, even when the Lead is the only stored session', async () => {
+  const external = (childId, name) => event('subagent/catalog', now, { childId, childCreatedAt: now, mode: 'external', version: 3, name, label: 'external work' })
+  const prefix = [assistant(0, now - 1000), external('external-1', 'codex')]
+  await withSessionRoute([
+    { id: 'solo', events: [...prefix, external('external-1', 'codex')] },
+    { id: 'other-lead', events: [external('ext-lead', 'from-lead')] },
+    { id: 'other-worker', parentSession: 'other-lead', origin: 'subagent', isSeeded: true, inheritedEventCount: 1, events: [external('ext-lead', 'from-lead'), external('ext-worker', 'from-worker')] },
+    { id: 'ordinary-fork', isSeeded: true, inheritedEventCount: prefix.length, events: prefix },
+  ], async (detail) => {
+    const { team } = await detail('solo')
+    assert.ok(team, 'one native Lead plus a recorded external child is a team')
+    assert.equal(team.memberCount, 2)
+    assert.equal(team.members.length, 1)
+    assert.equal(team.totals.requests, 1)
+    assert.equal(team.cost.standard, 0.0028)
+    assert.deepEqual(team.unmeteredMembers.map((m) => [m.id, m.name, m.depth, m.parentId]), [['external-1', 'codex', 1, 'solo']])
+    assert.equal('cost' in team.unmeteredMembers[0], false)
+    for (const id of ['other-lead', 'other-worker']) {
+      const { team } = await detail(id)
+      assert.equal(team.memberCount, 4)
+      assert.deepEqual(team.unmeteredMembers.map((m) => [m.id, m.name, m.depth]).sort(), [['ext-lead', 'from-lead', 1], ['ext-worker', 'from-worker', 2]])
+    }
+    assert.equal((await detail('ordinary-fork')).team, null)
+  })
+})
 await check('UsageCatalog passes trusted nested header topology and roster names into windowed review teams', async () => {
   const {catalog} = await catalogOf([
     {id:'a',cwd:'/repo',events:[event('team/member',now-1000,{member:{id:'b',name:'researcher'}}),assistant(1,now)]},
@@ -560,7 +712,7 @@ await check('source cache retains no original events/args/results and exposes sh
 await check('inherited child timing/tools are excluded but financials retain original ledger scope', async () => {
   const prefix = [event('turn/start', now - 8000, { turn: 1 }), assistant(1, now - 7000), event('turn/end', now - 6000, { turn: 1, reason: { kind: 'completed' } })].map((e, seq) => ({ ...e, seq }))
   const owned = [event('turn/start', now - 3000, { turn: 2 }), assistant(4, now - 2000), event('turn/end', now, { turn: 2, reason: { kind: 'completed' } })].map((e, i) => ({ ...e, seq: i + prefix.length }))
-  const { catalog } = await catalogOf([{ id: 'a', cwd: '/repo', events: prefix }, { id: 'b', cwd: '/repo', parentSession: 'a', inheritedEventCount: prefix.length, events: [...prefix, ...owned] }])
+  const { catalog } = await catalogOf([{ id: 'a', cwd: '/repo', events: prefix }, { id: 'b', cwd: '/repo', parentSession: 'a', origin: 'subagent', isSeeded: true, inheritedEventCount: prefix.length, events: [...prefix, ...owned] }])
   const snapshot = catalog.adoptSnapshot(await catalog.build(now))
   const result = await catalog.readReview(7, 'all')
   assert.equal(result.summary.requests, 3)

@@ -18,6 +18,7 @@ import React from 'react'
 import { createPortal } from 'react-dom'
 import { Dashboard } from './dashboard.js'
 import { SUBSCRIPTION_VALUE_MESSAGES } from './subscriptionValueLocale.js'
+import { SESSION_TEAM_MESSAGES, teamTranslator } from './sessionTeamLocale.js'
 import { installNotifier, notifyStore } from './Notifier.js'
 import { PeriodDot, panelEntryLayout, periodTitle, usePeriodPhase } from './period.js'
 import { COST_ENTRY_ID, COST_ENTRY_ORDER, SessionCost } from './SessionCost.js'
@@ -183,7 +184,9 @@ export function apply(ctx) {
 
   const localeService = ctx.get('locale')
   if (typeof localeService?.register === 'function') {
-    ctx.effect(() => localeService.register(PACKAGE_ID, SUBSCRIPTION_VALUE_MESSAGES), 'pixel-dashboard: 套餐价值文案')
+    const messages = Object.fromEntries(Object.entries(SUBSCRIPTION_VALUE_MESSAGES).map(([lang, dict]) =>
+      [lang, { ...dict, ...SESSION_TEAM_MESSAGES[lang] }]))
+    ctx.effect(() => localeService.register(PACKAGE_ID, messages), 'pixel-dashboard: 界面文案')
   }
   const valueText = localeService?.bind?.(PACKAGE_ID)
   slots.inject('main', () => slots.register(
@@ -206,8 +209,9 @@ export function apply(ctx) {
   // 一次只渲染一个视图（现有 chat / trajectory / context / fleet / stats）。
   // order=50 落在它们之后：这一页是「读数」的地方，不该抢在对话前面。
   // 与费用条同一个 id 是刻意的——它们是同一笔钱的摘要与明细，槽位不同、互不冲突。
+  const sessionText = teamTranslator(valueText)
   slots.inject('conversation.view', () => slots.register(
     { name: 'conversation.view', id: SESSION_VIEW_ID, order: SESSION_VIEW_ORDER, label: SESSION_VIEW_LABEL },
-    SessionCostView,
+    (props) => h(SessionCostView, { ...props, localeService, sessionText }),
   ))
 }
